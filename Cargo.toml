@@ -1,0 +1,16 @@
+# Userspace TCP/IP stack — zero external dependencies (std only).
+# The whole engine is device- and OS-agnostic and unit-testable off-device;
+# only the `tcp-tun` backend (added in M0) is Linux-only.
+[workspace]
+resolver = "2"
+members = ["tcp-core", "tcp-tun"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"          # MSRV: the version available on the VPS via apt
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
