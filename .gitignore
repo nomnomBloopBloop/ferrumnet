@@ -2,3 +2,7 @@
 **/*.rs.bk
 *.pcap
 *.pcapng
+
+# Editor / IDE
+.vscode/
+.idea/

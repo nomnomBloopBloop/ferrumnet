@@ -56,22 +56,33 @@ syscall FFI in `tcp-tun/src/sys.rs`.
 tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   wire/        zero-copy IPv4/TCP/ICMP views + RFC 1071 checksum        [M0/M1]
   seq          SeqNumber — RFC 1982 serial arithmetic                   [M1]
-  state, tcb   the 11-state TCP machine + transmission control block    [M1/M2]
+  isn          keyed-SipHash ISN selection (RFC 6528)                   [M1]
+  state        the 11 RFC 793 states                                   [M1]
+  tcb          the transmission control block: state machine, go-back-N [M1-M3,M6]
+               reliability, flow control, teardown, and per-connection timers
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
-  retx         retransmission queue                                     [M2]
-  timerwheel   hashed timer wheel (generation counters)                 [M2]
   congestion   TCP Tahoe controller                                     [M3]
   buffers      rx/tx ring buffers                                       [M2]
-  iface        the sans-IO driver: on_recv / poll_timers / poll_egress  [M1–M3]
-  device       Device trait + in-memory MockDevice (loss/reorder sim)   [M2]
-  runtime/     hand-rolled async: executor, reactor, TcpListener/Stream [M4]
+  iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
+  runtime/     hand-rolled async: executor, reactor, TcpListener/Stream,
+               Device trait + in-memory MockDevice                      [M4]
 tcp-tun/   (Linux-only backend + demo)
   sys          extern "C" ioctl/poll + repr(C) ifreq/pollfd            [M0]
-  tun          TunDevice (IFF_TUN|IFF_NO_PI, O_NONBLOCK, poll wait)     [M0]
-  http         minimal HTTP/1.1 responder                              [M5]
-  main         the reactor loop wiring it together                     [M0–M5]
+  tun          TunDevice : Device (IFF_TUN|IFF_NO_PI, O_NONBLOCK)       [M0/M5]
+  http         minimal HTTP/1.1 responder (+ /bench throughput path)   [M5]
+  main         opens the TUN, spawns the accept loop, runs the Runtime [M0-M5]
 scripts/     tun-up.sh / tun-down.sh (host networking, scoped to 10.0.0.0/24)
 ```
+
+Timers are kept per-connection (each TCB exposes `poll_at()` = the min of its retransmit /
+persist / TIME-WAIT / FIN-WAIT-2 deadlines; the `Stack` takes the min across connections). A
+hashed timer wheel would be the O(1) generalization at thousands of connections, but is
+unnecessary at this scale.
+
+**Deliberately out of scope** (RTO recovery and the demo do not need them): delayed-ACK (we
+ACK immediately), SACK, TCP timestamps, window scaling, out-of-order reassembly (a gap is
+dropped and dup-ACKed; the RTO recovers it), IP fragmentation/reassembly, and active open
+(`connect`) — this is a server. None are stubbed; the code paths simply don't exist yet.
 
 **Async model.** A single-threaded executor and reactor on one thread; shared connection
 state is `Rc<RefCell<ConnectionShared>>` — no hot-path locks (the brief's "mutex on every
@@ -133,7 +144,7 @@ sequence variables). Verified traps:
   most one segment per call in a fixed priority order; `poll_at()` returns the min of **all**
   armed deadlines (RTO, delayed-ACK, persist, TIME-WAIT). (`state/T12,X12`)
 
-### 5.4 Retransmission & RTO (`retx`, `rtt`, `timerwheel`) — M2
+### 5.4 Retransmission & RTO (`tcb`, `rtt`) — M2
 
 RTO per RFC 6298 with Jacobson's estimator and Karn's amendment. Verified traps:
 
