@@ -41,39 +41,52 @@ fn main() -> std::io::Result<()> {
     );
 
     let start = StdInstant::now();
+    let now = || Instant::from_micros(start.elapsed().as_micros() as u64);
     let mut rx = vec![0u8; dev.mtu() + 64];
     let mut tx = vec![0u8; dev.mtu() + 64];
     let mut egress: Vec<Vec<u8>> = Vec::new();
 
     loop {
-        // M1 has no timers yet, so block until the device is readable.
-        if !dev.poll_readable(-1)? {
-            continue;
+        // Sleep until the device is readable or the next timer is due.
+        let timeout_ms: i32 = match stack.poll_at() {
+            None => -1,
+            Some(deadline) => {
+                let micros = deadline.saturating_micros_since(now());
+                (micros.div_ceil(1000)).min(i32::MAX as u64) as i32
+            }
+        };
+        let readable = dev.poll_readable(timeout_ms)?;
+
+        // Fire any expired timers (retransmission, persist, TIME-WAIT).
+        stack.on_timer(now());
+
+        // Drain all queued inbound datagrams.
+        if readable {
+            while let Some(n) = dev.recv(&mut rx)? {
+                let ip = match Ipv4Packet::new_checked(&rx[..n]) {
+                    Ok(ip) => ip,
+                    Err(_) => continue, // not IPv4 / truncated / a fragment
+                };
+                match ip.protocol() {
+                    IPPROTO_ICMP => {
+                        if let Some(len) = echo_reply(&ip, &mut tx) {
+                            if let Err(e) = dev.send(&tx[..len]) {
+                                eprintln!("tcp-tun: dropped ICMP reply ({e})");
+                            }
+                        }
+                    }
+                    IPPROTO_TCP => stack.on_recv(now(), &ip),
+                    _ => {}
+                }
+            }
         }
-        while let Some(n) = dev.recv(&mut rx)? {
-            let now = Instant::from_micros(start.elapsed().as_micros() as u64);
-            let ip = match Ipv4Packet::new_checked(&rx[..n]) {
-                Ok(ip) => ip,
-                Err(_) => continue, // not IPv4 / truncated / a fragment
-            };
-            match ip.protocol() {
-                IPPROTO_ICMP => {
-                    if let Some(len) = echo_reply(&ip, &mut tx) {
-                        if let Err(e) = dev.send(&tx[..len]) {
-                            eprintln!("tcp-tun: dropped ICMP reply ({e})");
-                        }
-                    }
-                }
-                IPPROTO_TCP => {
-                    egress.clear();
-                    stack.on_recv(now, &ip, &mut egress);
-                    for pkt in &egress {
-                        if let Err(e) = dev.send(pkt) {
-                            eprintln!("tcp-tun: dropped TCP segment ({e})");
-                        }
-                    }
-                }
-                _ => {}
+
+        // Emit everything the stack wants to send.
+        egress.clear();
+        stack.poll_transmit(now(), &mut egress);
+        for pkt in &egress {
+            if let Err(e) = dev.send(pkt) {
+                eprintln!("tcp-tun: dropped TCP segment ({e})");
             }
         }
     }
