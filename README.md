@@ -61,7 +61,7 @@ that with a transmit scratch ring is the obvious next optimization.
   │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream               │
   │    Stack  →  TCB per connection                                                    │
   │      wire (zero-copy parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)  │
-  │      rtt (RFC 6298) · congestion (Tahoe) · buffers · per-connection timers         │
+  │      rtt (RFC 6298) · congestion (Reno) · buffers · per-connection timers         │
   └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,7 +83,7 @@ and wakes the async tasks.
    simultaneous close, and TIME-WAIT (2·MSL). (`state`, `tcb`)
 2. **Retransmission** — a send ring with go-back-N retransmission and Jacobson/Karn RTO
    estimation (RFC 6298). (`tcb`, `rtt`)
-3. **Congestion control** — TCP Tahoe: slow start, congestion avoidance, fast retransmit on 3
+3. **Congestion control** — TCP Reno: slow start, congestion avoidance, fast retransmit on 3
    duplicate ACKs (RFC 5681 + 6928). (`congestion`)
 4. **Zero-copy parsing** — header views over `&[u8]` and the one's-complement Internet checksum
    (RFC 1071), with a clean RX/TX borrow split. (`wire`)

@@ -47,4 +47,12 @@ impl Instant {
             micros: self.micros.saturating_add(millis.saturating_mul(1_000)),
         }
     }
+
+    /// This instant advanced by `micros` microseconds.
+    #[inline]
+    pub const fn plus_micros(self, micros: u64) -> Instant {
+        Instant {
+            micros: self.micros.saturating_add(micros),
+        }
+    }
 }

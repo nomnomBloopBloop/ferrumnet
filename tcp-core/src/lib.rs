@@ -16,7 +16,7 @@
 //! - [`wire`] — zero-copy IPv4/TCP/ICMP header views and the RFC 1071 Internet checksum.
 //!
 //! Later milestones add: `seq` (RFC 1982 sequence arithmetic), `state`/`tcb` (the TCP
-//! state machine), `rtt`/`retx`/`timerwheel` (reliability), `congestion` (Tahoe),
+//! state machine), `rtt`/`retx`/`timerwheel` (reliability), `congestion` (Reno),
 //! `buffers`, `iface` (the sans-IO driver), `device` (the `Device` trait + mock), and
 //! `runtime` (the async executor, reactor, and socket API).
 

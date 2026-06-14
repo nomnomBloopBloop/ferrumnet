@@ -11,11 +11,11 @@
 //! Application I/O is [`Tcb::send`] / [`Tcb::recv`] / [`Tcb::close`].
 //!
 //! Reliability is go-back-N over a send ring: unacked bytes stay in `tx`; an RTO rewinds
-//! `snd_nxt` to `snd_una` and `poll_transmit` resends. Congestion control (Tahoe) layers onto
+//! `snd_nxt` to `snd_una` and `poll_transmit` resends. Congestion control (Reno) layers onto
 //! the send window in M3.
 
 use crate::buffers::RingBuffer;
-use crate::congestion::Tahoe;
+use crate::congestion::Reno;
 use crate::iface::{build_segment, Endpoint};
 use crate::rtt::RttEstimator;
 use crate::seq::SeqNumber;
@@ -58,11 +58,13 @@ pub struct Tcb {
     rx: RingBuffer, // in-order received data awaiting the application
 
     rtt: RttEstimator,
-    cc: Tahoe,
+    cc: Reno,
     /// (sent_at, seq_end) of the segment currently being timed for RTT, if any.
     rtt_sample: Option<(Instant, SeqNumber)>,
     /// The outstanding window has been retransmitted; suppress RTT sampling (Karn).
     retransmitted: bool,
+    /// A retransmission of the oldest unacked segment is pending (set by RTO / fast retransmit).
+    retransmit: bool,
 
     // Timers.
     rtx_deadline: Option<Instant>,
@@ -118,9 +120,10 @@ impl Tcb {
             tx: RingBuffer::with_capacity(TX_BUFFER),
             rx: RingBuffer::with_capacity(RX_BUFFER),
             rtt: RttEstimator::new(),
-            cc: Tahoe::new(snd_mss),
+            cc: Reno::new(snd_mss),
             rtt_sample: None,
             retransmitted: false,
+            retransmit: false,
             rtx_deadline: None,
             persist_deadline: None,
             persist_backoff: PERSIST_MIN_MILLIS,
@@ -255,14 +258,15 @@ impl Tcb {
             }
         } else {
             // A pure, non-advancing ACK with outstanding data is a duplicate ACK.
-            // A duplicate ACK (RFC 5681 §2): no data, ack == SND.UNA, the advertised window is
-            // unchanged, and there is outstanding data. The window check stops a pure
-            // window-update at SND.UNA from spuriously triggering fast retransmit.
+            // A duplicate ACK: no data, ack == SND.UNA, and data is still outstanding. We
+            // deliberately do NOT require the advertised window to be unchanged (RFC 5681
+            // §2(e)): under real loss the receiver buffers out-of-order data, so its window
+            // shrinks with every dup-ACK — requiring an unchanged window would suppress fast
+            // retransmit exactly when it is needed and force slow RTO-based recovery.
             let is_dup = payload.is_empty()
                 && !flags.fin()
                 && !flags.syn()
                 && seg_ack == self.snd_una
-                && tcp.window() == self.snd_wnd
                 && self.snd_una != self.snd_nxt;
             if !self.process_ack(seg_seq, seg_ack, tcp.window(), now) {
                 return; // SEG.ACK > SND.NXT: ACK already owed, drop the segment
@@ -270,8 +274,9 @@ impl Tcb {
             if is_dup {
                 let flight = self.snd_nxt.offset_from(self.snd_una);
                 if self.cc.on_dup_ack(flight) {
-                    // Fast retransmit (Tahoe): resend from SND.UNA; suppress RTT sampling.
-                    self.snd_nxt = self.snd_una;
+                    // Fast retransmit: resend the oldest unacked segment; suppress RTT sampling
+                    // (Karn). Do NOT rewind SND.NXT (see transmit_data_or_fin step 0).
+                    self.retransmit = true;
                     self.retransmitted = true;
                     self.rtt_sample = None;
                     self.restart_rtx(now);
@@ -323,17 +328,21 @@ impl Tcb {
             }
             self.snd_una = seg_ack;
 
-            // RTT (Karn): only sample / clear backoff when the acked data was never resent.
+            // Karn: suppress the RTT *sample* on retransmitted data (an ACK is ambiguous).
             if !self.retransmitted {
                 if let Some((sent_at, seq_end)) = self.rtt_sample {
                     if seg_ack.ge(seq_end) {
-                        let ms = (now.saturating_micros_since(sent_at) / 1000).max(1) as u32;
-                        self.rtt.on_sample(ms);
+                        let rtt_us =
+                            now.saturating_micros_since(sent_at).min(u32::MAX as u64).max(1) as u32;
+                        self.rtt.on_sample(rtt_us);
                         self.rtt_sample = None;
                     }
                 }
-                self.rtt.on_clean_ack();
             }
+            // ...but forward progress ALWAYS clears the RTO backoff. Otherwise, while we are
+            // retransmitting, a doubled RTO never comes back down and recovery ratchets toward
+            // the 60 s cap — which made bulk transfers effectively wedge under loss.
+            self.rtt.on_clean_ack();
 
             if self.snd_una == self.snd_nxt {
                 // Everything outstanding is acked: stop the timer, clear Karn state.
@@ -450,6 +459,23 @@ impl Tcb {
         let unsent_data = self.tx.len() - sent_data;
         let data_end = self.snd_una + self.tx.len() as u32;
 
+        // 0. A pending retransmission of the oldest unacked segment takes priority. Critically,
+        //    we resend from SND.UNA WITHOUT rewinding SND.NXT: the receiver buffers out-of-order
+        //    data, so filling the hole lets its cumulative ACK jump forward — whereas rewinding
+        //    SND.NXT would make the in-flight ACKs (which acknowledge data past the rewound
+        //    SND.NXT) look like they acknowledge unsent data, and they'd be dropped.
+        if self.retransmit && inflight > 0 {
+            self.retransmit = false;
+            let n = (inflight as usize).min(self.tx.len()).min(self.snd_mss as usize);
+            let mut payload = vec![0u8; n];
+            self.tx.peek(0, &mut payload);
+            let psh = n == self.tx.len();
+            let flags = if psh { TcpFlags::PSH } else { 0 };
+            let seg = self.build(self.snd_una, flags, &payload);
+            self.start_rtx(now);
+            return Some(seg);
+        }
+
         // 1. Send new data the window allows...
         if usable > 0 {
             let allowed = usable.saturating_sub(inflight);
@@ -501,10 +527,11 @@ impl Tcb {
 
     /// The earliest armed deadline (the backend sleeps until then).
     pub fn poll_at(&self) -> Option<Instant> {
-        [self.rtx_deadline, self.persist_deadline, self.time_wait_deadline]
+        let d = [self.rtx_deadline, self.persist_deadline, self.time_wait_deadline]
             .into_iter()
             .flatten()
-            .min()
+            .min();
+        d
     }
 
     /// Fire every timer whose deadline has passed (a late wake may pass several at once).
@@ -514,7 +541,7 @@ impl Tcb {
                 let flight = self.snd_nxt.offset_from(self.snd_una);
                 self.cc.on_rto(flight); // ssthresh = max(flight/2, 2*MSS); cwnd = 1*MSS
                 self.rtt.on_timeout();
-                self.snd_nxt = self.snd_una; // go-back-N
+                self.retransmit = true; // resend the oldest unacked segment (no SND.NXT rewind)
                 self.retransmitted = true;
                 self.rtt_sample = None;
                 self.restart_rtx(now);
@@ -591,12 +618,12 @@ impl Tcb {
 
     fn start_rtx(&mut self, now: Instant) {
         if self.rtx_deadline.is_none() {
-            self.rtx_deadline = Some(now.plus_millis(self.rtt.rto_millis() as u64));
+            self.rtx_deadline = Some(now.plus_micros(self.rtt.rto_micros() as u64));
         }
     }
 
     fn restart_rtx(&mut self, now: Instant) {
-        self.rtx_deadline = Some(now.plus_millis(self.rtt.rto_millis() as u64));
+        self.rtx_deadline = Some(now.plus_micros(self.rtt.rto_micros() as u64));
     }
 
     fn arm_persist(&mut self, now: Instant) {
@@ -916,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn three_dup_acks_fast_retransmit_and_collapse_cwnd() {
+    fn three_dup_acks_trigger_fast_retransmit() {
         let now = Instant::from_millis(0);
         let (mut tcb, iss, cnxt) = established(now, 13000, 64000);
         let data: Vec<u8> = (0..5000).map(|i| i as u8).collect();
@@ -931,10 +958,12 @@ mod tests {
         };
         assert!(dup(&mut tcb).is_empty()); // 1st
         assert!(dup(&mut tcb).is_empty()); // 2nd
-        let out = dup(&mut tcb); // 3rd -> fast retransmit
-        assert_eq!(out.len(), 1, "fast retransmit emits one segment");
-        assert_eq!(out[0].seq, iss + 1); // resent from SND.UNA
-        assert_eq!(out[0].payload, &data[..1460]); // exactly one (collapsed) cwnd of 1 MSS
+        let out = dup(&mut tcb); // 3rd -> fast retransmit of the oldest unacked segment
+        // We retransmit exactly the hole at SND.UNA (one segment) without rewinding SND.NXT;
+        // the receiver's cumulative ACK then jumps past the data it already buffered.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, iss + 1);
+        assert_eq!(out[0].payload, &data[..1460]);
     }
 
     #[test]
@@ -1009,18 +1038,22 @@ mod tests {
     }
 
     #[test]
-    fn window_update_acks_do_not_fast_retransmit() {
+    fn dup_acks_fast_retransmit_even_when_window_changes() {
         let now = Instant::from_millis(0);
         let (mut tcb, iss, cnxt) = established(now, 18000, 64000);
         tcb.send(b"payload");
         drain(&mut tcb, now);
-        // Three ACKs at SND.UNA, each with a *different* advertised window -> not duplicates.
-        for w in [50000u16, 40000, 30000] {
-            deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, w, None, b""));
-        }
-        assert!(
-            drain(&mut tcb, now).is_empty(),
-            "pure window-update ACKs must not be counted as dup-ACKs / trigger fast retransmit"
-        );
+        // Three ACKs at SND.UNA whose advertised window shrinks each time — exactly what a
+        // receiver buffering out-of-order data does under loss. They must still count as
+        // duplicate ACKs and fast-retransmit on the third (not be dismissed as window updates).
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, 50000, None, b""));
+        assert!(drain(&mut tcb, now).is_empty());
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, 40000, None, b""));
+        assert!(drain(&mut tcb, now).is_empty());
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, 30000, None, b""));
+        let out = drain(&mut tcb, now); // 3rd dup-ACK -> fast retransmit
+        assert!(!out.is_empty(), "third dup-ACK must fast-retransmit despite the changing window");
+        assert_eq!(out[0].seq, iss + 1);
+        assert_eq!(out[0].payload, b"payload");
     }
 }

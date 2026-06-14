@@ -61,7 +61,7 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   tcb          the transmission control block: state machine, go-back-N [M1-M3,M6]
                reliability, flow control, teardown, and per-connection timers
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
-  congestion   TCP Tahoe controller                                     [M3]
+  congestion   TCP Reno controller                                     [M3]
   buffers      rx/tx ring buffers                                       [M2]
   iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
   runtime/     hand-rolled async: executor, reactor, TcpListener/Stream,
@@ -164,14 +164,17 @@ RTO per RFC 6298 with Jacobson's estimator and Karn's amendment. Verified traps:
 
 ### 5.5 Congestion control (`congestion`) — M3
 
-TCP Tahoe, everything in **bytes**. Verified traps:
+TCP Reno, everything in **bytes**. Verified traps:
 
 - Congestion avoidance counts **bytes acked** with a `while` loop
   (`ca_acc += acked; while ca_acc >= cwnd { ca_acc -= cwnd; cwnd += mss }`). The naive
   `ca_acc += MSS` / `if` form under-grows under delayed or stretch ACKs. (`congestion/N1,N2`)
-- On loss, `ssthresh = max(FlightSize/2, 2·MSS)` from a passed `flight_size`, **not cwnd**;
-  Tahoe sets `cwnd = 1·MSS` on both a 3-dup-ACK and an RTO, with **no fast recovery**.
-  `IW = min(10·MSS, max(2·MSS, 14600))` (RFC 6928). (`congestion/T1,T2`)
+- On loss, `ssthresh = max(FlightSize/2, 2·MSS)` from a passed `flight_size`, **not cwnd**.
+  A 3-dup-ACK triggers **fast recovery** (`cwnd = ssthresh`, not 1) so the pipe stays full
+  enough to keep fast-retransmitting; only an RTO collapses to `cwnd = 1·MSS` and restarts slow
+  start. (The project began with Tahoe — collapse-to-1 on both — and was upgraded to Reno after
+  loss testing showed Tahoe's collapse made recovery pathological.) `IW = min(10·MSS,
+  max(2·MSS, 14600))` (RFC 6928). (`congestion/T1,T2`)
 - The load-bearing send gate lives *inside* the tested module:
   `allowed_to_send = min(cwnd, rwnd).saturating_sub(snd_nxt − snd_una)`, unit-tested across a
   2³² wrap. The zero-window probe bypasses cwnd. (`congestion/X5,T4`)
@@ -224,7 +227,7 @@ Hand-rolled executor + reactor exposing `TcpListener`/`TcpStream`. Verified trap
 
 - **Unit (runs on 1.92 locally and 1.75 on the VPS):** checksum RFC-1071 vectors (odd length,
   sums-to-0xFFFF); IPv4/TCP parse edge cases; `SeqNumber` wrap properties; RTO estimator vs
-  RFC 6298 worked examples; Tahoe transitions + `allowed_to_send` across a 2³² wrap; timer-wheel
+  RFC 6298 worked examples; Reno transitions + `allowed_to_send` across a 2³² wrap; timer-wheel
   cancel/reschedule/cascade.
 - **Integration (in-memory `MockDevice`):** full handshake / transfer / teardown between two
   stack instances, under injected loss, reordering, and duplication; TIME-WAIT reaping via a
@@ -239,7 +242,7 @@ Hand-rolled executor + reactor exposing `TcpListener`/`TcpStream`. Verified trap
 | M0 | device + IPv4/ICMP + checksums + reactor skeleton | `ping 10.0.0.2` ✅ |
 | M1 | TCP wire + SeqNumber + handshake + RST | `curl` completes the handshake |
 | M2 | rings + retransmission + RTO + timer wheel + teardown | reliable echo under injected loss |
-| M3 | Tahoe congestion control | bulk transfer: slow-start → CA → fast-retransmit |
+| M3 | Reno congestion control | bulk transfer: slow-start → CA → fast-retransmit |
 | M4 | async executor + reactor + sockets | async echo server, concurrent connections |
 | M5 | HTTP responder | **`curl http://10.0.0.2:8080`** |
 | M6 | hardening + docs + portfolio polish | full suite green on 1.92 and 1.75 |

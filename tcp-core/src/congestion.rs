@@ -1,4 +1,4 @@
-//! TCP Tahoe congestion control (RFC 5681 + RFC 6928 initial window).
+//! TCP Reno congestion control (RFC 5681 + RFC 6928 initial window).
 //!
 //! Everything is in **bytes**. The verified subtleties (see `docs/DESIGN.md` `congestion/*`):
 //!
@@ -6,8 +6,11 @@
 //!   ACK — the latter under-grows under delayed/stretch ACKs and multi-segment recovery ACKs.
 //! - On loss, `ssthresh = max(FlightSize/2, 2·MSS)` from the *passed* FlightSize, never `cwnd`
 //!   (which may be far larger than what is truly in flight if the connection was rwnd-limited).
-//! - Tahoe collapses to `cwnd = 1·MSS` on *both* a triple-duplicate-ACK and an RTO, and has
-//!   **no** fast recovery (no window inflation, no deflate-to-ssthresh).
+//! - On a triple-duplicate-ACK, **fast recovery** sets `cwnd = ssthresh` (halved) rather than
+//!   collapsing to one segment — so the pipe stays full enough to keep recovering subsequent
+//!   losses by fast retransmit (one RTT) instead of the slow RTO path. Only a real RTO (the
+//!   stronger loss signal) collapses to `cwnd = 1·MSS` and restarts slow start. (The earlier
+//!   Tahoe build collapsed to 1 on *both*, which made loss recovery pathological on a fast path.)
 //! - The send gate is `min(cwnd, rwnd) − FlightSize`; the FlightSize subtraction uses wrapping
 //!   sequence arithmetic (tested in `crate::seq`). The zero-window probe bypasses `cwnd`.
 
@@ -16,7 +19,7 @@ pub fn initial_window(mss: u32) -> u32 {
     (10 * mss).min((2 * mss).max(14600))
 }
 
-pub struct Tahoe {
+pub struct Reno {
     cwnd: u32,
     ssthresh: u32,
     mss: u32,
@@ -25,10 +28,10 @@ pub struct Tahoe {
     dup_acks: u8,
 }
 
-impl Tahoe {
+impl Reno {
     pub fn new(mss: u16) -> Self {
         let mss = mss as u32;
-        Tahoe {
+        Reno {
             cwnd: initial_window(mss),
             ssthresh: u32::MAX, // effectively infinite: slow start until the first loss
             mss,
@@ -73,25 +76,28 @@ impl Tahoe {
     }
 
     /// A duplicate ACK arrived (`flight_size` = bytes in flight). Returns `true` on exactly the
-    /// third, when the caller must fast-retransmit and we enter loss recovery.
+    /// third, when the caller must fast-retransmit.
     pub fn on_dup_ack(&mut self, flight_size: u32) -> bool {
         self.dup_acks = self.dup_acks.saturating_add(1);
         if self.dup_acks == 3 {
-            self.enter_loss(flight_size);
+            // Fast retransmit + fast recovery (Reno): halve the window, but do NOT collapse to
+            // one segment. Keeping the pipe partly full means subsequent losses still generate
+            // duplicate ACKs and recover via fast retransmit (one RTT) instead of falling onto
+            // the slow RTO path — which is what made loss recovery pathological under Reno.
+            self.ssthresh = (flight_size / 2).max(2 * self.mss);
+            self.cwnd = self.ssthresh;
+            self.ca_acc = 0;
             true
         } else {
             false
         }
     }
 
-    /// The retransmission timer fired.
+    /// The retransmission timer fired — a much stronger loss signal than dup-ACKs. Collapse to
+    /// one segment and restart slow start (Reno and Reno agree here).
     pub fn on_rto(&mut self, flight_size: u32) {
-        self.enter_loss(flight_size);
-    }
-
-    fn enter_loss(&mut self, flight_size: u32) {
         self.ssthresh = (flight_size / 2).max(2 * self.mss);
-        self.cwnd = self.mss; // Tahoe: back to one segment, no fast recovery
+        self.cwnd = self.mss;
         self.ca_acc = 0;
     }
 
@@ -118,7 +124,7 @@ mod tests {
 
     #[test]
     fn slow_start_grows_by_acked_capped_at_mss() {
-        let mut t = Tahoe::new(1460); // cwnd = 14600, ssthresh = MAX
+        let mut t = Reno::new(1460); // cwnd = 14600, ssthresh = MAX
         t.on_ack(1460);
         assert_eq!(t.cwnd(), 16060);
         t.on_ack(5000); // capped at one MSS of growth
@@ -127,7 +133,7 @@ mod tests {
 
     #[test]
     fn congestion_avoidance_counts_bytes_with_while_loop() {
-        let mut t = Tahoe::new(1000);
+        let mut t = Reno::new(1000);
         // Force CA: a loss drops ssthresh, then slow-start back up to it.
         t.on_rto(4000); // ssthresh = max(2000, 2000) = 2000, cwnd = 1000
         assert_eq!(t.cwnd(), 1000);
@@ -145,7 +151,7 @@ mod tests {
 
     #[test]
     fn loss_uses_flight_size_not_cwnd() {
-        let mut t = Tahoe::new(1000);
+        let mut t = Reno::new(1000);
         for _ in 0..20 {
             t.on_ack(1000); // grow cwnd well past any plausible flight size
         }
@@ -153,12 +159,12 @@ mod tests {
         let third = t.on_dup_ack(4000) || t.on_dup_ack(4000) || t.on_dup_ack(4000);
         assert!(third); // the 3rd dup ACK triggers recovery
         assert_eq!(t.ssthresh(), 2000); // 4000/2, from FlightSize — not cwnd/2
-        assert_eq!(t.cwnd(), 1000); // Tahoe: collapse to 1 MSS
+        assert_eq!(t.cwnd(), 2000); // Reno fast recovery: cwnd = ssthresh (not 1 MSS)
     }
 
     #[test]
     fn dup_ack_fires_only_on_third() {
-        let mut t = Tahoe::new(1460);
+        let mut t = Reno::new(1460);
         assert!(!t.on_dup_ack(5000));
         assert!(!t.on_dup_ack(5000));
         assert!(t.on_dup_ack(5000));
@@ -168,7 +174,7 @@ mod tests {
 
     #[test]
     fn rto_collapses_to_one_mss() {
-        let mut t = Tahoe::new(1460);
+        let mut t = Reno::new(1460);
         for _ in 0..10 {
             t.on_ack(1460);
         }
