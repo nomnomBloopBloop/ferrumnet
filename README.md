@@ -67,8 +67,15 @@ that with a transmit scratch ring is the obvious next optimization.
 
 `tcp-core` is driven by three calls in a loop: `on_recv(bytes)` (update state), `poll_transmit`
 (drain bytes to send), and `poll_at`/`on_timer` (timers). The reactor wires those to the device
-and wakes the async tasks. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design, including
-the verified correctness traps each component avoids.
+and wakes the async tasks.
+
+> **The thinking lives in [`docs/DESIGN.md`](docs/DESIGN.md).** It's a component-by-component
+> walkthrough that, for each piece, lists the specific correctness traps it has to avoid —
+> sequence-number wraparound, the checksum carry-fold and pseudo-header, Karn's rule for RTT
+> sampling under loss, the `ack_of_fin` teardown subtlety, the async lost-wakeup race. Every one
+> was pinned down by an adversarial design review *before* a line was written, then re-checked by
+> a review of the finished code (which found, and I fixed, 11 real bugs). If you read one file,
+> read that one.
 
 ## The five hard problems
 
@@ -82,6 +89,29 @@ the verified correctness traps each component avoids.
    (RFC 1071), with a clean RX/TX borrow split. (`wire`)
 5. **Async integration** — the `Waker` lifecycle over the sans-IO core, built on the safe
    `std::task::Wake` trait. (`runtime`)
+
+## What I learned
+
+The bug that taught me the most wasn't in the TCP state machine — it was the checksum, and it
+was invisible. `ping` worked perfectly, which "proved" the device, the IPv4 layer, and my
+one's-complement checksum were all fine. But `curl` would complete the handshake and then hang.
+`tcpdump` showed my SYN-ACK and data segments leaving the interface looking correct — yet the
+client never made progress.
+
+The cause lives at the boundary between my code and the kernel. When a packet is generated on
+the same host and handed to a TUN device, Linux leaves the TCP checksum field **zero**: it
+assumes a real NIC will fill it in on the way out via hardware TX offload. A software TUN device
+has no NIC, so those segments reached my stack with a checksum of `0x0000`, and my verifier was —
+correctly, per the RFC — rejecting every single one as corrupt, silently. ICMP slipped through
+only because the kernel checksums ICMP itself. The fix was twofold: disable TX checksum offload
+on the interface (`ethtool -K tun0 tx off`), and have the stack treat an on-wire checksum of
+`0x0000` as "offloaded, accept" rather than "corrupt, drop."
+
+The lesson stuck: *"the protocol is correct"* and *"it works end to end"* are completely
+different claims, and the hardest problems in a network stack aren't in the spec — they're in the
+half-truths about what the layer beneath you actually does. (Close runner-up: a parked
+`read().await` that hung forever when the peer sent a RST, because the reactor only woke a reader
+on *new data*, never on *the connection going away*.)
 
 ## Layout
 
@@ -112,12 +142,24 @@ sudo ./scripts/tun-down.sh
 The setup is scoped to `10.0.0.0/24` on `tun0` and never touches the host's default route or
 IP forwarding, so it is safe to run alongside other services.
 
-## Deliberately out of scope
+## Roadmap
 
-To keep the focus on the core mechanisms, these are not implemented (RTO recovers loss without
-them): delayed-ACK (we ACK immediately), SACK, TCP timestamps, window scaling, out-of-order
-reassembly, IP fragmentation, and active open (`connect` — this is a server). None are stubbed;
-those code paths simply don't exist yet.
+The core is deliberately small and focused. These are the natural next milestones, each a
+self-contained extension of an existing component:
+
+- **SACK + selective repair** — today a gap is dropped and recovered by the RTO via go-back-N;
+  selective acknowledgement would repair loss without resending data that already arrived.
+- **Delayed ACKs and TCP timestamps (RFC 7323)** — fewer pure-ACK segments, and RTTM-based RTT
+  sampling that sidesteps Karn's ambiguity.
+- **Window scaling** — receive windows beyond 64 KiB for high bandwidth-delay paths.
+- **Out-of-order reassembly** — buffer and stitch gaps instead of dropping them.
+- **Active open (`connect`)** — make it a client as well as a server, which also unlocks a
+  two-stack loopback test harness.
+- **A transmit scratch ring** — remove the one heap allocation per emitted segment; this is the
+  main lever on the throughput number above.
+
+Nothing here is stubbed today — those code paths simply don't exist yet, which keeps the current
+implementation honest about exactly what it does.
 
 ## References
 
