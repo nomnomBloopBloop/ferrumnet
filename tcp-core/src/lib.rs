@@ -22,4 +22,15 @@
 
 #![deny(unsafe_code)]
 
+pub mod iface;
+pub mod isn;
+pub mod seq;
+pub mod state;
+pub mod tcb;
+pub mod time;
 pub mod wire;
+
+pub use iface::{Endpoint, Stack};
+pub use seq::SeqNumber;
+pub use state::State;
+pub use time::Instant;

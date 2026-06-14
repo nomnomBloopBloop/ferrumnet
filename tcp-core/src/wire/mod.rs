@@ -8,7 +8,9 @@
 pub mod checksum;
 pub mod icmp;
 pub mod ipv4;
+pub mod tcp;
 
 pub use checksum::{IPPROTO_ICMP, IPPROTO_TCP};
 pub use icmp::echo_reply;
-pub use ipv4::{Ipv4Packet, Ipv4Repr, ParseError};
+pub use ipv4::{Ipv4Packet, Ipv4Repr};
+pub use tcp::{TcpFlags, TcpPacket, TcpRepr};

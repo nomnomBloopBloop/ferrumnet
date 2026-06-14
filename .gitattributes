@@ -1,0 +1,6 @@
+# Normalize line endings: LF in the repo, so shell scripts stay runnable on Linux even when
+# the repo is cloned on Windows.
+* text=auto eol=lf
+*.rs text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
