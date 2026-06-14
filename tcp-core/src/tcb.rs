@@ -29,6 +29,8 @@ const TX_BUFFER: usize = 65_536;
 const RX_BUFFER: usize = 65_536;
 /// TIME-WAIT duration (2·MSL). A demo-friendly value; RFC 793 suggests up to ~4 min.
 const TIME_WAIT_MILLIS: u64 = 10_000;
+/// FIN-WAIT-2 bound: a peer that ACKs our FIN but never closes can't leak the connection.
+const FIN_WAIT2_MILLIS: u64 = 60_000;
 const PERSIST_MIN_MILLIS: u64 = 1_000;
 const PERSIST_MAX_MILLIS: u64 = 60_000;
 const CHALLENGE_ACK_LIMIT: u32 = 100; // RFC 5961 per-connection budget per second
@@ -50,7 +52,6 @@ pub struct Tcb {
     // Receive sequence space.
     irs: SeqNumber,
     rcv_nxt: SeqNumber,
-    rcv_wnd: u16,    // the window we most recently advertised
     rcv_adv: SeqNumber, // the right edge we most recently advertised (never moves left)
 
     tx: RingBuffer, // unacked + unsent application data; tx[0] is the byte at snd_una
@@ -74,6 +75,8 @@ pub struct Tcb {
     fin_seq: Option<SeqNumber>, // sequence number assigned to our FIN once sent
     fin_acked: bool,
     peer_fin_seen: bool,
+    /// An in-window RST closed us (distinguishes an abortive reset from an orderly FIN).
+    reset: bool,
 
     needs_ack: bool, // an ACK is owed (data received, or a dup/challenge ACK)
     send_probe: bool, // the persist timer fired; emit a 1-byte window probe
@@ -111,7 +114,6 @@ impl Tcb {
             snd_mss,
             irs,
             rcv_nxt,
-            rcv_wnd,
             rcv_adv: rcv_nxt + rcv_wnd as u32,
             tx: RingBuffer::with_capacity(TX_BUFFER),
             rx: RingBuffer::with_capacity(RX_BUFFER),
@@ -127,6 +129,7 @@ impl Tcb {
             fin_seq: None,
             fin_acked: false,
             peer_fin_seen: false,
+            reset: false,
             needs_ack: false,
             send_probe: false,
             pending_reset: None,
@@ -165,6 +168,22 @@ impl Tcb {
     pub fn recv_eof(&self) -> bool {
         self.peer_fin_seen && self.rx.is_empty()
     }
+    /// An abortive reset closed this connection (reads should error, not return EOF).
+    pub fn is_reset(&self) -> bool {
+        self.reset
+    }
+    /// Past the handshake (any synchronized state) — eligible to be `accept`ed.
+    pub fn is_synchronized(&self) -> bool {
+        matches!(
+            self.state,
+            State::Established
+                | State::CloseWait
+                | State::FinWait1
+                | State::FinWait2
+                | State::Closing
+                | State::LastAck
+        )
+    }
     pub fn remote(&self) -> Endpoint {
         self.remote
     }
@@ -183,10 +202,20 @@ impl Tcb {
             if self.seq_in_window(seg_seq) {
                 if seg_seq == self.rcv_nxt {
                     self.state = State::Closed;
+                    self.reset = true;
                 } else {
                     self.challenge_ack(now);
                 }
             }
+            return;
+        }
+
+        // In TIME-WAIT we are done processing: just re-ACK (e.g. a retransmitted FIN, whose
+        // sequence number is RCV.NXT-1 and would otherwise fail the acceptability test) and
+        // extend the 2*MSL timer.
+        if self.state == State::TimeWait {
+            self.needs_ack = true;
+            self.arm_time_wait(now);
             return;
         }
 
@@ -226,10 +255,14 @@ impl Tcb {
             }
         } else {
             // A pure, non-advancing ACK with outstanding data is a duplicate ACK.
+            // A duplicate ACK (RFC 5681 §2): no data, ack == SND.UNA, the advertised window is
+            // unchanged, and there is outstanding data. The window check stops a pure
+            // window-update at SND.UNA from spuriously triggering fast retransmit.
             let is_dup = payload.is_empty()
                 && !flags.fin()
                 && !flags.syn()
                 && seg_ack == self.snd_una
+                && tcp.window() == self.snd_wnd
                 && self.snd_una != self.snd_nxt;
             if !self.process_ack(seg_seq, seg_ack, tcp.window(), now) {
                 return; // SEG.ACK > SND.NXT: ACK already owed, drop the segment
@@ -269,13 +302,6 @@ impl Tcb {
         // (8) Recompute the closing state from the (fin_acked, peer_fin_seen) flags — this is
         // order-independent and handles segments that both ack our FIN and carry the peer's.
         self.recompute_closing_state(now);
-
-        // In TIME-WAIT, any segment (e.g. a retransmitted FIN) re-arms the 2·MSL timer and is
-        // re-ACKed.
-        if self.state == State::TimeWait {
-            self.needs_ack = true;
-            self.arm_time_wait(now);
-        }
     }
 
     /// Advance over acked data/FIN, sample RTT (Karn), manage the rtx timer and send window.
@@ -323,7 +349,7 @@ impl Tcb {
     }
 
     fn recompute_closing_state(&mut self, now: Instant) {
-        let entered_time_wait;
+        let prev = self.state;
         self.state = match self.state {
             State::FinWait1 => match (self.fin_acked, self.peer_fin_seen) {
                 (true, true) => State::TimeWait,
@@ -361,9 +387,17 @@ impl Tcb {
             }
             other => other,
         };
-        entered_time_wait = self.state == State::TimeWait && self.time_wait_deadline.is_none();
-        if entered_time_wait {
-            self.arm_time_wait(now);
+        // Arm the relevant timer on *entry* to a state (a fresh 2*MSL on TIME-WAIT must
+        // overwrite any FIN-WAIT-2 timer we set earlier).
+        if self.state != prev {
+            match self.state {
+                State::TimeWait => self.arm_time_wait(now),
+                // Bound FIN-WAIT-2 so a peer that ACKs our FIN but never closes can't leak us.
+                State::FinWait2 => {
+                    self.time_wait_deadline = Some(now.plus_millis(FIN_WAIT2_MILLIS))
+                }
+                _ => {}
+            }
         }
     }
 
@@ -414,44 +448,43 @@ impl Tcb {
         let usable = self.cc.cwnd().min(self.snd_wnd as u32); // min(cwnd, advertised window)
         let sent_data = (inflight as usize).min(self.tx.len());
         let unsent_data = self.tx.len() - sent_data;
-
-        if usable == 0 {
-            // Zero window: probe with a single byte at SND.UNA (without advancing SND.NXT).
-            if unsent_data > 0 && inflight == 0 {
-                self.arm_persist(now);
-                if self.send_probe {
-                    self.send_probe = false;
-                    let mut byte = [0u8; 1];
-                    self.tx.peek(0, &mut byte);
-                    return Some(self.build(self.snd_una, 0, &byte));
-                }
-            }
-            return None;
-        }
-
-        let allowed = usable.saturating_sub(inflight);
-        let n = (allowed as usize).min(unsent_data).min(self.snd_mss as usize);
-        if n > 0 {
-            let mut payload = vec![0u8; n];
-            self.tx.peek(sent_data, &mut payload);
-            let seq = self.snd_nxt;
-            let last_buffered = sent_data + n == self.tx.len();
-            let flags = if last_buffered { TcpFlags::PSH } else { 0 };
-            let seg = self.build(seq, flags, &payload);
-            self.snd_nxt = self.snd_nxt + n as u32;
-            if self.rtt_sample.is_none() && !self.retransmitted {
-                self.rtt_sample = Some((now, self.snd_nxt));
-            }
-            self.start_rtx(now);
-            return Some(seg);
-        }
-
-        // All buffered data is in flight: send (or resend) our FIN if one is queued.
         let data_end = self.snd_una + self.tx.len() as u32;
-        if self.fin_queued && !self.fin_acked && self.snd_nxt == data_end && allowed >= 1 {
-            let seq = data_end;
-            let seg = self.build(seq, TcpFlags::FIN, b"");
-            self.fin_seq = Some(seq);
+
+        // 1. Send new data the window allows...
+        if usable > 0 {
+            let allowed = usable.saturating_sub(inflight);
+            let n = (allowed as usize).min(unsent_data).min(self.snd_mss as usize);
+            if n > 0 {
+                let mut payload = vec![0u8; n];
+                self.tx.peek(sent_data, &mut payload);
+                let seq = self.snd_nxt;
+                let last_buffered = sent_data + n == self.tx.len();
+                let flags = if last_buffered { TcpFlags::PSH } else { 0 };
+                let seg = self.build(seq, flags, &payload);
+                self.snd_nxt = self.snd_nxt + n as u32;
+                if self.rtt_sample.is_none() && !self.retransmitted {
+                    self.rtt_sample = Some((now, self.snd_nxt));
+                }
+                self.start_rtx(now);
+                return Some(seg);
+            }
+        } else if unsent_data > 0 && inflight == 0 {
+            // ...or, with a zero window and data to send, probe one byte at SND.UNA (without
+            // advancing SND.NXT — the same byte is sent normally once the window reopens).
+            self.arm_persist(now);
+            if self.send_probe {
+                self.send_probe = false;
+                let mut byte = [0u8; 1];
+                self.tx.peek(0, &mut byte);
+                return Some(self.build(self.snd_una, 0, &byte));
+            }
+        }
+
+        // 2. Send (or retransmit) our FIN once all data is sent. A FIN carries no data, so it
+        //    is sent even into a zero window — otherwise an orderly close could wedge.
+        if self.fin_queued && !self.fin_acked && self.snd_nxt == data_end {
+            let seg = self.build(data_end, TcpFlags::FIN, b"");
+            self.fin_seq = Some(data_end);
             self.snd_nxt = data_end + 1;
             self.start_rtx(now);
             self.state = match self.state {
@@ -503,19 +536,21 @@ impl Tcb {
 
     // ── helpers ───────────────────────────────────────────────────────────────────────────
 
+    // Both window predicates use `rcv_adv` — the right edge we actually advertised, which
+    // never moves left — rather than `rcv_nxt + rcv_wnd`, which can drift right of the
+    // advertised edge between accepting data and the next ACK.
     fn seq_in_window(&self, seq: SeqNumber) -> bool {
-        let wnd = self.rcv_wnd as u32;
-        if wnd == 0 {
-            seq == self.rcv_nxt
+        if self.rcv_adv == self.rcv_nxt {
+            seq == self.rcv_nxt // zero window
         } else {
-            seq.ge(self.rcv_nxt) && seq.lt(self.rcv_nxt + wnd)
+            seq.ge(self.rcv_nxt) && seq.lt(self.rcv_adv)
         }
     }
 
     fn segment_acceptable(&self, seq: SeqNumber, seg_len: u32) -> bool {
-        let wnd = self.rcv_wnd as u32;
-        let right = self.rcv_nxt + wnd;
-        match (seg_len == 0, wnd == 0) {
+        let zero_window = self.rcv_adv == self.rcv_nxt;
+        let right = self.rcv_adv;
+        match (seg_len == 0, zero_window) {
             (true, true) => seq == self.rcv_nxt,
             (true, false) => seq.ge(self.rcv_nxt) && seq.lt(right),
             (false, true) => false,
@@ -606,9 +641,7 @@ impl Tcb {
             candidate_right
         };
         self.rcv_adv = right;
-        let w = right.offset_from(self.rcv_nxt).min(0xFFFF) as u16;
-        self.rcv_wnd = w;
-        w
+        right.offset_from(self.rcv_nxt).min(0xFFFF) as u16
     }
 
     /// Build a bare RST (no ACK flag) carrying `seq` — used to reject a bad half-open ACK.
@@ -918,5 +951,76 @@ mod tests {
         let rcv_nxt = after + 5536;
         deliver(&mut tcb, now, &inbound(rcv_nxt, SeqNumber::new(0), TcpFlags::RST, 0, None, b""));
         assert_eq!(tcb.state, State::Closed);
+    }
+
+    #[test]
+    fn reset_at_rcv_nxt_sets_reset_flag() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 14000, 64000);
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::RST, 64000, None, b""));
+        assert_eq!(tcb.state, State::Closed);
+        assert!(tcb.is_reset()); // distinguishes an abortive reset from an orderly FIN
+    }
+
+    #[test]
+    fn fin_is_sent_into_a_zero_window() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, _cnxt) = established(now, 15000, 0); // peer advertises window 0
+        tcb.close();
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1, "a FIN carries no data, so it is sent despite a zero window");
+        assert!(out[0].flags.fin());
+        assert_eq!(out[0].seq, iss + 1);
+        assert_eq!(tcb.state, State::FinWait1);
+        assert!(tcb.poll_at().is_some(), "rtx armed -> the close cannot wedge");
+    }
+
+    #[test]
+    fn fin_wait2_is_bounded_by_a_timer() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 16000, 64000);
+        tcb.close();
+        drain(&mut tcb, now); // FIN -> FinWait1
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 2, TcpFlags::ACK, 64000, None, b"")); // ack our FIN
+        assert_eq!(tcb.state, State::FinWait2);
+        let deadline = tcb.poll_at().expect("FIN-WAIT-2 must be timer-bounded, not leaked");
+        tcb.on_timer(deadline.plus_millis(1));
+        assert_eq!(tcb.state, State::Closed);
+    }
+
+    #[test]
+    fn retransmitted_fin_in_time_wait_rearms_the_timer() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 17000, 64000);
+        tcb.close();
+        drain(&mut tcb, now);
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 2, TcpFlags::ACK, 64000, None, b"")); // -> FinWait2
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 2, TcpFlags::FIN | TcpFlags::ACK, 64000, None, b"")); // -> TimeWait
+        assert_eq!(tcb.state, State::TimeWait);
+        drain(&mut tcb, now);
+        let first = tcb.poll_at().unwrap();
+        // A retransmitted FIN arrives later; its seq is RCV.NXT-1 and would fail the strict
+        // acceptability test, but TIME-WAIT must still re-ACK it and extend 2*MSL.
+        let later = now.plus_millis(1000);
+        deliver(&mut tcb, later, &inbound(cnxt, iss + 2, TcpFlags::FIN | TcpFlags::ACK, 64000, None, b""));
+        assert_eq!(tcb.state, State::TimeWait);
+        assert!(drain(&mut tcb, later).iter().any(|o| o.flags.ack()));
+        assert!(tcb.poll_at().unwrap().millis() > first.millis(), "2*MSL re-armed");
+    }
+
+    #[test]
+    fn window_update_acks_do_not_fast_retransmit() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 18000, 64000);
+        tcb.send(b"payload");
+        drain(&mut tcb, now);
+        // Three ACKs at SND.UNA, each with a *different* advertised window -> not duplicates.
+        for w in [50000u16, 40000, 30000] {
+            deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, w, None, b""));
+        }
+        assert!(
+            drain(&mut tcb, now).is_empty(),
+            "pure window-update ACKs must not be counted as dup-ACKs / trigger fast retransmit"
+        );
     }
 }

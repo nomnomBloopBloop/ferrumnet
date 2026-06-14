@@ -17,6 +17,9 @@ use crate::state::State;
 use super::reactor::ReactorState;
 
 /// A listening socket bound to the runtime's local endpoint.
+///
+/// Invariant: drive it from a **single** accept loop. The reactor keeps one `accept_waker`
+/// slot, so two concurrently-pending `accept()` futures on clones would clobber each other.
 #[derive(Clone)]
 pub struct TcpListener {
     state: Rc<RefCell<ReactorState>>,
@@ -44,15 +47,21 @@ impl Future for Accept {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TcpStream> {
         let mut s = self.state.borrow_mut();
-        if let Some(remote) = s.accept_queue.pop_front() {
-            Poll::Ready(TcpStream {
-                state: self.state.clone(),
-                remote,
-            })
-        } else {
-            s.accept_waker = Some(cx.waker().clone());
-            Poll::Pending
+        // Skip any queued connection that was reset/closed before we got to it.
+        while let Some(remote) = s.accept_queue.pop_front() {
+            let usable = s
+                .stack
+                .connection_mut(&remote)
+                .map_or(false, |t| t.is_synchronized() || t.rx_available() > 0);
+            if usable {
+                return Poll::Ready(TcpStream {
+                    state: self.state.clone(),
+                    remote,
+                });
+            }
         }
+        s.accept_waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -117,9 +126,11 @@ impl Future for Read<'_> {
             None => Poll::Ready(Ok(0)), // connection gone -> EOF
             Some(tcb) => {
                 if tcb.rx_available() > 0 {
-                    Poll::Ready(Ok(tcb.recv(me.buf)))
-                } else if tcb.recv_eof() {
-                    Poll::Ready(Ok(0))
+                    Poll::Ready(Ok(tcb.recv(me.buf))) // deliver buffered data first
+                } else if tcb.is_reset() {
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "connection reset")))
+                } else if tcb.recv_eof() || tcb.state == State::Closed {
+                    Poll::Ready(Ok(0)) // orderly EOF (peer FIN)
                 } else {
                     s.read_wakers.insert(remote, cx.waker().clone());
                     Poll::Pending
@@ -143,6 +154,9 @@ impl Future for Write<'_> {
         match s.stack.connection_mut(&remote) {
             None => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection reset"))),
             Some(tcb) => {
+                if tcb.is_reset() {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "connection reset")));
+                }
                 if !matches!(tcb.state, State::Established | State::CloseWait) {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "not connected")));
                 }

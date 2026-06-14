@@ -56,6 +56,9 @@ impl RttEstimator {
 
     /// Incorporate a fresh RTT measurement `r` (ms) from a non-retransmitted segment.
     pub fn on_sample(&mut self, r: u32) {
+        // A sample longer than the max RTO is meaningless; clamping it also keeps the
+        // SRTT/RTTVAR arithmetic below from overflowing on a pathological measurement.
+        let r = r.min(MAX_RTO);
         if !self.have_measurement {
             // RFC 6298 (2.2): first measurement.
             self.srtt = r;

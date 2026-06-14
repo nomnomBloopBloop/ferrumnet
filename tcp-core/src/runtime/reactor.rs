@@ -141,14 +141,16 @@ impl<D: Device> Runtime<D> {
     fn dispatch_wakeups(&self) {
         let mut s = self.state.borrow_mut();
 
-        // Newly established connections -> accept queue (each announced exactly once).
-        let established: Vec<Endpoint> = s
+        // Any connection past the handshake -> accept queue (each announced exactly once).
+        // We announce on *any* synchronized state, not just Established, because a request +
+        // FIN delivered in one batch can leave the connection in CloseWait before we look.
+        let synced: Vec<Endpoint> = s
             .stack
             .connections_mut()
-            .filter(|(_, t)| t.state == State::Established)
+            .filter(|(_, t)| t.is_synchronized())
             .map(|(e, _)| *e)
             .collect();
-        for ep in established {
+        for ep in synced {
             if s.announced.insert(ep) {
                 s.accept_queue.push_back(ep);
             }
@@ -159,11 +161,11 @@ impl<D: Device> Runtime<D> {
             }
         }
 
-        // Wake reads whose connection has data, reached EOF, or vanished.
+        // Wake reads whose connection has data, reached EOF, was reset, or vanished.
         let read_keys: Vec<Endpoint> = s.read_wakers.keys().copied().collect();
         for ep in read_keys {
             let ready = match s.stack.connection_mut(&ep) {
-                Some(t) => t.rx_available() > 0 || t.recv_eof(),
+                Some(t) => t.rx_available() > 0 || t.recv_eof() || t.state == State::Closed,
                 None => true,
             };
             if ready {
@@ -173,11 +175,14 @@ impl<D: Device> Runtime<D> {
             }
         }
 
-        // Wake writes whose connection can accept more data, or vanished.
+        // Wake writes whose connection can accept more data, or can no longer send (so the
+        // future observes the error) — or vanished.
         let write_keys: Vec<Endpoint> = s.write_wakers.keys().copied().collect();
         for ep in write_keys {
             let ready = match s.stack.connection_mut(&ep) {
-                Some(t) => t.tx_free() > 0 && matches!(t.state, State::Established | State::CloseWait),
+                Some(t) => {
+                    !matches!(t.state, State::Established | State::CloseWait) || t.tx_free() > 0
+                }
                 None => true,
             };
             if ready {
@@ -187,9 +192,11 @@ impl<D: Device> Runtime<D> {
             }
         }
 
-        // Drop bookkeeping for connections the stack has reaped.
+        // Drop bookkeeping for connections the stack has reaped, and prune the accept queue so
+        // it never hands out a stream for a connection that no longer exists.
         let live: HashSet<Endpoint> = s.stack.connections_mut().map(|(e, _)| *e).collect();
         s.announced.retain(|ep| live.contains(ep));
+        s.accept_queue.retain(|ep| live.contains(ep));
     }
 }
 
@@ -227,7 +234,6 @@ mod tests {
     struct Parsed {
         flags: TcpFlags,
         seq: SeqNumber,
-        ack: SeqNumber,
         payload: Vec<u8>,
     }
 
@@ -237,7 +243,6 @@ mod tests {
         Parsed {
             flags: tcp.flags(),
             seq: tcp.seq(),
-            ack: tcp.ack(),
             payload: tcp.payload().to_vec(),
         }
     }
@@ -339,6 +344,83 @@ mod tests {
             let got: Vec<u8> = out.iter().flat_map(|f| parse(f).payload).collect();
             assert_eq!(&got, b"ok", "connection {i} should be served");
         }
+    }
+
+    #[test]
+    fn reset_wakes_a_blocked_reader_with_an_error() {
+        let mut rt = Runtime::new(MockDevice::new(), Endpoint::new(US, 8080), [7u8; 16]);
+        let listener = rt.listener();
+        let errored = std::rc::Rc::new(std::cell::RefCell::new(None::<bool>));
+        let e = errored.clone();
+        rt.spawn(async move {
+            let stream = listener.accept().await;
+            let mut buf = [0u8; 16];
+            let res = stream.read(&mut buf).await; // parks: no data yet
+            *e.borrow_mut() = Some(res.is_err());
+        });
+
+        let t = Instant::from_millis(0);
+        rt.device_mut().inject(client_seg(SeqNumber::new(100), SeqNumber::new(0), TcpFlags::SYN, b""));
+        rt.turn(t).unwrap();
+        let iss = parse(&rt.device_mut().take_outbound()[0]).seq;
+        rt.device_mut().inject(client_seg(SeqNumber::new(101), iss + 1, TcpFlags::ACK, b""));
+        rt.turn(t).unwrap();
+        rt.device_mut().take_outbound();
+        assert_eq!(*errored.borrow(), None, "reader should still be parked");
+
+        // RST the connection: the parked read must resolve (with an error), not hang.
+        rt.device_mut().inject(client_seg(SeqNumber::new(101), iss + 1, TcpFlags::RST, b""));
+        rt.turn(t).unwrap();
+        assert_eq!(*errored.borrow(), Some(true));
+    }
+
+    #[test]
+    fn accepts_a_connection_that_reaches_closewait_in_one_batch() {
+        let mut rt = Runtime::new(MockDevice::new(), Endpoint::new(US, 8080), [8u8; 16]);
+        let listener = rt.listener();
+        let served = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let sv = served.clone();
+        rt.spawn(async move {
+            let stream = listener.accept().await;
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            if got == b"hello" {
+                *sv.borrow_mut() = true;
+            }
+            let _ = stream.write_all(b"bye").await;
+            stream.close();
+        });
+
+        let t = Instant::from_millis(0);
+        rt.device_mut().inject(client_seg(SeqNumber::new(200), SeqNumber::new(0), TcpFlags::SYN, b""));
+        rt.turn(t).unwrap();
+        let iss = parse(&rt.device_mut().take_outbound()[0]).seq;
+        // The handshake ACK and a data+FIN segment arrive in the SAME ingest batch, so the
+        // connection goes Established -> CloseWait before dispatch_wakeups runs.
+        rt.device_mut().inject(client_seg(SeqNumber::new(201), iss + 1, TcpFlags::ACK, b""));
+        rt.device_mut().inject(client_seg(
+            SeqNumber::new(201),
+            iss + 1,
+            TcpFlags::ACK | TcpFlags::PSH | TcpFlags::FIN,
+            b"hello",
+        ));
+        rt.turn(t).unwrap();
+
+        assert!(*served.borrow(), "a connection that closed in one batch must still be accepted");
+        let body: Vec<u8> = rt
+            .device_mut()
+            .take_outbound()
+            .iter()
+            .flat_map(|f| parse(f).payload)
+            .collect();
+        assert!(body.windows(3).any(|w| w == b"bye"), "server should still respond");
     }
 
     // Build a segment for connection `idx` (distinct client port).
