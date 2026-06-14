@@ -15,6 +15,7 @@
 //! the send window in M3.
 
 use crate::buffers::RingBuffer;
+use crate::congestion::Tahoe;
 use crate::iface::{build_segment, Endpoint};
 use crate::rtt::RttEstimator;
 use crate::seq::SeqNumber;
@@ -56,6 +57,7 @@ pub struct Tcb {
     rx: RingBuffer, // in-order received data awaiting the application
 
     rtt: RttEstimator,
+    cc: Tahoe,
     /// (sent_at, seq_end) of the segment currently being timed for RTT, if any.
     rtt_sample: Option<(Instant, SeqNumber)>,
     /// The outstanding window has been retransmitted; suppress RTT sampling (Karn).
@@ -114,6 +116,7 @@ impl Tcb {
             tx: RingBuffer::with_capacity(TX_BUFFER),
             rx: RingBuffer::with_capacity(RX_BUFFER),
             rtt: RttEstimator::new(),
+            cc: Tahoe::new(snd_mss),
             rtt_sample: None,
             retransmitted: false,
             rtx_deadline: None,
@@ -221,8 +224,26 @@ impl Tcb {
                 self.pending_reset = Some(seg_ack);
                 return;
             }
-        } else if !self.process_ack(seg_seq, seg_ack, tcp.window(), now) {
-            return; // SEG.ACK > SND.NXT: ACK already owed, drop the segment
+        } else {
+            // A pure, non-advancing ACK with outstanding data is a duplicate ACK.
+            let is_dup = payload.is_empty()
+                && !flags.fin()
+                && !flags.syn()
+                && seg_ack == self.snd_una
+                && self.snd_una != self.snd_nxt;
+            if !self.process_ack(seg_seq, seg_ack, tcp.window(), now) {
+                return; // SEG.ACK > SND.NXT: ACK already owed, drop the segment
+            }
+            if is_dup {
+                let flight = self.snd_nxt.offset_from(self.snd_una);
+                if self.cc.on_dup_ack(flight) {
+                    // Fast retransmit (Tahoe): resend from SND.UNA; suppress RTT sampling.
+                    self.snd_nxt = self.snd_una;
+                    self.retransmitted = true;
+                    self.rtt_sample = None;
+                    self.restart_rtx(now);
+                }
+            }
         }
 
         // (6) In-order data.
@@ -268,6 +289,7 @@ impl Tcb {
             let acked = seg_ack.offset_from(self.snd_una) as usize;
             let data_acked = acked.min(self.tx.len());
             self.tx.consume(data_acked);
+            self.cc.on_ack(data_acked as u32); // grow cwnd by the data bytes acknowledged
             if let Some(fin_seq) = self.fin_seq {
                 if seg_ack.gt(fin_seq) {
                     self.fin_acked = true;
@@ -389,7 +411,7 @@ impl Tcb {
 
     fn transmit_data_or_fin(&mut self, now: Instant) -> Option<Vec<u8>> {
         let inflight = self.snd_nxt.offset_from(self.snd_una);
-        let usable = self.snd_wnd as u32; // M3: min(cwnd, snd_wnd)
+        let usable = self.cc.cwnd().min(self.snd_wnd as u32); // min(cwnd, advertised window)
         let sent_data = (inflight as usize).min(self.tx.len());
         let unsent_data = self.tx.len() - sent_data;
 
@@ -456,6 +478,8 @@ impl Tcb {
     pub fn on_timer(&mut self, now: Instant) {
         if let Some(d) = self.rtx_deadline {
             if now >= d {
+                let flight = self.snd_nxt.offset_from(self.snd_una);
+                self.cc.on_rto(flight); // ssthresh = max(flight/2, 2*MSS); cwnd = 1*MSS
                 self.rtt.on_timeout();
                 self.snd_nxt = self.snd_una; // go-back-N
                 self.retransmitted = true;
@@ -841,6 +865,43 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].flags.ack() && !out[0].flags.fin());
         assert_eq!(out[0].ack, cnxt); // dup ACK of our RCV.NXT
+    }
+
+    #[test]
+    fn slow_start_caps_first_burst_at_initial_window() {
+        let now = Instant::from_millis(0);
+        // Large advertised window so the *congestion* window is the only limit.
+        let (mut tcb, iss, _cnxt) = established(now, 12000, 64000);
+        let data = vec![0u8; 30000];
+        assert_eq!(tcb.send(&data), 30000);
+        let out = drain(&mut tcb, now);
+        // RFC 6928 IW for MSS 1460 = 14600 bytes = ten 1460-byte segments.
+        let sent: usize = out.iter().map(|o| o.payload.len()).sum();
+        assert_eq!(sent, 14600);
+        assert_eq!(out.len(), 10);
+        assert_eq!(out[0].seq, iss + 1);
+    }
+
+    #[test]
+    fn three_dup_acks_fast_retransmit_and_collapse_cwnd() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 13000, 64000);
+        let data: Vec<u8> = (0..5000).map(|i| i as u8).collect();
+        tcb.send(&data);
+        let out = drain(&mut tcb, now); // initial burst (within IW)
+        assert!(out.len() >= 4);
+
+        // Three duplicate ACKs for iss+1 (no new data acknowledged).
+        let dup = |t: &mut Tcb| {
+            deliver(t, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, 64000, None, b""));
+            drain(t, now)
+        };
+        assert!(dup(&mut tcb).is_empty()); // 1st
+        assert!(dup(&mut tcb).is_empty()); // 2nd
+        let out = dup(&mut tcb); // 3rd -> fast retransmit
+        assert_eq!(out.len(), 1, "fast retransmit emits one segment");
+        assert_eq!(out[0].seq, iss + 1); // resent from SND.UNA
+        assert_eq!(out[0].payload, &data[..1460]); // exactly one (collapsed) cwnd of 1 MSS
     }
 
     #[test]

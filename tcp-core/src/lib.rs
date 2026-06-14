@@ -23,6 +23,7 @@
 #![deny(unsafe_code)]
 
 pub mod buffers;
+pub mod congestion;
 pub mod iface;
 pub mod isn;
 pub mod rtt;
