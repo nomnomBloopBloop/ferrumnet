@@ -159,6 +159,30 @@ impl Reasm {
         Vec::new()
     }
 
+    /// Drop buffered data the advancing `rcv_nxt` has overtaken: runs entirely at or below it are
+    /// removed (they duplicate data just delivered in order), and a run straddling it has its
+    /// already-delivered `[start, rcv_nxt)` prefix dropped and its left edge clipped up to
+    /// `rcv_nxt`. Without this, an in-order segment that overlaps a buffered run would leave the
+    /// run stranded below `rcv_nxt` — leaking the receive budget and emitting a SACK block below
+    /// the cumulative ACK.
+    pub fn discard_below(&mut self, rcv_nxt: SeqNumber) {
+        while let Some(first) = self.runs.first_mut() {
+            let run_end = first.start + first.data.len() as u32;
+            if run_end.le(rcv_nxt) {
+                let seg = self.runs.remove(0);
+                self.bytes -= seg.data.len();
+            } else if first.start.lt(rcv_nxt) {
+                let drop = rcv_nxt.offset_from(first.start) as usize;
+                first.data.drain(..drop);
+                first.start = rcv_nxt;
+                self.bytes -= drop;
+                break; // only the lowest run can straddle rcv_nxt
+            } else {
+                break; // the lowest run is already at or above rcv_nxt
+            }
+        }
+    }
+
     /// Re-buffer the unwritten tail of a popped run at the front (used only by the defensive
     /// drain guard — unreachable under the window invariant, but it must not lose bytes).
     /// `start` is below every remaining run's start, so it goes at index 0.
@@ -324,5 +348,29 @@ mod tests {
         assert_eq!(r.buffered(), 200);
         let v = report_vec(&r);
         assert_eq!(v, vec![(0xFFFF_FF80, 0x48)]); // 0xFFFFFF80 + 200 wraps to 0x48
+    }
+
+    #[test]
+    fn discard_below_purges_and_clips_overtaken_runs() {
+        let nxt = seq(0);
+        let mut r = Reasm::new();
+        r.insert(nxt, wide(nxt), seq(100), &[1u8; 50]); // [100,150)
+        r.insert(nxt, wide(nxt), seq(300), &[2u8; 50]); // [300,350)
+        assert_eq!(r.buffered(), 100);
+        // An in-order write overtook rcv_nxt to 320: [100,150) is wholly below (purged), and
+        // [300,350) straddles 320 -> clipped to [320,350). The clipped run sits exactly at
+        // rcv_nxt, so the caller's pop_contiguous drains it next (the steady-state "strictly
+        // above" invariant is restored after that pop).
+        r.discard_below(seq(320));
+        assert_eq!(r.buffered(), 30); // only [320,350) survives
+        let popped = r.pop_contiguous(seq(320));
+        assert_eq!(popped.len(), 30);
+        assert!(r.is_empty());
+        assert_eq!(r.buffered(), 0);
+        // Discarding past everything empties without surprises.
+        let mut r2 = Reasm::new();
+        r2.insert(nxt, wide(nxt), seq(100), &[1u8; 50]);
+        r2.discard_below(seq(500));
+        assert!(r2.is_empty());
     }
 }

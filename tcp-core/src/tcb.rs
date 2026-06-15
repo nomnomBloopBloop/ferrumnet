@@ -335,29 +335,43 @@ impl Tcb {
         // out-of-order runs contiguous, which are then drained in). Out-of-order data — a gap
         // below it — is buffered for reassembly when SACK is enabled, instead of being dropped.
         if !payload.is_empty() {
-            if seg_seq == self.rcv_nxt {
-                let n = self.rx.write(payload);
-                self.rcv_nxt += n as u32;
-                if self.sack_enabled {
-                    // Drain any buffered runs the new in-order data just made contiguous.
-                    loop {
-                        let run = self.reasm.pop_contiguous(self.rcv_nxt);
-                        if run.is_empty() {
-                            break;
-                        }
-                        let w = self.rx.write(&run);
-                        self.rcv_nxt += w as u32;
-                        if w < run.len() {
-                            // Unreachable under the window-budget invariant, but never lose the
-                            // tail: re-buffer it and stop draining.
-                            self.reasm.reinsert_front(self.rcv_nxt, run[w..].to_vec());
-                            break;
+            // Left-trim a segment overlapping the left window edge (seg_seq < RCV.NXT) so its
+            // fresh in-order tail is delivered rather than dropped; an already-delivered prefix
+            // (or a wholly-duplicate segment) trims to empty.
+            let (data_seq, data): (SeqNumber, &[u8]) = if seg_seq.lt(self.rcv_nxt) {
+                let off = (self.rcv_nxt.offset_from(seg_seq) as usize).min(payload.len());
+                (self.rcv_nxt, &payload[off..])
+            } else {
+                (seg_seq, payload)
+            };
+            if !data.is_empty() {
+                if data_seq == self.rcv_nxt {
+                    let n = self.rx.write(data);
+                    self.rcv_nxt += n as u32;
+                    if self.sack_enabled {
+                        // The in-order write may have overtaken buffered runs: purge/clip those
+                        // now below RCV.NXT, then drain any run it made contiguous.
+                        self.reasm.discard_below(self.rcv_nxt);
+                        loop {
+                            let run = self.reasm.pop_contiguous(self.rcv_nxt);
+                            if run.is_empty() {
+                                break;
+                            }
+                            let w = self.rx.write(&run);
+                            self.rcv_nxt += w as u32;
+                            if w < run.len() {
+                                // Unreachable under the window-budget invariant, but never lose
+                                // the tail: re-buffer it and stop draining.
+                                self.reasm.reinsert_front(self.rcv_nxt, run[w..].to_vec());
+                                break;
+                            }
                         }
                     }
+                } else if self.sack_enabled {
+                    // data_seq > RCV.NXT: a gap remains below it — buffer for reassembly.
+                    let edge = self.reasm_right_edge();
+                    self.reasm.insert(self.rcv_nxt, edge, data_seq, data);
                 }
-            } else if self.sack_enabled && seg_seq.gt(self.rcv_nxt) {
-                let edge = self.reasm_right_edge();
-                self.reasm.insert(self.rcv_nxt, edge, seg_seq, payload);
             }
             // In-order or not (gap / no room), the peer is owed an ACK of our RCV.NXT.
             self.needs_ack = true;
@@ -423,6 +437,10 @@ impl Tcb {
                     // (deflated) ssthresh. Reset Reno's dup-ACK counter without growing cwnd.
                     self.scoreboard.exit_recovery();
                     self.cc.on_ack(0);
+                    // Data sent fresh during recovery (above RecoveryPoint) was never
+                    // retransmitted, so RTT sampling may resume. Clearing this here (not only on
+                    // full drain) avoids suppressing samples for the rest of a healthy flow.
+                    self.retransmitted = false;
                 }
             }
 
@@ -565,13 +583,25 @@ impl Tcb {
         if self.retransmit && inflight > 0 {
             self.retransmit = false;
             let n = (inflight as usize).min(self.tx.len()).min(self.snd_mss as usize);
-            let mut payload = vec![0u8; n];
-            self.tx.peek(0, &mut payload);
-            let psh = n == self.tx.len();
-            let flags = if psh { TcpFlags::PSH } else { 0 };
-            let seg = self.build(self.snd_una, flags, &payload);
-            self.start_rtx(now);
-            return Some(seg);
+            if n > 0 {
+                let mut payload = vec![0u8; n];
+                self.tx.peek(0, &mut payload);
+                let psh = n == self.tx.len();
+                let flags = if psh { TcpFlags::PSH } else { 0 };
+                let seg = self.build(self.snd_una, flags, &payload);
+                self.start_rtx(now);
+                return Some(seg);
+            }
+            // No data to resend (tx drained) but data is still in flight: the outstanding octet
+            // is our FIN. Retransmit it at its own sequence slot — peeking tx would yield nothing
+            // and emit an empty segment, leaving a lost FIN to never be resent.
+            if let Some(fin_seq) = self.fin_seq {
+                if !self.fin_acked && self.snd_una == fin_seq {
+                    let seg = self.build(fin_seq, TcpFlags::FIN, b"");
+                    self.start_rtx(now);
+                    return Some(seg);
+                }
+            }
         }
 
         // 0.5. SACK selective retransmit (RFC 6675): during recovery, repair lost holes before
@@ -885,6 +915,10 @@ impl Tcb {
     #[cfg(test)]
     fn reasm_buffered_dbg(&self) -> usize {
         self.reasm.buffered()
+    }
+    #[cfg(test)]
+    fn retransmitted_dbg(&self) -> bool {
+        self.retransmitted
     }
 }
 
@@ -1461,5 +1495,87 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].seq, iss + 1);
         assert!(!tcb.in_sack_recovery_dbg(), "a non-SACK connection never enters SACK recovery");
+    }
+
+    // ── review regression tests (M8 adversarial findings) ─────────────────────────────────────
+
+    #[test]
+    fn lost_fin_is_retransmitted_on_rto() {
+        // Finding #1: a FIN that is the only outstanding octet must be retransmitted on RTO; the
+        // go-back-N path peeks tx (empty) and would otherwise emit an empty segment, never the FIN.
+        let now = Instant::from_millis(0);
+        let (mut tcb, _iss, cnxt) = established(now, 900, 64000);
+        tcb.send(b"hello");
+        assert_eq!(drain(&mut tcb, now)[0].payload, b"hello");
+        tcb.close();
+        let out = drain(&mut tcb, now);
+        assert!(out[0].flags.fin());
+        let fin_seq = out[0].seq;
+        // Peer ACKs the data but not the FIN (cumulative ack == fin_seq).
+        deliver(&mut tcb, now, &inbound(cnxt, fin_seq, TcpFlags::ACK, 64000, None, b""));
+        assert_eq!(tcb.state, State::FinWait1);
+        assert!(drain(&mut tcb, now).is_empty(), "nothing to send until the RTO");
+        let deadline = tcb.poll_at().expect("rtx armed for the unacked FIN");
+        let later = deadline.plus_millis(1);
+        tcb.on_timer(later);
+        let out = drain(&mut tcb, later);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags.fin(), "the lost FIN is retransmitted, not an empty segment");
+        assert_eq!(out[0].seq, fin_seq);
+    }
+
+    #[test]
+    fn overlapping_in_order_write_purges_stale_ooo_run() {
+        // Finding #2: an in-order segment overlapping a buffered OOO run must purge the run so it
+        // doesn't leak the receive budget or emit a SACK block below the cumulative ACK.
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established_sack(now, 250, 64000);
+        deliver(&mut tcb, now, &inbound(cnxt + 1000, iss + 1, TcpFlags::ACK, 64000, None, &vec![7u8; 1000]));
+        assert_eq!(tcb.reasm_buffered_dbg(), 1000);
+        drain_raw(&mut tcb, now);
+        // A repacketized gap-fill [cnxt, cnxt+2000) overlaps the buffered run entirely.
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, 64000, None, &vec![5u8; 2000]));
+        assert_eq!(tcb.rx_available(), 2000, "all in-order data delivered");
+        assert_eq!(tcb.reasm_buffered_dbg(), 0, "the stale OOO run is purged (no budget leak)");
+        let frames = drain_raw(&mut tcb, now);
+        assert_eq!(parse(&frames[0]).ack, cnxt + 2000);
+        assert!(parse_sack(&frames[0]).1.is_empty(), "no SACK block below the cumulative ACK");
+    }
+
+    #[test]
+    fn left_overlapping_segment_delivers_fresh_tail() {
+        // Finding #3: a segment overlapping the left window edge must deliver its fresh in-order
+        // tail rather than drop it (also exercises the legacy, non-SACK path).
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 260, 64000);
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, 64000, None, &[1u8; 50]));
+        assert_eq!(tcb.rx_available(), 50);
+        drain(&mut tcb, now);
+        // A re-segmented retransmit [cnxt, cnxt+80): first 50 bytes old, 30 fresh in order.
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK, 64000, None, &[2u8; 80]));
+        assert_eq!(tcb.rx_available(), 80, "the fresh in-order tail is delivered, not dropped");
+        assert_eq!(drain(&mut tcb, now)[0].ack, cnxt + 80, "RCV.NXT advanced past the tail");
+    }
+
+    #[test]
+    fn retransmitted_clears_on_sack_recovery_exit() {
+        // Finding #4: the Karn `retransmitted` guard must clear when SACK recovery exits, not only
+        // on full drain, so RTT sampling resumes for data sent fresh during recovery.
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established_sack(now, 270, 64000);
+        let data: Vec<u8> = (0..5000).map(|i| i as u8).collect();
+        tcb.send(&data);
+        drain_raw(&mut tcb, now);
+        deliver(&mut tcb, now, &inbound_with_sack(cnxt, iss + 1, 64000, &[(iss + 1461, iss + 5001)]));
+        assert!(tcb.in_sack_recovery_dbg());
+        drain_raw(&mut tcb, now); // retransmit the hole
+        assert!(tcb.retransmitted_dbg(), "Karn guard set during recovery");
+        // New data sent during recovery pushes SND.NXT past RecoveryPoint.
+        tcb.send(&[9u8; 2000]);
+        drain_raw(&mut tcb, now);
+        // Cumulative ACK reaches RecoveryPoint while the new data is still in flight.
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 5001, TcpFlags::ACK, 64000, None, b""));
+        assert!(!tcb.in_sack_recovery_dbg());
+        assert!(!tcb.retransmitted_dbg(), "RTT sampling resumes after recovery exit");
     }
 }
