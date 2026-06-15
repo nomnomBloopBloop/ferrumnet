@@ -37,38 +37,42 @@ $ curl -v http://10.0.0.2:8080/
 
 ## Benchmarks
 
-Measured on a 2-vCPU Ubuntu 22.04 VPS over `tun0` (MTU 1500). It's a same-host path, so it is
-CPU-bound — this measures the stack's processing efficiency, not link speed.
+Measured on a 2-vCPU ("Common KVM processor") Ubuntu 22.04.5 VPS (kernel 5.15, Rust 1.75) over
+`tun0`, a same-host path — so it measures the stack's processing efficiency, not link speed.
+Figures are **medians** over the runs noted; the VPS is shared, so the occasional outlier is a
+contention dip (median is robust).
 
-- **Throughput** (`GET /bench`, single-threaded): **~135–145 MB/s** at the default 1500-byte MTU,
-  and **~290–340 MB/s** with the MTU raised to 65535. The advertised MSS auto-adapts to the
-  device MTU, so a larger MTU sends the same data in far fewer packets — and far fewer `write`
-  syscalls.
-- **Latency:** ICMP RTT (100 packets) min/avg/max ≈ **0.07 / 0.11 / 0.18 ms**; small HTTP request
-  ~0.5 ms.
-- **CPU** during a large transfer: ~1 core, dominated by **system** time — the per-packet
-  `read`/`write` syscalls. A TUN char device is one packet per `write` (it is not a socket, so
-  `sendmmsg` does not apply, and `writev` only *gathers* into a single packet), so raising the MTU
-  is the practical way to cut the syscall count — which is why match-MTU roughly doubles
-  throughput here.
+- **Throughput** (`GET /bench`, 64 MiB, single-threaded): **~140 MB/s** at the default 1500-byte
+  MTU (median of 10), and **~337 MB/s** at MTU 65535 (median of 10; 9 of 10 runs in 316–356). The
+  advertised MSS auto-adapts to the device MTU, so a larger MTU sends the same data in ~2.4× fewer
+  packets — and `write` syscalls. (SACK does not change no-loss throughput; it is inactive at 0%
+  loss.)
+- **Latency:** ICMP RTT (100 packets) min/avg/max/mdev = **0.047 / 0.099 / 0.180 / 0.028 ms**.
+- **CPU** under sustained load (`vmstat`, system-wide over 2 vCPU): MTU 1500 → 30% user /
+  **50% system** / 20% idle; MTU 65535 → 28% user / **17% system** / 55% idle. **System time
+  collapses with the larger MTU** — the stack is *syscall-bound* at small MTU (a TUN is one packet
+  per `write`; it is not a socket, so `sendmmsg` does not apply, and `writev` only *gathers* into a
+  single packet), and becomes *window-bound* at large MTU (the 64 KiB window caps it at ~1 segment
+  in flight per RTT).
 
-**Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB transfer) — every
-transfer **completes correctly**, and **SACK selective repair** (RFC 2018 + RFC 6675) recovers the
-high-loss tail far faster than the previous go-back-N single-segment repair:
+**Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB), measured **before and
+after SACK in the same session** — every transfer completes correctly, and **SACK selective
+repair** (RFC 2018 + RFC 6675) recovers the tail far faster than go-back-N:
 
 | packet loss | 0% | 1% | 2% | 5% | 10% |
 |---|---|---|---|---|---|
-| go-back-N (before) | 101 | 16.5 | 2.5 | 0.33 | 0.09 |
-| **SACK (now)** | **~98** | **~83** | **~9** | **~2** | **~0.5** |
+| go-back-N (before) | 93.9 | 9.2 | 2.5 | 0.40 | 0.10 |
+| **SACK (now)** | **94.6** | **91.4** | **9.3** | **2.0** | **0.4** |
+| speedup | 1.0× | ~9.9× | ~3.7× | ~5.0× | ~4.0× |
 
-(MB/s; ~4–5× faster across the tail. Loss is stochastic, so these are small-sample figures.)
+(MB/s, medians; ~4–10× faster across the tail. Loss is stochastic — the 2% cell is bimodal,
+splitting between ~6–14 and ~70–78 MB/s depending on where losses fall.)
 
-**Kernel baseline** (Python `http.server` over `lo`, 16 MiB, 5 runs): ~420–640 MB/s. *Not*
-apples-to-apples — `lo`'s MTU is 65536 vs our default 1500, and the kernel's loopback is fully
-in-kernel (no per-packet syscall or user/kernel copy), so it is structurally faster on this path.
-Matching the MTU closes much of the gap (done — ~2.3× here); dropping the per-segment allocation
-would tighten the hot loop a little more. It won't beat in-kernel loopback, which has neither a
-per-packet syscall nor a user/kernel copy.
+**Kernel baseline** (Python `http.server` over `lo`, kernel TCP, 16 MiB): median **~800 MB/s**
+(556–893). *Not* apples-to-apples — `lo`'s MTU is 65536 and it is fully in-kernel (no per-packet
+syscall or user/kernel copy), so it is structurally faster on this path. Matching the MTU closes
+much of the gap (done — ~2.4× here) and io_uring would cut the remaining syscall overhead; it
+won't beat in-kernel loopback, which has neither a per-packet syscall nor a user/kernel copy.
 
 ## Architecture
 
