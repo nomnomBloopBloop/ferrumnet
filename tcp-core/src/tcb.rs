@@ -64,6 +64,9 @@ const FIN_WAIT2_MILLIS: u64 = 60_000;
 const PERSIST_MIN_MILLIS: u64 = 1_000;
 const PERSIST_MAX_MILLIS: u64 = 60_000;
 const CHALLENGE_ACK_LIMIT: u32 = 100; // RFC 5961 per-connection budget per second
+/// How many times the SYN of an active open (SYN-SENT) is retransmitted before the connect
+/// attempt is abandoned (the connection moves to Closed and the connector observes a timeout).
+const MAX_SYN_RETRIES: u16 = 7;
 
 pub struct Tcb {
     pub state: State,
@@ -118,7 +121,14 @@ pub struct Tcb {
 
     needs_ack: bool, // an ACK is owed (data received, or a dup/challenge ACK)
     send_probe: bool, // the persist timer fired; emit a 1-byte window probe
-    pending_reset: Option<SeqNumber>, // a RST is owed (bad ACK while half-open); seq to stamp
+    /// A RST is owed (bad ACK while half-open): the sequence number to stamp on it. Any state
+    /// transition is applied where the bad ACK is *detected* (in `on_segment`), never here, so a
+    /// connect/read waker sees the resulting Closed in the same reactor turn — `dispatch_wakeups`
+    /// runs before `poll_transmit`, and a connection that only reached Closed during transmit
+    /// would be reaped with its waker stranded.
+    pending_reset: Option<SeqNumber>,
+    /// Count of SYN retransmits while in SYN-SENT (active open), bounding the connect timeout.
+    syn_retries: u16,
 
     // RFC 5961 challenge-ACK rate limiter (per connection — not global; CVE-2016-5696).
     challenge_window_start: Instant,
@@ -195,9 +205,70 @@ impl Tcb {
             needs_ack: false,
             send_probe: false,
             pending_reset: None,
+            syn_retries: 0,
             challenge_window_start: now,
             challenge_count: 0,
             sack_enabled,
+            reasm: Reasm::new(),
+            scoreboard: Scoreboard::new(),
+            pending_fin: None,
+            mss_advertise,
+        }
+    }
+
+    /// Active open: we are initiating a connection. The TCB starts in SYN-SENT; the SYN (offering
+    /// MSS + SACK-Permitted + Window Scale) is emitted by the next `poll_transmit`. The receive
+    /// sequence space (`irs`/`rcv_nxt`) and the peer's options stay unknown until the SYN-ACK
+    /// arrives, where [`Tcb::on_segment_syn_sent`] negotiates them exactly as a passive open does.
+    pub fn new_syn_sent(
+        local: Endpoint,
+        remote: Endpoint,
+        iss: SeqNumber,
+        now: Instant,
+        mss_advertise: u16,
+    ) -> Self {
+        Tcb {
+            state: State::SynSent,
+            local,
+            remote,
+            iss,
+            snd_una: iss,
+            snd_nxt: iss, // the SYN has not been sent yet
+            snd_wnd: 0,   // the peer's window is unknown until the SYN-ACK
+            snd_wl1: iss,
+            snd_wl2: iss,
+            snd_mss: MSS_DEFAULT, // replaced by the peer's MSS (clamped) on the SYN-ACK
+            // We *offer* SACK and window scaling on our SYN (see `build_syn`); whether they are
+            // negotiated is decided when the SYN-ACK arrives. Until then both are inert.
+            window_scaling: false,
+            snd_wscale: 0,
+            rcv_wscale: 0,
+            irs: SeqNumber::new(0), // unknown until the SYN/SYN-ACK carries IRS
+            rcv_nxt: SeqNumber::new(0),
+            rcv_adv: SeqNumber::new(0),
+            tx: RingBuffer::with_capacity(TX_BUFFER),
+            rx: RingBuffer::with_capacity(RX_BUFFER),
+            rtt: RttEstimator::new(),
+            cc: Reno::new(MSS_DEFAULT),
+            rtt_sample: None,
+            retransmitted: false,
+            retransmit: false,
+            rtx_deadline: None,
+            persist_deadline: None,
+            persist_backoff: PERSIST_MIN_MILLIS,
+            time_wait_deadline: None,
+            fin_queued: false,
+            fin_seq: None,
+            fin_acked: false,
+            peer_fin_seen: false,
+            reset: false,
+            needs_ack: false,
+            send_probe: false,
+            pending_reset: None,
+            syn_retries: 0,
+            challenge_window_start: now,
+            challenge_count: 0,
+            sack_enabled: false, // negotiated on the SYN-ACK
             reasm: Reasm::new(),
             scoreboard: Scoreboard::new(),
             pending_fin: None,
@@ -254,10 +325,24 @@ impl Tcb {
     pub fn remote(&self) -> Endpoint {
         self.remote
     }
+    /// This connection's local endpoint. For a passive open it is the listening endpoint; for an
+    /// active open it is the local IP with the ephemeral port chosen by [`crate::iface::Stack`].
+    /// The demux uses it to route a segment to the right connection on a client's ephemeral port.
+    pub fn local(&self) -> Endpoint {
+        self.local
+    }
 
     // ── inbound ───────────────────────────────────────────────────────────────────────────
 
     pub fn on_segment(&mut self, now: Instant, tcp: &TcpPacket<'_>) {
+        // SYN-SENT (active open) has its own RFC 793 §3.9 processing order: the receive window is
+        // not yet established (IRS is unknown), so the four-case acceptability test below does not
+        // apply. Handle it separately, then return.
+        if self.state == State::SynSent {
+            self.on_segment_syn_sent(tcp);
+            return;
+        }
+
         let seg_seq = tcp.seq();
         let seg_ack = tcp.ack();
         let flags = tcp.flags();
@@ -315,9 +400,13 @@ impl Tcb {
                 self.update_window(seg_seq, seg_ack, tcp.window());
                 self.state = State::Established;
                 self.rtx_deadline = None; // SYN-ACK acknowledged
+                self.retransmit = false; // drop any pending SYN-ACK retransmit (now acked)
             } else {
-                // Bad ACK while half-open: owe a RST (emitted by poll_transmit, then Closed).
+                // Bad ACK while half-open: reject the peer with a RST and tear down. Close NOW
+                // (not in poll_transmit) so a connector/reader waker observes Closed in this same
+                // turn; poll_transmit only emits the queued RST.
                 self.pending_reset = Some(seg_ack);
+                self.state = State::Closed;
                 return;
             }
         } else {
@@ -451,6 +540,95 @@ impl Tcb {
         self.recompute_closing_state(now);
     }
 
+    /// RFC 793 §3.9 SYN-SENT segment processing (active open). Steps in the RFC's fixed order:
+    /// check the ACK, then the RST, then the SYN; security/precedence (the third step) is not
+    /// implemented. A segment is never emitted here (sans-IO): an owed RST is queued in
+    /// `pending_reset`, an owed ACK / SYN-ACK is left to `poll_transmit` via `needs_ack` / the
+    /// re-armed SYN-RECEIVED path.
+    fn on_segment_syn_sent(&mut self, tcp: &TcpPacket<'_>) {
+        let flags = tcp.flags();
+        let seg_seq = tcp.seq();
+        let seg_ack = tcp.ack();
+
+        // (1) Check the ACK. With our SYN sent, SND.NXT == ISS+1, so the only acceptable ACK is
+        // ISS < SEG.ACK <= SND.NXT (i.e. it acknowledges exactly our SYN).
+        let ack_present = flags.ack();
+        let ack_acceptable = ack_present && seg_ack.gt(self.iss) && seg_ack.le(self.snd_nxt);
+        if ack_present && !ack_acceptable {
+            // SEG.ACK <= ISS or SEG.ACK > SND.NXT: reset the sender of this bad ACK — unless it
+            // carries RST, in which case just drop it. Either way we stay in SYN-SENT and keep
+            // retransmitting our SYN, per RFC 793 (poll_transmit emits the RST without closing).
+            if !flags.rst() {
+                self.pending_reset = Some(seg_ack);
+            }
+            return;
+        }
+
+        // (2) Check the RST. A RST is honoured only alongside an acceptable ACK (otherwise it is a
+        // blind reset and is dropped). An acceptable ACK + RST means the peer refused the open.
+        if flags.rst() {
+            if ack_acceptable {
+                self.state = State::Closed;
+                self.reset = true; // connection refused
+            }
+            return;
+        }
+
+        // (4) Check the SYN. (Reached only with an acceptable ACK or no ACK, and no RST.)
+        if flags.syn() {
+            // Our SYN drew a response, so cancel any pending SYN retransmit from an earlier RTO.
+            self.retransmit = false;
+            self.irs = seg_seq;
+            self.rcv_nxt = seg_seq + 1; // the peer's SYN consumes one sequence number
+            // RCV.NXT is now known: seed the advertised right edge (it only ever moves right).
+            let rcv_wnd = RX_BUFFER.min(0xFFFF) as u32;
+            self.rcv_adv = self.rcv_nxt + rcv_wnd;
+
+            // Negotiate options from the peer's SYN/SYN-ACK exactly as a passive open does. We
+            // offered all three on our SYN, so each is enabled iff the peer also offers it.
+            self.snd_mss = tcp.mss_option().unwrap_or(MSS_DEFAULT).min(self.mss_advertise);
+            // No data has been sent yet, so re-sizing the congestion window to the negotiated MSS
+            // (giving the correct RFC 6928 initial window) loses no state.
+            self.cc = Reno::new(self.snd_mss);
+            self.sack_enabled = tcp.sack_permitted();
+            match tcp.window_scale() {
+                Some(peer) => {
+                    self.window_scaling = true;
+                    self.snd_wscale = peer;
+                    self.rcv_wscale = RCV_WSCALE;
+                }
+                None => {
+                    self.window_scaling = false;
+                    self.snd_wscale = 0;
+                    self.rcv_wscale = 0;
+                }
+            }
+            // The SYN/SYN-ACK window field is never scaled (RFC 7323); take it literally.
+            self.snd_wnd = tcp.window() as u32;
+            self.snd_wl1 = seg_seq;
+
+            if ack_acceptable {
+                // Normal three-way handshake: our SYN is acknowledged → ESTABLISHED, then ACK.
+                self.snd_una = seg_ack;
+                self.snd_wl2 = seg_ack;
+                self.state = State::Established;
+                self.rtx_deadline = None; // our SYN is acknowledged
+                self.needs_ack = true; // poll_transmit emits the third-leg ACK
+            } else {
+                // Simultaneous open: a SYN with no ACK. Move to SYN-RECEIVED and answer with a
+                // SYN-ACK. We mark `retransmit` (which the SYN-RECEIVED arm honours) rather than
+                // rewinding SND.NXT to ISS: SND.NXT stays ISS+1, so any segment ingested before
+                // poll_transmit runs still sees a stable acceptability window. The SYN-ACK is our
+                // SYN re-emitted with ACK (IRS is now known); it consumes no new sequence. SND.UNA
+                // stays at ISS. (`self.retransmit` was cleared at the top of this SYN block.)
+                self.snd_wl2 = self.iss;
+                self.state = State::SynReceived;
+                self.retransmit = true;
+            }
+        }
+        // (5) Neither SYN nor RST: drop the segment (nothing to do).
+    }
+
     /// Advance over acked data/FIN, sample RTT (Karn), manage the rtx timer and send window.
     /// Returns `false` if the ACK is for unsent data (caller drops the segment).
     fn process_ack(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16, now: Instant) -> bool {
@@ -574,19 +752,40 @@ impl Tcb {
 
     /// Produce the next datagram to send, or `None` if nothing is pending.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
-        // An owed RST takes priority and terminates the connection.
+        // An owed RST takes priority. The state transition (if any) was already applied where the
+        // bad ACK was detected, so this only emits the segment — never a state change.
         if let Some(seq) = self.pending_reset.take() {
-            self.state = State::Closed;
             return Some(self.build_rst(seq));
         }
         match self.state {
-            State::Closed | State::Listen | State::SynSent => None,
+            State::Closed | State::Listen => None,
+            State::SynSent => {
+                // Active open: emit our SYN, then re-emit it on each RTO. Critically, the RTO does
+                // NOT rewind SND.NXT (which stays ISS+1 once the SYN is sent) — it sets `retransmit`
+                // instead, so the SYN-SENT ACK-acceptability test (ISS < SEG.ACK <= SND.NXT) keeps
+                // a stable SND.NXT even if a SYN-ACK is ingested in the same turn the RTO fires.
+                // `build_syn` offers MSS + SACK-Permitted + Window Scale.
+                if self.snd_nxt == self.iss {
+                    let seg = self.build_syn();
+                    self.snd_nxt = self.iss + 1; // the SYN consumes one sequence number
+                    self.start_rtx(now);
+                    Some(seg)
+                } else if core::mem::take(&mut self.retransmit) {
+                    Some(self.build_syn()) // RTO retransmit; the timer was re-armed by on_timer
+                } else {
+                    None
+                }
+            }
             State::SynReceived => {
                 if self.snd_nxt == self.iss {
                     let seg = self.build(self.iss, TcpFlags::SYN, b"");
                     self.snd_nxt = self.iss + 1;
                     self.start_rtx(now);
                     Some(seg)
+                } else if core::mem::take(&mut self.retransmit) {
+                    // RTO with our SYN-ACK unacknowledged: retransmit it (the timer was re-armed by
+                    // on_timer). Without this a lost SYN-ACK relied on the peer re-sending its SYN.
+                    Some(self.build(self.iss, TcpFlags::SYN, b""))
                 } else if self.take_needs_ack() {
                     Some(self.build(self.snd_nxt, 0, b""))
                 } else {
@@ -752,7 +951,21 @@ impl Tcb {
     /// Fire every timer whose deadline has passed (a late wake may pass several at once).
     pub fn on_timer(&mut self, now: Instant) {
         if let Some(d) = self.rtx_deadline {
-            if now >= d {
+            if now >= d && self.state == State::SynSent {
+                // Active open lost its SYN (or its SYN-ACK): re-emit the SYN, bounded by a retry
+                // budget so a peer that never answers fails the connect instead of probing forever.
+                self.syn_retries += 1;
+                if self.syn_retries >= MAX_SYN_RETRIES {
+                    self.state = State::Closed; // connect timed out (no RST → not "refused")
+                    self.rtx_deadline = None;
+                } else {
+                    // Re-emit the SYN via poll_transmit WITHOUT rewinding SND.NXT — it stays ISS+1,
+                    // so a SYN-ACK ingested in this same turn still passes the acceptability test.
+                    self.retransmit = true;
+                    self.rtt.on_timeout(); // back the RTO off
+                    self.restart_rtx(now);
+                }
+            } else if now >= d {
                 let flight = self.snd_nxt.offset_from(self.snd_una);
                 self.cc.on_rto(flight); // ssthresh = max(flight/2, 2*MSS); cwnd = 1*MSS
                 self.rtt.on_timeout();
@@ -947,6 +1160,26 @@ impl Tcb {
         self.scoreboard.is_lost(seq, self.snd_mss as u32)
     }
 
+    /// Build our active-open SYN: a pure SYN (no ACK — we have acknowledged nothing yet) offering
+    /// MSS + SACK-Permitted + Window Scale. Unlike [`Tcb::build`], which always sets ACK and gates
+    /// the SACK/WScale options on what the peer offered, the active SYN advertises all three
+    /// unconditionally — it is the *offer* that the peer's SYN-ACK then accepts or declines.
+    fn build_syn(&self) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: self.local.port,
+            dst_port: self.remote.port,
+            seq: self.iss,
+            ack: SeqNumber::new(0),
+            flags: TcpFlags(TcpFlags::SYN),
+            window: RX_BUFFER.min(0xFFFF) as u16, // the SYN window is never scaled (RFC 7323)
+            mss: Some(self.mss_advertise),
+            sack_permitted: true,
+            window_scale: Some(RCV_WSCALE),
+            sack: SackBlocks::default(),
+        };
+        build_segment(self.local, self.remote, &repr, b"")
+    }
+
     /// Build a bare RST (no ACK flag) carrying `seq` — used to reject a bad half-open ACK.
     fn build_rst(&self, seq: SeqNumber) -> Vec<u8> {
         let repr = TcpRepr {
@@ -988,6 +1221,14 @@ impl Tcb {
     #[cfg(test)]
     fn snd_wnd_dbg(&self) -> u32 {
         self.snd_wnd
+    }
+    #[cfg(test)]
+    fn sack_enabled_dbg(&self) -> bool {
+        self.sack_enabled
+    }
+    #[cfg(test)]
+    fn window_scaling_dbg(&self) -> bool {
+        self.window_scaling
     }
 }
 
@@ -1773,5 +2014,253 @@ mod tests {
             deliver(&mut tcb, now, &inbound(cnxt, ack, TcpFlags::ACK, 1000, None, b""));
         }
         assert!(max_burst > 65536, "scaled window lifts the >64 KiB in-flight cap; got {max_burst}");
+    }
+
+    // ── active open / SYN-SENT (RFC 793 §3.9) ─────────────────────────────────────────────────
+
+    const SPORT: u16 = 80; // the server we dial in the active-open tests
+    const CLIENT_PORT: u16 = 50000; // our ephemeral local port
+
+    fn client_local() -> Endpoint {
+        Endpoint::new(US, CLIENT_PORT)
+    }
+    fn server_remote() -> Endpoint {
+        Endpoint::new(HOST, SPORT)
+    }
+
+    /// A segment from the dialled server (HOST:SPORT) to our client (US:CLIENT_PORT).
+    #[allow(clippy::too_many_arguments)]
+    fn peer_seg(seq: SeqNumber, ack: SeqNumber, flags: u8, window: u16, mss: Option<u16>, sack_permitted: bool, wscale: Option<u8>, payload: &[u8]) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: SPORT,
+            dst_port: CLIENT_PORT,
+            seq,
+            ack,
+            flags: TcpFlags(flags),
+            window,
+            mss,
+            sack_permitted,
+            window_scale: wscale,
+            sack: SackBlocks::default(),
+        };
+        build_segment(server_remote(), client_local(), &repr, payload)
+    }
+
+    fn new_client(now: Instant) -> Tcb {
+        Tcb::new_syn_sent(client_local(), server_remote(), SeqNumber::new(OUR_ISS), now, 1460)
+    }
+
+    #[test]
+    fn active_open_emits_pure_syn_with_options() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        assert_eq!(tcb.state, State::SynSent);
+        let out = drain_raw(&mut tcb, now);
+        assert_eq!(out.len(), 1, "exactly one SYN");
+        let ip = Ipv4Packet::new_checked(&out[0]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.flags().syn() && !tcp.flags().ack(), "a pure SYN, no ACK");
+        assert_eq!(tcp.seq(), SeqNumber::new(OUR_ISS));
+        assert_eq!(tcp.mss_option(), Some(1460), "offers MSS");
+        assert!(tcp.sack_permitted(), "offers SACK-Permitted");
+        assert_eq!(tcp.window_scale(), Some(RCV_WSCALE), "offers window scaling");
+        // The SYN is sent once; nothing more until the SYN-ACK.
+        assert!(drain_raw(&mut tcb, now).is_empty());
+    }
+
+    #[test]
+    fn active_open_completes_on_syn_ack_and_negotiates_options() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now); // our SYN
+        let our_iss = SeqNumber::new(OUR_ISS);
+        let peer_isn = SeqNumber::new(7000);
+        // SYN-ACK acks our SYN and offers SACK + window scale 7.
+        deliver(&mut tcb, now, &peer_seg(peer_isn, our_iss + 1, TcpFlags::SYN | TcpFlags::ACK, 64000, Some(1460), true, Some(7), b""));
+        assert_eq!(tcb.state, State::Established);
+        // The third-leg ACK is emitted.
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags.ack() && !out[0].flags.syn());
+        assert_eq!(out[0].seq, our_iss + 1);
+        assert_eq!(out[0].ack, peer_isn + 1, "ACKs the peer's SYN");
+        // Negotiated state.
+        assert!(tcb.sack_enabled_dbg(), "SACK negotiated");
+        assert!(tcb.window_scaling_dbg(), "window scaling negotiated");
+        assert_eq!(tcb.snd_wnd_dbg(), 64000, "the SYN-ACK window field is taken literally (not scaled)");
+        // A subsequent in-order ACK's window IS scaled by the negotiated shift (7).
+        deliver(&mut tcb, now, &peer_seg(peer_isn + 1, our_iss + 1, TcpFlags::ACK, 1000, None, false, None, b""));
+        assert_eq!(tcb.snd_wnd_dbg(), 1000u32 << 7, "post-handshake window is scaled");
+    }
+
+    #[test]
+    fn active_open_without_peer_options_is_plain() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now);
+        let our_iss = SeqNumber::new(OUR_ISS);
+        let peer_isn = SeqNumber::new(8000);
+        // A SYN-ACK that offers neither SACK nor window scaling.
+        deliver(&mut tcb, now, &peer_seg(peer_isn, our_iss + 1, TcpFlags::SYN | TcpFlags::ACK, 50000, Some(1460), false, None, b""));
+        assert_eq!(tcb.state, State::Established);
+        assert!(!tcb.sack_enabled_dbg(), "no SACK when the peer does not offer it");
+        assert!(!tcb.window_scaling_dbg(), "no scaling when the peer does not offer it");
+        assert_eq!(tcb.snd_wnd_dbg(), 50000, "window taken literally");
+    }
+
+    #[test]
+    fn simultaneous_open_enters_syn_received_then_established() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now); // our SYN
+        let our_iss = SeqNumber::new(OUR_ISS);
+        let peer_isn = SeqNumber::new(9000);
+        // A SYN with NO ACK crossed ours on the wire: simultaneous open.
+        deliver(&mut tcb, now, &peer_seg(peer_isn, SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), true, Some(7), b""));
+        assert_eq!(tcb.state, State::SynReceived);
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags.syn() && out[0].flags.ack(), "answers with a SYN-ACK");
+        assert_eq!(out[0].seq, our_iss, "re-emitted at our ISS");
+        assert_eq!(out[0].ack, peer_isn + 1);
+        // The peer now ACKs our SYN -> ESTABLISHED.
+        deliver(&mut tcb, now, &peer_seg(peer_isn + 1, our_iss + 1, TcpFlags::ACK, 64000, None, false, None, b""));
+        assert_eq!(tcb.state, State::Established);
+    }
+
+    #[test]
+    fn active_open_unacceptable_ack_resets_sender_and_stays_syn_sent() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now);
+        let our_iss = SeqNumber::new(OUR_ISS);
+        // An ACK for data we never sent (SEG.ACK > SND.NXT): RFC 793 says reset that sender.
+        deliver(&mut tcb, now, &peer_seg(SeqNumber::new(123), our_iss + 5, TcpFlags::ACK, 64000, None, false, None, b""));
+        assert_eq!(tcb.state, State::SynSent, "we stay in SYN-SENT and keep retrying our SYN");
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags.rst() && !out[0].flags.ack(), "a bare RST");
+        assert_eq!(out[0].seq, our_iss + 5, "SEQ = SEG.ACK");
+    }
+
+    #[test]
+    fn active_open_refused_by_rst_with_acceptable_ack() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now);
+        let our_iss = SeqNumber::new(OUR_ISS);
+        deliver(&mut tcb, now, &peer_seg(SeqNumber::new(1), our_iss + 1, TcpFlags::RST | TcpFlags::ACK, 0, None, false, None, b""));
+        assert_eq!(tcb.state, State::Closed);
+        assert!(tcb.is_reset(), "a refused connect is observable as a reset");
+    }
+
+    #[test]
+    fn active_open_ignores_blind_rst() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now);
+        // A RST with no acceptable ACK is a blind reset — dropped, we stay SYN-SENT.
+        deliver(&mut tcb, now, &peer_seg(SeqNumber::new(1), SeqNumber::new(0), TcpFlags::RST, 0, None, false, None, b""));
+        assert_eq!(tcb.state, State::SynSent);
+    }
+
+    #[test]
+    fn active_open_retransmits_syn_on_rto() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        let out = drain(&mut tcb, now);
+        assert!(out[0].flags.syn());
+        let deadline = tcb.poll_at().expect("rtx armed for the SYN");
+        let later = deadline.plus_millis(1);
+        tcb.on_timer(later);
+        let out = drain(&mut tcb, later);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags.syn() && !out[0].flags.ack(), "the SYN is retransmitted");
+        assert_eq!(out[0].seq, SeqNumber::new(OUR_ISS));
+        assert_eq!(tcb.state, State::SynSent);
+    }
+
+    #[test]
+    fn active_open_times_out_after_max_syn_retries() {
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now); // initial SYN
+        while tcb.state == State::SynSent {
+            let d = tcb.poll_at().expect("rtx armed while SYN-SENT");
+            let later = d.plus_millis(1);
+            tcb.on_timer(later);
+            drain_raw(&mut tcb, later);
+        }
+        assert_eq!(tcb.state, State::Closed);
+        assert!(!tcb.is_reset(), "a connect timeout is not a reset (distinct from refused)");
+    }
+
+    #[test]
+    fn active_open_synack_in_same_turn_as_rto_still_establishes() {
+        // Regression (review finding): a SYN-SENT RTO must not rewind SND.NXT, or a SYN-ACK
+        // ingested in the same reactor turn (after on_timer, before poll_transmit) would fail the
+        // acceptability test (ISS < SEG.ACK <= SND.NXT) and be rejected with a spurious RST.
+        let now = Instant::from_millis(0);
+        let mut tcb = new_client(now);
+        drain_raw(&mut tcb, now); // our SYN; SND.NXT = ISS+1, rtx armed
+        let our_iss = SeqNumber::new(OUR_ISS);
+        let peer_isn = SeqNumber::new(4242);
+
+        // The RTO fires, THEN the SYN-ACK arrives — with no intervening poll_transmit.
+        let deadline = tcb.poll_at().expect("rtx armed for the SYN");
+        let later = deadline.plus_millis(1);
+        tcb.on_timer(later);
+        deliver(&mut tcb, later, &peer_seg(peer_isn, our_iss + 1, TcpFlags::SYN | TcpFlags::ACK, 64000, Some(1460), true, Some(7), b""));
+
+        assert_eq!(tcb.state, State::Established, "the valid SYN-ACK must establish, not be rejected");
+        let out = drain(&mut tcb, later);
+        assert!(out.iter().all(|o| !o.flags.rst()), "no spurious RST to a cooperating peer");
+        assert_eq!(out.len(), 1, "just the third-leg ACK");
+        assert!(out[0].flags.ack() && !out[0].flags.syn());
+        assert_eq!(out[0].seq, our_iss + 1, "the ACK uses SND.NXT = ISS+1, not a rewound ISS");
+        assert_eq!(out[0].ack, peer_isn + 1);
+    }
+
+    #[test]
+    fn half_open_bad_ack_closes_immediately_then_emits_rst() {
+        // Regression (review finding): a half-open SYN-RECEIVED rejected by a bad ACK must reach
+        // Closed in on_segment (so a waker observes it the same turn), with poll_transmit only
+        // emitting the queued RST — not driving the close itself.
+        let now = Instant::from_millis(0);
+        let syn = inbound(SeqNumber::new(1000), SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), b"");
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        let iss = drain(&mut tcb, now)[0].seq; // SYN-ACK
+        // An in-window segment whose ACK does not acknowledge our SYN.
+        deliver(&mut tcb, now, &inbound(SeqNumber::new(1001), iss + 9, TcpFlags::ACK, 64000, None, b""));
+        assert_eq!(tcb.state, State::Closed, "the close is applied in on_segment, before poll_transmit");
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags.rst() && !out[0].flags.ack(), "a bare RST is emitted");
+        assert_eq!(out[0].seq, iss + 9, "SEQ = SEG.ACK");
+    }
+
+    #[test]
+    fn syn_received_retransmits_syn_ack_on_rto() {
+        // Regression (review finding): a passive (or simultaneous) open whose SYN-ACK is lost must
+        // retransmit it on its own RTO, rather than relying on the peer re-sending its SYN.
+        let now = Instant::from_millis(0);
+        let syn = inbound(SeqNumber::new(2000), SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), b"");
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        let out = drain(&mut tcb, now);
+        assert!(out[0].flags.syn() && out[0].flags.ack());
+        let iss = out[0].seq;
+
+        let deadline = tcb.poll_at().expect("rtx armed for the SYN-ACK");
+        let later = deadline.plus_millis(1);
+        tcb.on_timer(later);
+        let out = drain(&mut tcb, later);
+        assert_eq!(out.len(), 1, "the SYN-ACK is retransmitted on RTO");
+        assert!(out[0].flags.syn() && out[0].flags.ack());
+        assert_eq!(out[0].seq, iss, "retransmitted at ISS");
+        assert_eq!(tcb.state, State::SynReceived);
     }
 }

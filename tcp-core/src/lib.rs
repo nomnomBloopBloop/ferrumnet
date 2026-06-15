@@ -37,7 +37,9 @@ pub mod time;
 pub mod wire;
 
 pub use iface::{Endpoint, Stack};
-pub use runtime::{Device, MockDevice, Runtime, Spawner, TcpListener, TcpStream};
+pub use runtime::{
+    Connect, Device, MockDevice, Runtime, Spawner, TcpConnector, TcpListener, TcpStream,
+};
 pub use seq::SeqNumber;
 pub use state::State;
 pub use time::Instant;

@@ -15,7 +15,7 @@ mod socket;
 
 pub use executor::{Executor, Spawner};
 pub use reactor::Runtime;
-pub use socket::{Accept, Read, TcpListener, TcpStream, Write};
+pub use socket::{Accept, Connect, Read, TcpConnector, TcpListener, TcpStream, Write};
 
 use std::collections::VecDeque;
 

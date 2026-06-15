@@ -65,6 +65,81 @@ impl Future for Accept {
     }
 }
 
+/// A connector for initiating active opens, bound to the runtime's local endpoint. Cloneable;
+/// each `connect` picks its own ephemeral local port, so concurrent connects do not interfere.
+#[derive(Clone)]
+pub struct TcpConnector {
+    state: Rc<RefCell<ReactorState>>,
+}
+
+impl TcpConnector {
+    pub(crate) fn new(state: Rc<RefCell<ReactorState>>) -> Self {
+        TcpConnector { state }
+    }
+
+    /// Initiate a connection to `remote`, resolving to the established [`TcpStream`] (or an error
+    /// if the peer refuses with a RST, or the SYN goes unanswered until the connect times out).
+    pub fn connect(&self, remote: Endpoint) -> Connect {
+        Connect {
+            state: self.state.clone(),
+            remote,
+            initiated: false,
+        }
+    }
+}
+
+/// The future returned by [`TcpConnector::connect`]. Its first poll installs the SYN-SENT
+/// connection (whose SYN goes out on the same turn's transmit pass); later polls resolve once the
+/// reactor reports the connection established, refused, or timed out.
+pub struct Connect {
+    state: Rc<RefCell<ReactorState>>,
+    remote: Endpoint,
+    initiated: bool,
+}
+
+impl Future for Connect {
+    type Output = io::Result<TcpStream>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<TcpStream>> {
+        let me = self.get_mut();
+        let mut s = me.state.borrow_mut();
+        if !me.initiated {
+            // Install the SYN-SENT TCB and register the waker within the same borrow, before
+            // returning Pending — the connection cannot establish until a later turn, so there is
+            // no lost-wakeup window, but registering up front keeps the pattern uniform.
+            let now = s.now;
+            s.stack.connect(me.remote, now);
+            me.initiated = true;
+            s.connect_wakers.insert(me.remote, cx.waker().clone());
+            return Poll::Pending;
+        }
+        match s.stack.connection_mut(&me.remote) {
+            // Vanished before we observed a state: treat as a failed connect.
+            None => Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "connect failed"))),
+            Some(tcb) => {
+                if tcb.is_synchronized() {
+                    Poll::Ready(Ok(TcpStream {
+                        state: me.state.clone(),
+                        remote: me.remote,
+                    }))
+                } else if tcb.state == State::Closed {
+                    // A RST sets the reset flag (refused); a connect timeout reaches Closed
+                    // without it.
+                    let err = if tcb.is_reset() {
+                        io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
+                    } else {
+                        io::Error::new(io::ErrorKind::TimedOut, "connect timed out")
+                    };
+                    Poll::Ready(Err(err))
+                } else {
+                    s.connect_wakers.insert(me.remote, cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
 /// An established connection.
 pub struct TcpStream {
     state: Rc<RefCell<ReactorState>>,

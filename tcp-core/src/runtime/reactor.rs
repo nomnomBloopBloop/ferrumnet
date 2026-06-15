@@ -13,7 +13,7 @@ use crate::time::Instant;
 use crate::wire::{echo_reply, Ipv4Packet, IPPROTO_ICMP, IPPROTO_TCP};
 
 use super::executor::{Executor, Spawner};
-use super::socket::TcpListener;
+use super::socket::{TcpConnector, TcpListener};
 use super::Device;
 
 /// State shared between the reactor and the socket futures (single-threaded; `Rc<RefCell>`).
@@ -21,8 +21,14 @@ pub(crate) struct ReactorState {
     pub(crate) stack: Stack,
     pub(crate) read_wakers: HashMap<Endpoint, Waker>,
     pub(crate) write_wakers: HashMap<Endpoint, Waker>,
+    /// Wakers for in-flight active opens, keyed by remote, woken when the connection becomes
+    /// established (success) or reaches Closed / vanishes (refused or timed out).
+    pub(crate) connect_wakers: HashMap<Endpoint, Waker>,
     pub(crate) accept_waker: Option<Waker>,
     pub(crate) accept_queue: VecDeque<Endpoint>,
+    /// The most recent logical time handed to `turn` — used to stamp an active open's ISN (RFC
+    /// 6528) when the application calls `connect` from inside a task.
+    pub(crate) now: Instant,
     /// Connections already handed to `accept` (so we enqueue each exactly once).
     announced: HashSet<Endpoint>,
 }
@@ -46,8 +52,10 @@ impl<D: Device> Runtime<D> {
                 stack: Stack::new(local, isn_secret, mss),
                 read_wakers: HashMap::new(),
                 write_wakers: HashMap::new(),
+                connect_wakers: HashMap::new(),
                 accept_waker: None,
                 accept_queue: VecDeque::new(),
+                now: Instant::from_micros(0),
                 announced: HashSet::new(),
             })),
             exec: Executor::new(),
@@ -60,6 +68,11 @@ impl<D: Device> Runtime<D> {
     /// A listener bound to the runtime's local endpoint.
     pub fn listener(&self) -> TcpListener {
         TcpListener::new(self.state.clone())
+    }
+
+    /// A connector for initiating active opens (`connector.connect(remote).await`).
+    pub fn connector(&self) -> TcpConnector {
+        TcpConnector::new(self.state.clone())
     }
 
     /// A handle for spawning tasks.
@@ -89,7 +102,11 @@ impl<D: Device> Runtime<D> {
     /// One reactor iteration at logical time `now`: fire timers, ingest packets, wake ready
     /// futures, run tasks, then flush everything the stack wants to send.
     pub fn turn(&mut self, now: Instant) -> std::io::Result<()> {
-        self.state.borrow_mut().stack.on_timer(now);
+        {
+            let mut s = self.state.borrow_mut();
+            s.now = now; // available to `connect` (ISN stamping) when tasks run below
+            s.stack.on_timer(now);
+        }
 
         while let Some(n) = self.device.recv(&mut self.rx)? {
             let ip = match Ipv4Packet::new_checked(&self.rx[..n]) {
@@ -142,13 +159,16 @@ impl<D: Device> Runtime<D> {
     fn dispatch_wakeups(&self) {
         let mut s = self.state.borrow_mut();
 
-        // Any connection past the handshake -> accept queue (each announced exactly once).
-        // We announce on *any* synchronized state, not just Established, because a request +
-        // FIN delivered in one batch can leave the connection in CloseWait before we look.
+        // Any *passively-opened* connection past the handshake -> accept queue (each announced
+        // exactly once). We announce on any synchronized state, not just Established, because a
+        // request + FIN delivered in one batch can leave the connection in CloseWait before we
+        // look. Connections we actively opened (`connect`) have an ephemeral local port, not the
+        // listen port, so this filter keeps them out of `accept` — the connector wakes on them.
+        let listen_port = s.stack.local().port;
         let synced: Vec<Endpoint> = s
             .stack
             .connections_mut()
-            .filter(|(_, t)| t.is_synchronized())
+            .filter(|(_, t)| t.is_synchronized() && t.local().port == listen_port)
             .map(|(e, _)| *e)
             .collect();
         for ep in synced {
@@ -159,6 +179,21 @@ impl<D: Device> Runtime<D> {
         if !s.accept_queue.is_empty() {
             if let Some(w) = s.accept_waker.take() {
                 w.wake();
+            }
+        }
+
+        // Wake active opens that established (synchronized), were refused / timed out (Closed),
+        // or vanished. The Connect future then resolves to a stream or the right error.
+        let connect_keys: Vec<Endpoint> = s.connect_wakers.keys().copied().collect();
+        for ep in connect_keys {
+            let ready = match s.stack.connection_mut(&ep) {
+                Some(t) => t.is_synchronized() || t.state == State::Closed,
+                None => true,
+            };
+            if ready {
+                if let Some(w) = s.connect_wakers.remove(&ep) {
+                    w.wake();
+                }
             }
         }
 
@@ -425,6 +460,193 @@ mod tests {
             .flat_map(|f| parse(f).payload)
             .collect();
         assert!(body.windows(3).any(|w| w == b"bye"), "server should still respond");
+    }
+
+    // ── two-stack userspace loopback (active open end to end) ─────────────────────────────────
+
+    fn payload_len(frame: &[u8]) -> usize {
+        parse(frame).payload.len()
+    }
+
+    /// Cross-wire two runtimes: each runtime's egress becomes the other's ingress next turn.
+    /// Returns the total TCP payload bytes the *client* emitted this round (its in-flight burst).
+    fn pump_once(client: &mut Runtime<MockDevice>, server: &mut Runtime<MockDevice>, t: Instant) -> usize {
+        client.turn(t).unwrap();
+        server.turn(t).unwrap();
+        let c_out = client.device_mut().take_outbound();
+        let s_out = server.device_mut().take_outbound();
+        let burst: usize = c_out.iter().map(|f| payload_len(f)).sum();
+        for f in s_out {
+            client.device_mut().inject(f);
+        }
+        for f in c_out {
+            server.device_mut().inject(f);
+        }
+        burst
+    }
+
+    #[test]
+    fn two_stacks_connect_and_round_trip_in_userspace() {
+        // Server listens on US:8080; the client lives on HOST and dials it. Both run entirely in
+        // userspace over mock devices — the SYN, SYN-ACK, ACK, data and FINs all cross the wire.
+        let mut server = Runtime::new(MockDevice::new(), Endpoint::new(US, 8080), [1u8; 16]);
+        let mut client = Runtime::new(MockDevice::new(), Endpoint::new(HOST, 9), [2u8; 16]);
+
+        let listener = server.listener();
+        let got_server = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let gs = got_server.clone();
+        server.spawn(async move {
+            let stream = listener.accept().await;
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).await.unwrap();
+            gs.borrow_mut().extend_from_slice(&buf[..n]);
+            stream.write_all(b"pong").await.unwrap();
+            stream.close();
+        });
+
+        let connector = client.connector();
+        let got_client = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let connected = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let gc = got_client.clone();
+        let cf = connected.clone();
+        client.spawn(async move {
+            let stream = connector.connect(Endpoint::new(US, 8080)).await.unwrap();
+            *cf.borrow_mut() = true;
+            stream.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).await.unwrap();
+            gc.borrow_mut().extend_from_slice(&buf[..n]);
+            stream.close();
+        });
+
+        let t = Instant::from_millis(0);
+        for _ in 0..50 {
+            pump_once(&mut client, &mut server, t);
+            if &*got_client.borrow() == b"pong" && &*got_server.borrow() == b"ping" {
+                break;
+            }
+        }
+        assert!(*connected.borrow(), "the active open established");
+        assert_eq!(&*got_server.borrow(), b"ping", "server received the request");
+        assert_eq!(&*got_client.borrow(), b"pong", "client received the reply");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // pumps ~2 MiB through both stacks — far too slow under Miri
+    fn two_stacks_bulk_transfer_puts_over_64k_in_flight() {
+        // With two fast peers (unlike the curl bench, where curl's ~64 KiB receive window is the
+        // limiter), window scaling lets the client keep more than a 16-bit window in flight. We
+        // assert the client emits a single >64 KiB burst with no intervening ACK — impossible
+        // without the scaled window — and that the whole payload arrives intact.
+        let mut server = Runtime::new(MockDevice::new(), Endpoint::new(US, 8080), [3u8; 16]);
+        let mut client = Runtime::new(MockDevice::new(), Endpoint::new(HOST, 9), [4u8; 16]);
+
+        const N: usize = 2 * 1024 * 1024;
+        let payload: std::rc::Rc<Vec<u8>> = std::rc::Rc::new((0..N).map(|i| (i % 251) as u8).collect());
+
+        let listener = server.listener();
+        let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        let rv = received.clone();
+        server.spawn(async move {
+            let stream = listener.accept().await;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                rv.borrow_mut().extend_from_slice(&buf[..n]);
+            }
+        });
+
+        let connector = client.connector();
+        let to_send = payload.clone();
+        client.spawn(async move {
+            let stream = connector.connect(Endpoint::new(US, 8080)).await.unwrap();
+            stream.write_all(&to_send).await.unwrap();
+            stream.close();
+        });
+
+        let t = Instant::from_millis(0);
+        let mut max_burst = 0usize;
+        for _ in 0..20_000 {
+            max_burst = max_burst.max(pump_once(&mut client, &mut server, t));
+            if received.borrow().len() == N {
+                break;
+            }
+        }
+        assert_eq!(received.borrow().len(), N, "the whole payload arrived");
+        assert_eq!(&**received.borrow(), &payload[..], "data integrity across both userspace stacks");
+        assert!(max_burst > 65_536, "window scaling let the client put >64 KiB in flight in one burst; got {max_burst}");
+    }
+
+    /// A segment from a peer at US:8080 to our client at HOST:`our_port`.
+    fn peer_to(seq: SeqNumber, ack: SeqNumber, flags: u8, our_port: u16) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: 8080,
+            dst_port: our_port,
+            seq,
+            ack,
+            flags: TcpFlags(flags),
+            window: 64000,
+            mss: None,
+            sack_permitted: false,
+            window_scale: None,
+            sack: SackBlocks::default(),
+        };
+        build_segment(Endpoint::new(US, 8080), Endpoint::new(HOST, our_port), &repr, b"")
+    }
+
+    /// Drive the connect handshake far enough to learn our ephemeral port and ISS, returning
+    /// `(client_runtime_state via outcome, iss, ephemeral_port)`. The SYN has been emitted.
+    fn start_connect(secret: u8) -> (Runtime<MockDevice>, std::rc::Rc<std::cell::RefCell<Option<bool>>>, SeqNumber, u16) {
+        let mut client = Runtime::new(MockDevice::new(), Endpoint::new(HOST, 9), [secret; 16]);
+        let connector = client.connector();
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None::<bool>)); // Some(is_err)
+        let oc = outcome.clone();
+        client.spawn(async move {
+            let res = connector.connect(Endpoint::new(US, 8080)).await;
+            *oc.borrow_mut() = Some(res.is_err());
+        });
+        let t = Instant::from_millis(0);
+        client.turn(t).unwrap(); // installs SYN-SENT, emits the SYN
+        let syn = client.device_mut().take_outbound();
+        assert_eq!(syn.len(), 1);
+        let ip = Ipv4Packet::new_checked(&syn[0]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.flags().syn() && !tcp.flags().ack());
+        (client, outcome, tcp.seq(), tcp.src_port())
+    }
+
+    #[test]
+    fn connect_refused_by_rst_resolves_with_an_error() {
+        let (mut client, outcome, iss, lport) = start_connect(21);
+        let t = Instant::from_millis(0);
+        // The peer refuses with RST+ACK acknowledging our SYN.
+        client.device_mut().inject(peer_to(SeqNumber::new(1), iss + 1, TcpFlags::RST | TcpFlags::ACK, lport));
+        client.turn(t).unwrap();
+        assert_eq!(*outcome.borrow(), Some(true), "a refused connect resolves to an error, not a hang");
+    }
+
+    #[test]
+    fn connect_closed_during_simultaneous_open_does_not_hang() {
+        // Regression (review finding): the conn reaches Closed inside poll_transmit's RST path only
+        // if the close is deferred there; with the close applied in on_segment, dispatch_wakeups
+        // sees Closed the same turn and the parked connect future resolves rather than hanging.
+        let (mut client, outcome, iss, lport) = start_connect(22);
+        let t = Instant::from_millis(0);
+
+        // A bare SYN crosses ours (simultaneous open): the client answers with a SYN-ACK.
+        client.device_mut().inject(peer_to(SeqNumber::new(9000), SeqNumber::new(0), TcpFlags::SYN, lport));
+        client.turn(t).unwrap();
+        let _ = client.device_mut().take_outbound(); // the SYN-ACK
+        assert_eq!(*outcome.borrow(), None, "still connecting after the simultaneous open");
+
+        // Now an in-window segment whose ACK does not acknowledge our SYN: the half-open conn is
+        // rejected and closed. The connect must resolve (with an error) this very turn.
+        client.device_mut().inject(peer_to(SeqNumber::new(9001), iss + 5, TcpFlags::ACK, lport));
+        client.turn(t).unwrap();
+        assert_eq!(*outcome.borrow(), Some(true), "the failed connect resolves, it does not hang");
     }
 
     // Build a segment for connection `idx` (distinct client port).
