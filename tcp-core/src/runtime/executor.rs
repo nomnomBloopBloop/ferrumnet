@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Wake, Waker};
 
@@ -38,16 +38,27 @@ struct ExecInner {
 
 /// A cloneable handle for spawning new tasks (e.g. an accept loop spawning per-connection
 /// handlers).
+///
+/// The back-reference to the executor is a [`Weak`], **not** an `Rc`: a spawned task (e.g. the
+/// accept loop) commonly captures a `Spawner` and is itself stored in the executor, so a strong
+/// reference here would close an `Rc` cycle (executor → task → `Spawner` → executor) that leaks
+/// the executor and every task when the runtime is dropped. With a `Weak`, dropping the runtime
+/// releases the executor, which drops its tasks, which drop their `Spawner`s — no cycle.
 #[derive(Clone)]
 pub struct Spawner {
-    inner: Rc<RefCell<ExecInner>>,
+    inner: Weak<RefCell<ExecInner>>,
     woken: Arc<Mutex<Vec<usize>>>,
 }
 
 impl Spawner {
+    /// Spawn a task onto the executor. A no-op if the executor has already been dropped (the
+    /// `Weak` no longer upgrades) — spawning onto a torn-down runtime cannot schedule anything.
     pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
         let id = {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = inner.borrow_mut();
             let id = inner.next_id;
             inner.next_id += 1;
             inner.tasks.insert(id, Box::pin(fut));
@@ -81,7 +92,7 @@ impl Executor {
 
     pub fn spawner(&self) -> Spawner {
         Spawner {
-            inner: self.inner.clone(),
+            inner: Rc::downgrade(&self.inner),
             woken: self.woken.clone(),
         }
     }
