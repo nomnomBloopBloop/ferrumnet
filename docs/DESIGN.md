@@ -44,11 +44,17 @@ the parts the brief calls hard rather than gluing libraries together.
 
 - No `smoltcp` — the TCP/IP logic is ours.
 - No `tokio` — the async executor, reactor, and `Waker` plumbing are ours.
-- No `libc`/`nix` — the two syscalls we need (`ioctl` for `TUNSETIFF`, `poll` for the event
-  loop) are bound by hand; everything else goes through `std::fs` / `std::os::fd`.
+- No `liburing` — the `io_uring` backend (setup/enter, the SQ/CQ ring `mmap`, the SQE/CQE struct
+  layouts) is hand-rolled against the raw syscalls; the layouts are pinned to `<linux/io_uring.h>`
+  with compile-time size asserts.
+- No `libc`/`nix` — the syscalls we need (`ioctl` for `TUNSETIFF`, `poll` for the blocking event
+  loop, and `io_uring_setup`/`io_uring_enter` + `mmap` for the io_uring backend, reached through
+  glibc's generic `syscall()`) are bound by hand; everything else goes through `std::fs` /
+  `std::os::fd`.
 
-`tcp-core` is `#![deny(unsafe_code)]`. The only `unsafe` in the project is the ~10 lines of
-syscall FFI in `tcp-tun/src/sys.rs`.
+`tcp-core` is `#![deny(unsafe_code)]`. The only `unsafe` in the project is the syscall FFI in the
+TUN backend: `tcp-tun/src/sys.rs` (ioctl/poll) and `tcp-tun/src/iou.rs` (the io_uring ring
+management).
 
 ## 4. Architecture & layout
 
@@ -58,21 +64,23 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   seq          SeqNumber — RFC 1982 serial arithmetic                   [M1]
   isn          keyed-SipHash ISN selection (RFC 6528)                   [M1]
   state        the 11 RFC 793 states                                   [M1]
-  tcb          the transmission control block: state machine, go-back-N [M1-M3,M6-M8]
-               reliability, flow control, teardown, per-connection timers, SACK recovery
+  tcb          the transmission control block: state machine, go-back-N [M1-M3,M6-M9+]
+               reliability, flow control, teardown, per-connection timers, SACK recovery,
+               active open (SYN-SENT), RFC 7323 timestamps + PAWS, delayed ACKs
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
   congestion   TCP Reno controller                                     [M3]
   buffers      rx/tx ring buffers                                       [M2]
   reasm        receiver out-of-order reassembly (coalesced runs)        [M8]
   sack         sender SACK scoreboard + RFC 6675 predicates             [M8]
   iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
-  runtime/     hand-rolled async: executor, reactor, TcpListener/Stream,
-               Device trait + in-memory MockDevice                      [M4]
+  runtime/     hand-rolled async: executor, reactor, TcpListener/Stream/ [M4,M9]
+               TcpConnector, Device trait + in-memory MockDevice
 tcp-tun/   (Linux-only backend + demo)
   sys          extern "C" ioctl/poll + repr(C) ifreq/pollfd            [M0]
   tun          TunDevice : Device (IFF_TUN|IFF_NO_PI, O_NONBLOCK)       [M0/M5]
+  iou          IoUringTun : Device — hand-rolled io_uring, batched I/O  [M10]
   http         minimal HTTP/1.1 responder (+ /bench throughput path)   [M5]
-  main         opens the TUN, spawns the accept loop, runs the Runtime [M0-M5]
+  main         opens the TUN, spawns the accept loop, runs the Runtime [M0-M5,M10]
 scripts/     tun-up.sh / tun-down.sh (host networking, scoped to 10.0.0.0/24)
 ```
 
@@ -282,6 +290,45 @@ inline). Verified subtleties:
   in flight instead of ~one per RTT — without it, the 64 KiB window is the limiter at a large MTU
   (the `vmstat` 55%-idle observation). The SACK scoreboard's run cap rises with the larger window.
 
+### 5.9 Active open, timestamps, delayed ACKs, and io_uring (`tcb`, `iface`, `runtime`, `iou`) — M9–M11
+
+Each was specified by an adversarial design pass and re-checked by a multi-agent review of the
+finished code (which caught 5 real bugs across active open and delayed ACKs). Verified traps:
+
+- **Active open / SYN-SENT (RFC 793 §3.9).** The exact ACK-then-RST-then-SYN order: an ACK is
+  acceptable iff `ISS < SEG.ACK ≤ SND.NXT`; a bad ACK resets the sender but stays SYN-SENT; RST is
+  honoured only with an acceptable ACK; a SYN with an ACK → Established, without → SYN-RECEIVED
+  (simultaneous open). The **load-bearing trap the review found:** the SYN (re)transmit must NOT
+  rewind `SND.NXT` (the data path's no-rewind invariant) — driving it off a `retransmit` flag
+  instead, because a SYN-ACK arriving in the same turn as the RTO would otherwise be rejected as
+  unacceptable and the cooperating peer RST'd.
+- **Demux + the connect lost-wakeup.** The connection table is keyed by remote, but `on_recv`
+  matches a segment to a connection by its own local port — so a client on an ephemeral port gets
+  its SYN-ACK routed rather than dropped. A half-open reject applies its `Closed` transition in
+  `on_segment` (not `poll_transmit`), so `dispatch_wakeups` — which runs *before* transmit — sees
+  it the same turn and a parked `connect().await` resolves instead of hanging forever.
+- **Timestamps (RFC 7323).** `TSval` is a **microsecond** clock (not the usual ms) to keep RTT
+  precise; every segment, including retransmits, carries a fresh `TSval`, so RTT = `now − TSecr` is
+  **Karn-free** (a retransmit's ACK times the retransmit). `TS.Recent` advances only from in-order
+  segments, and PAWS drops `SEG.TSval < TS.Recent` — which cannot false-drop a reordered segment,
+  because out-of-order data is sent *later* and so carries a newer timestamp. Timestamps (12 bytes)
+  collide with SACK in the 40-byte option area, so the emitter caps SACK at 3 blocks when
+  timestamps are present (`12 + 4 + 8·3 = 40`).
+- **Delayed ACKs (RFC 1122 §4.2.3.2).** Only a *clean* in-order segment defers its ACK (≤ 40 ms, or
+  until a second segment / piggyback): in order, fully accepted, and with nothing buffered
+  out-of-order. The **trap the review found:** a segment that fills *part* of a gap, or is dropped
+  for lack of room, must ACK immediately (RFC 5681 §4.2) so the sender's SACK scoreboard stays
+  current — so the delay condition is gated on `reasm` being empty and the write being complete.
+- **io_uring backend (`iou`).** A second `Device` impl that keeps a pool of pre-posted READs and
+  queues WRITEs, flushing all of them — plus re-posts — with **one `io_uring_enter` per event-loop
+  turn**; completions are reaped from the mapped CQ with no syscall. `IORING_OP_READ`/`WRITE` are
+  generic file ops, so they work on a TUN char device. Requires `SINGLE_MMAP` + `RW_CUR_POS`
+  (offset `-1` = current position); the ring head/tail are accessed with acquire/release ordering.
+  The one change that reaches the core is `Device::poll_readable(&mut self)` (to flush the batch
+  before waiting); the sans-IO engine is untouched. Result: ~1.24× at MTU 1500 — throughput at the
+  same system time, since io_uring removes the per-packet syscall *overhead* while the TUN copy
+  itself stays irreducible kernel work.
+
 ## 6. End-to-end data flow (one `curl` request)
 
 1. `curl` → kernel routes `10.0.0.2` to `tun0` → the IP datagram appears on our fd.
@@ -319,7 +366,10 @@ inline). Verified subtleties:
 | M5 | HTTP responder | **`curl http://10.0.0.2:8080`** |
 | M6 | hardening + docs + portfolio polish | full suite green on 1.92 and 1.75 |
 | M7 | working loss recovery (Reno fast recovery, µs RTO, the no-rewind retransmit) | bulk transfer completes under live `tc netem` loss |
-| M8 | SACK + OOO reassembly + RFC 6675 selective recovery; MTU-adaptive MSS | ~4–5× faster recovery across the loss tail; ~2.3× throughput at a 65535 MTU |
+| M8 | SACK + OOO reassembly + RFC 6675 selective recovery; MTU-adaptive MSS; window scaling (RFC 7323) | ~4–10× faster recovery across the loss tail; ~2.4× throughput at a 65535 MTU |
+| M9 | active open (`connect`) + reactor `TcpConnector` + two-stack userspace loopback | two instances connect and round-trip in userspace; >64 KiB in flight proves window scaling |
+| M10 | io_uring backend (hand-rolled, zero-dependency; batched I/O) | ~1.24× throughput at MTU 1500 (148.6 → 184.3 MB/s, medians of 9) |
+| M11 | RFC 7323 timestamps (Karn-free RTT + PAWS) + delayed ACKs (RFC 1122) | timestamps interoperate with the Linux kernel on the wire; fewer pure-ACK packets |
 
 ## 9. Environment
 
@@ -332,7 +382,9 @@ via `tun0` or enable system-wide IP forwarding, so the host's own networking is 
 
 ## 10. References
 
-RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP), RFC 1071 (Internet checksum), RFC 1982 (serial
-numbers), RFC 5681 + 6928 (congestion control / initial window), RFC 6298 (RTO), RFC 5961 +
-6528 (blind-attack hardening / ISN); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*; the smoltcp
-source as a cross-reference.
+RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP + host requirements, incl. delayed ACKs), RFC 1071
+(Internet checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (congestion control / initial
+window), RFC 6298 (RTO), RFC 2018 + 6675 (SACK & selective recovery), RFC 7323 (timestamps &
+window scaling), RFC 5961 + 6528 (blind-attack hardening / ISN); the Linux `io_uring` ABI
+(`<linux/io_uring.h>`); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*; the smoltcp source as a
+cross-reference.

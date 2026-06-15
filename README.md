@@ -13,7 +13,7 @@ $ curl -v http://10.0.0.2:8080/
 < HTTP/1.1 200 OK
 < Server: ferrumnet
 < Content-Type: text/html; charset=utf-8
-< Content-Length: 392
+< Content-Length: 442
 < Connection: close
 ```
 
@@ -23,17 +23,23 @@ $ curl -v http://10.0.0.2:8080/
 
 - **Zero dependencies.** Only the Rust standard library. The TCP/IP logic (no `smoltcp`), the
   async runtime — executor, reactor, `Waker` plumbing (no `tokio`) — and even the syscall
-  bindings are all hand-written. The protocol core is `#![deny(unsafe_code)]`; the *only*
-  `unsafe` in the entire project is ~10 lines of `ioctl`/`poll` FFI in the TUN backend.
+  bindings (including a hand-rolled `io_uring`) are all hand-written. The protocol core is
+  `#![deny(unsafe_code)]`; the *only* `unsafe` in the entire project is the syscall FFI in the TUN
+  backend — `ioctl`/`poll` in `sys.rs` and the `io_uring` setup/enter/`mmap` in `iou.rs`.
 - **sans-IO core.** `tcp-core` performs no I/O and contains no OS-specific code — it ingests
   received bytes and emits bytes to send, with time injected as a parameter. So the whole
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
-  unit-testable off-device, including under simulated packet loss, reordering, and SACK-based
-  selective recovery. **100 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
-  leaks).
+  unit-testable off-device, including under simulated packet loss, reordering, SACK-based
+  selective recovery, and a **two-stack userspace loopback** (two instances connecting to each
+  other entirely in memory). **136 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no
+  UB, no leaks, no suppression).
+- **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
+  passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
+  can talk to each other with no kernel TCP involved.
 - **It's real.** It runs on a Linux box over an actual `/dev/net/tun` device, answers `ping`,
-  and serves HTTP to a stock `curl` — handshake, retransmission, congestion control, orderly
-  teardown and TIME-WAIT, all on the wire.
+  and serves HTTP to a stock `curl` — handshake, retransmission, congestion control, SACK loss
+  recovery, RFC 7323 timestamps, window scaling, delayed ACKs, orderly teardown and TIME-WAIT,
+  all on the wire. An optional `io_uring` backend batches the packet I/O.
 
 ## Benchmarks
 
@@ -47,7 +53,15 @@ contention dip (median is robust).
   advertised MSS auto-adapts to the device MTU, so a larger MTU sends the same data in ~2.4× fewer
   packets — and `write` syscalls. (SACK does not change no-loss throughput; it is inactive at 0%
   loss.)
-- **Latency:** ICMP RTT (100 packets) min/avg/max/mdev = **0.047 / 0.099 / 0.180 / 0.028 ms**.
+- **io_uring backend** (`FERRUM_IO=uring`, opt-in, falls back to blocking I/O): batches every read
+  and write into **one `io_uring_enter` per event-loop turn**, lifting MTU-1500 throughput
+  **~1.24× (148.6 → 184.3 MB/s, medians of 9, same session)** by removing the per-packet syscall
+  overhead — exactly the syscall-bound regime the CPU profile below identifies. `IORING_OP_READ`/
+  `WRITE` are generic file ops, so (unlike `sendmmsg`, which returns `ENOTSOCK`) they work on a TUN
+  fd. It trades single-packet latency for batch throughput (ICMP RTT 0.10 → 0.32 ms), which bulk
+  transfer hides; the sans-IO core is untouched.
+- **Latency:** ICMP RTT (100 packets), blocking backend, min/avg/max/mdev =
+  **0.047 / 0.099 / 0.180 / 0.028 ms**.
 - **CPU** under sustained load (`vmstat`, system-wide over 2 vCPU): MTU 1500 → 30% user /
   **50% system** / 20% idle; MTU 65535 → 28% user / **17% system** / 55% idle. **System time
   collapses with the larger MTU** — the stack is *syscall-bound* at small MTU (a TUN is one packet
@@ -56,7 +70,9 @@ contention dip (median is robust).
   is implemented and lifts our 64 KiB cap, but on this same-host bench the limit is the **receiver's**
   window (a localhost `curl` advertises ~64 KiB and refills one ~65 KB segment at a time) and the
   **serial** per-segment processing across the two cores. So scaling doesn't move this number — it's
-  what keeps the pipe full on a real high-latency path; here the next lever is pipelined I/O (io_uring).
+  what keeps the pipe full on a real high-latency path (the two-stack loopback shows it: with two
+  fast peers we keep >64 KiB in flight). The remaining lever is pipelined I/O — the **io_uring
+  backend above** does exactly that at MTU 1500, where the profile is syscall-bound.
 
 **Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB), measured **before and
 after SACK in the same session** — every transfer completes correctly, and **SACK selective
@@ -74,8 +90,8 @@ splitting between ~6–14 and ~70–78 MB/s depending on where losses fall.)
 **Kernel baseline** (Python `http.server` over `lo`, kernel TCP, 16 MiB): median **~800 MB/s**
 (556–893). *Not* apples-to-apples — `lo`'s MTU is 65536 and it is fully in-kernel (no per-packet
 syscall or user/kernel copy), so it is structurally faster on this path. Matching the MTU closes
-much of the gap (done — ~2.4× here) and io_uring would cut the remaining syscall overhead; it
-won't beat in-kernel loopback, which has neither a per-packet syscall nor a user/kernel copy.
+much of the gap (~2.4× here) and io_uring cuts the remaining syscall overhead (~1.24× at MTU 1500);
+neither beats in-kernel loopback, which has neither a per-packet syscall nor a user/kernel copy.
 
 ## Architecture
 
@@ -84,13 +100,15 @@ won't beat in-kernel loopback, which has neither a per-packet syscall nor a user
                                                                                      │
   ┌─────────────────────── ferrumnet — one process, one thread ──────────────────────┐
   │  tcp-tun (Linux backend, the only `unsafe`)                                        │
-  │    TunDevice: read()/write() raw IP packets · HTTP app (one task per connection)   │
+  │    TunDevice (blocking read/write/poll) │ io_uring backend (FERRUM_IO=uring)       │
+  │    HTTP app (one task per connection)                                              │
   │  ── trait Device ────────────────────────────────────────────────────────────────│
   │  tcp-core (sans-IO · zero deps · #![deny(unsafe_code)])                            │
-  │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream               │
-  │    Stack  →  TCB per connection                                                    │
-  │      wire (zero-copy parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)  │
-  │      rtt (RFC 6298) · congestion (Reno) · buffers · per-connection timers         │
+  │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream / TcpConnector│
+  │    Stack  →  TCB per connection (active + passive open)                            │
+  │      wire (parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)            │
+  │      rtt (RFC 6298) · congestion (Reno) · sack + reasm (RFC 2018/6675)             │
+  │      timestamps (RFC 7323) · delayed ACKs (RFC 1122) · buffers · timers            │
   └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -103,16 +121,18 @@ and wakes the async tasks.
 > sequence-number wraparound, the checksum carry-fold and pseudo-header, Karn's rule for RTT
 > sampling under loss, the `ack_of_fin` teardown subtlety, the async lost-wakeup race. Every one
 > was pinned down by an adversarial design review *before* a line was written, then re-checked by
-> a review of the finished code (which found, and I fixed, 11 real bugs). If you read one file,
-> read that one.
+> a multi-agent adversarial review of the finished code before each commit (the initial review
+> found and fixed 11 real bugs; later reviews of active open and delayed ACKs caught 5 more). If
+> you read one file, read that one.
 
 ## The five hard problems
 
-1. **TCP state machine** — 11 RFC 793 states, the three-way handshake, active/passive/
-   simultaneous close, and TIME-WAIT (2·MSL). (`state`, `tcb`)
+1. **TCP state machine** — 11 RFC 793 states, the three-way handshake, **active open (`connect`)**
+   as well as passive, simultaneous open and close, and TIME-WAIT (2·MSL). (`state`, `tcb`)
 2. **Retransmission & selective repair** — a send ring with go-back-N retransmission, Jacobson/
-   Karn RTO estimation (RFC 6298), and SACK-based selective loss recovery with out-of-order
-   reassembly (RFC 2018 + RFC 6675). (`tcb`, `rtt`, `sack`, `reasm`)
+   Karn RTO estimation (RFC 6298), SACK-based selective loss recovery with out-of-order
+   reassembly (RFC 2018 + RFC 6675), RFC 7323 **timestamps** (Karn-free RTT + PAWS), and **delayed
+   ACKs** (RFC 1122). (`tcb`, `rtt`, `sack`, `reasm`)
 3. **Congestion control** — TCP Reno: slow start, congestion avoidance, fast retransmit on 3
    duplicate ACKs (RFC 5681 + 6928). (`congestion`)
 4. **Zero-copy parsing** — header views over `&[u8]` and the one's-complement Internet checksum
@@ -155,7 +175,8 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 100 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 136 tests: unit + in-memory integration + loss/SACK/teardown
+                            #            + two-stack loopback + timestamps + delayed ACKs
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -163,9 +184,10 @@ The TUN backend + live demo run on **Linux** (needs root for the device + routin
 ```sh
 cargo build --release -p tcp-tun
 sudo ./target/release/tcp-tun tun0 &     # creates tun0, serves HTTP on 10.0.0.2:8080
+# (FERRUM_IO=uring ./target/release/tcp-tun tun0  — the io_uring backend instead of blocking I/O)
 sudo ./scripts/tun-up.sh                 # address + route + disable checksum offload
 curl http://10.0.0.2:8080/               # the win condition
-curl -o /dev/null http://10.0.0.2:8080/bench   # 16 MiB throughput test
+curl -o /dev/null http://10.0.0.2:8080/bench/64   # 64 MiB throughput test
 sudo ./scripts/tun-down.sh
 ```
 
@@ -174,25 +196,27 @@ IP forwarding, so it is safe to run alongside other services.
 
 ## Roadmap
 
-The core is deliberately small and focused. These are the natural next milestones, each a
-self-contained extension of an existing component:
+The big milestones are done — active open, SACK loss recovery, MTU-adaptive MSS, window scaling,
+RFC 7323 timestamps, delayed ACKs, and an io_uring backend. What's left is the hot loop and a
+hardware measurement:
 
-- **Delayed ACKs and TCP timestamps (RFC 7323)** — fewer pure-ACK segments, and RTTM-based RTT
-  sampling that sidesteps Karn's ambiguity.
-- **io_uring backend** — its `READ`/`WRITE` are generic file ops, so (unlike `sendmmsg`) they
-  work on a TUN fd; batching many packet I/Os per `io_uring_enter` cuts the syscall overhead the
-  CPU profile is dominated by. The sans-IO core stays untouched.
-- **Active open (`connect`)** — make it a client as well as a server, which also unlocks a
-  two-stack loopback test harness.
-- **A transmit scratch ring** — remove the one heap allocation per emitted segment. A minor lever
-  on a syscall-bound path (match-MTU above is the larger one), but it would tighten the hot loop.
+- **A transmit scratch ring + folded/SIMD checksum** — remove the one heap allocation per emitted
+  segment and tighten the checksum. Worthwhile now that io_uring has made the I/O cheaper; a
+  marginal lever otherwise (match-MTU and io_uring are the larger ones).
+- **A two-instance measurement over a real TUN** — the two-stack loopback already proves window
+  scaling *in memory* (>64 KiB in flight with two fast peers); running two instances over the wire
+  would measure the compounding on hardware (needs IP forwarding + a second TUN, beyond the current
+  single-device footprint).
 
-Nothing here is stubbed today — those code paths simply don't exist yet, which keeps the current
-implementation honest about exactly what it does.
+Deliberately *not* on the roadmap: AF_XDP / DPDK / RDMA (a different kind of project — RDMA replaces
+the TCP stack rather than speeding it) and multi-threading (single-threaded by design; an
+`Arc<Mutex>` variant is the documented extension). Nothing in the codebase is stubbed — every code
+path that exists is complete and tested.
 
 ## References
 
-RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP), RFC 1071 (checksum), RFC 1982 (serial numbers),
-RFC 5681 + 6928 (congestion control), RFC 6298 (RTO), RFC 2018 + 6675 (SACK & selective recovery),
-RFC 5961 + 6528 (blind-attack hardening); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built
-milestone by milestone (M0 → M8); see [`docs/DESIGN.md`](docs/DESIGN.md).
+RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP + host requirements, incl. delayed ACKs), RFC 1071
+(checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (congestion control), RFC 6298 (RTO),
+RFC 2018 + 6675 (SACK & selective recovery), RFC 7323 (timestamps & window scaling), RFC 5961 +
+6528 (blind-attack hardening); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built milestone by
+milestone; see [`docs/DESIGN.md`](docs/DESIGN.md).
