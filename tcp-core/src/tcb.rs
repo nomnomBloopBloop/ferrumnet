@@ -16,10 +16,12 @@
 //! `snd_nxt` would make in-flight ACKs look like they acknowledge unsent data). On RTO this is
 //! go-back-N; with SACK negotiated (RFC 2018), `on_segment` buffers out-of-order data for
 //! reassembly and the sender runs RFC 6675 selective repair (scoreboard + pipe + NextSeg),
-//! falling back to go-back-N on a true RTO. Congestion control is Reno.
+//! falling back to go-back-N on a true RTO. Congestion control is pluggable: the TCB holds a
+//! [`Cc`] controller (Reno today; CUBIC/BBR slot in as enum variants) and drives it through the
+//! [`CongestionControl`] trait, threading `now` so a time-based controller can read the clock.
 
 use crate::buffers::RingBuffer;
-use crate::congestion::Reno;
+use crate::congestion::{Cc, CongestionControl};
 use crate::iface::{build_segment, Endpoint};
 use crate::reasm::Reasm;
 use crate::rtt::RttEstimator;
@@ -110,7 +112,7 @@ pub struct Tcb {
     rx: RingBuffer, // in-order received data awaiting the application
 
     rtt: RttEstimator,
-    cc: Reno,
+    cc: Cc,
     /// (sent_at, seq_end) of the segment currently being timed for RTT, if any.
     rtt_sample: Option<(Instant, SeqNumber)>,
     /// The outstanding window has been retransmitted; suppress RTT sampling (Karn).
@@ -216,7 +218,7 @@ impl Tcb {
             tx: RingBuffer::with_capacity(TX_BUFFER),
             rx: RingBuffer::with_capacity(RX_BUFFER),
             rtt: RttEstimator::new(),
-            cc: Reno::new(snd_mss),
+            cc: Cc::reno(snd_mss),
             rtt_sample: None,
             retransmitted: false,
             retransmit: false,
@@ -281,7 +283,7 @@ impl Tcb {
             tx: RingBuffer::with_capacity(TX_BUFFER),
             rx: RingBuffer::with_capacity(RX_BUFFER),
             rtt: RttEstimator::new(),
-            cc: Reno::new(MSS_DEFAULT),
+            cc: Cc::reno(MSS_DEFAULT),
             rtt_sample: None,
             retransmitted: false,
             retransmit: false,
@@ -493,12 +495,12 @@ impl Tcb {
                 // (step 0.5); we only arm recovery + the RTO timer here.
                 if !self.scoreboard.in_recovery() {
                     let flight = self.snd_nxt.offset_from(self.snd_una);
-                    let three_dups = is_dup && self.cc.on_dup_ack(flight);
+                    let three_dups = is_dup && self.cc.on_dup_ack(now, flight);
                     let lost = self.is_lost(self.snd_una);
                     if three_dups || lost {
                         if !three_dups {
-                            // Entered via SACK IsLost before 3 dup-ACKs: force Reno's halving.
-                            self.cc.enter_recovery(flight);
+                            // Entered via SACK IsLost before 3 dup-ACKs: force the window halving.
+                            self.cc.enter_recovery(now, flight);
                         }
                         self.scoreboard.begin_recovery(self.snd_nxt); // RecoveryPoint = SND.NXT
                         self.retransmitted = true;
@@ -508,7 +510,7 @@ impl Tcb {
                 }
             } else if is_dup {
                 let flight = self.snd_nxt.offset_from(self.snd_una);
-                if self.cc.on_dup_ack(flight) {
+                if self.cc.on_dup_ack(now, flight) {
                     // Legacy fast retransmit: resend the oldest unacked segment; suppress RTT
                     // sampling (Karn). Do NOT rewind SND.NXT (see transmit_data_or_fin step 0).
                     self.retransmit = true;
@@ -666,7 +668,7 @@ impl Tcb {
             self.snd_mss = tcp.mss_option().unwrap_or(MSS_DEFAULT).min(self.mss_advertise);
             // No data has been sent yet, so re-sizing the congestion window to the negotiated MSS
             // (giving the correct RFC 6928 initial window) loses no state.
-            self.cc = Reno::new(self.snd_mss);
+            self.cc = Cc::reno(self.snd_mss);
             self.sack_enabled = tcp.sack_permitted();
             match tcp.window_scale() {
                 Some(peer) => {
@@ -730,7 +732,7 @@ impl Tcb {
             // pipe estimate, not by Reno's per-ACK growth); outside recovery, grow normally.
             let in_recovery = self.sack_enabled && self.scoreboard.in_recovery();
             if !in_recovery {
-                self.cc.on_ack(data_acked as u32); // grow cwnd by the data bytes acknowledged
+                self.cc.on_ack(now, data_acked as u32); // grow cwnd by the data bytes acknowledged
             }
             if let Some(fin_seq) = self.fin_seq {
                 if seg_ack.gt(fin_seq) {
@@ -742,9 +744,9 @@ impl Tcb {
                 self.scoreboard.trim(self.snd_una);
                 if self.scoreboard.recovery_reached(self.snd_una) {
                     // Cumulative ACK reached RecoveryPoint: leave recovery; cwnd stays at the
-                    // (deflated) ssthresh. Reset Reno's dup-ACK counter without growing cwnd.
+                    // (deflated) ssthresh. Reset the controller's dup-ACK state without growing cwnd.
                     self.scoreboard.exit_recovery();
-                    self.cc.on_ack(0);
+                    self.cc.on_ack(now, 0);
                     // Data sent fresh during recovery (above RecoveryPoint) was never
                     // retransmitted, so RTT sampling may resume. Clearing this here (not only on
                     // full drain) avoids suppressing samples for the rest of a healthy flow.
@@ -1072,7 +1074,7 @@ impl Tcb {
                 }
             } else if now >= d {
                 let flight = self.snd_nxt.offset_from(self.snd_una);
-                self.cc.on_rto(flight); // ssthresh = max(flight/2, 2*MSS); cwnd = 1*MSS
+                self.cc.on_rto(now, flight); // ssthresh = max(flight/2, 2*MSS); cwnd = 1*MSS
                 self.rtt.on_timeout();
                 // An RTO is the stronger loss signal: abandon SACK recovery and fall back to the
                 // go-back-N path (step 0). The SACKed set is kept (RFC 6675 §5.1) so a
