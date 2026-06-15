@@ -27,6 +27,7 @@
 //! - The send gate is `min(cwnd, rwnd) − FlightSize`; the FlightSize subtraction uses wrapping
 //!   sequence arithmetic (tested in `crate::seq`). The zero-window probe bypasses `cwnd`.
 
+use crate::seq::SeqNumber;
 use crate::time::Instant;
 
 /// RFC 6928 initial window: `min(10·MSS, max(2·MSS, 14600))`.
@@ -98,6 +99,30 @@ pub trait CongestionControl {
     /// Update the maximum segment size (e.g. once the handshake learns the peer's MSS); never let
     /// `cwnd` drop below one new segment.
     fn set_mss(&mut self, mss: u16);
+
+    // ── rate-based control (BBR) ────────────────────────────────────────────────────────────────
+    // These have no-op defaults so a window-only controller (Reno, CUBIC) is unaffected and the
+    // TCB's send path stays byte-identical for them: `pacing_rate` returns `None` (unpaced), and
+    // the sampling hooks do nothing. A model-based controller overrides them.
+
+    /// The pacing rate in **bytes/second**, or `None` for a window-only controller that sends as
+    /// fast as `cwnd` allows. A rate-based controller (BBR) returns the rate the tx path should
+    /// space its sends at; `None` until it has measured enough to pace.
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
+
+    /// Record that `bytes` of **new** data ending at `seq_end` were transmitted at `now`, with
+    /// `inflight` bytes outstanding *before* this send, and whether the send was application-limited
+    /// (the app ran out of data while the window still had room). Feeds a rate-based controller's
+    /// delivery-rate estimator; retransmissions are not reported here.
+    fn on_transmit(&mut self, _now: Instant, _seq_end: SeqNumber, _bytes: u32, _inflight: u32, _app_limited: bool) {}
+
+    /// An ACK advanced the cumulative acknowledgement to `snd_una` (with `inflight` bytes still
+    /// outstanding after it): produce a delivery-rate sample and update the model (bottleneck
+    /// bandwidth, min-RTT, mode). Runs on every advancing ACK, *including* during loss recovery —
+    /// a rate-based controller keeps modelling where Reno would freeze.
+    fn on_ack_sample(&mut self, _now: Instant, _snd_una: SeqNumber, _inflight: u32) {}
 }
 
 pub struct Reno {
@@ -489,6 +514,27 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.set_mss(mss),
             Cc::Cubic(c) => c.set_mss(mss),
+        }
+    }
+
+    fn pacing_rate(&self) -> Option<u64> {
+        match self {
+            Cc::Reno(c) => c.pacing_rate(),
+            Cc::Cubic(c) => c.pacing_rate(),
+        }
+    }
+
+    fn on_transmit(&mut self, now: Instant, seq_end: SeqNumber, bytes: u32, inflight: u32, app_limited: bool) {
+        match self {
+            Cc::Reno(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
+            Cc::Cubic(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
+        }
+    }
+
+    fn on_ack_sample(&mut self, now: Instant, snd_una: SeqNumber, inflight: u32) {
+        match self {
+            Cc::Reno(c) => c.on_ack_sample(now, snd_una, inflight),
+            Cc::Cubic(c) => c.on_ack_sample(now, snd_una, inflight),
         }
     }
 }
