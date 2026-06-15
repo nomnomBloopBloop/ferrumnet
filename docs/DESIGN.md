@@ -58,11 +58,13 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   seq          SeqNumber — RFC 1982 serial arithmetic                   [M1]
   isn          keyed-SipHash ISN selection (RFC 6528)                   [M1]
   state        the 11 RFC 793 states                                   [M1]
-  tcb          the transmission control block: state machine, go-back-N [M1-M3,M6]
-               reliability, flow control, teardown, and per-connection timers
+  tcb          the transmission control block: state machine, go-back-N [M1-M3,M6-M8]
+               reliability, flow control, teardown, per-connection timers, SACK recovery
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
   congestion   TCP Reno controller                                     [M3]
   buffers      rx/tx ring buffers                                       [M2]
+  reasm        receiver out-of-order reassembly (coalesced runs)        [M8]
+  sack         sender SACK scoreboard + RFC 6675 predicates             [M8]
   iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
   runtime/     hand-rolled async: executor, reactor, TcpListener/Stream,
                Device trait + in-memory MockDevice                      [M4]
@@ -79,10 +81,11 @@ persist / TIME-WAIT / FIN-WAIT-2 deadlines; the `Stack` takes the min across con
 hashed timer wheel would be the O(1) generalization at thousands of connections, but is
 unnecessary at this scale.
 
-**Deliberately out of scope** (RTO recovery and the demo do not need them): delayed-ACK (we
-ACK immediately), SACK, TCP timestamps, window scaling, out-of-order reassembly (a gap is
-dropped and dup-ACKed; the RTO recovers it), IP fragmentation/reassembly, and active open
-(`connect`) — this is a server. None are stubbed; the code paths simply don't exist yet.
+**Deliberately out of scope** (the demo does not need them): delayed-ACK (we ACK immediately),
+TCP timestamps, window scaling, IP fragmentation/reassembly, and active open (`connect`) — this
+is a server. None are stubbed; the code paths simply don't exist yet. (**SACK**, out-of-order
+**reassembly**, and **RFC 6675** selective recovery were originally out of scope and are now
+implemented — see §5.8.)
 
 **Async model.** A single-threaded executor and reactor on one thread; shared connection
 state is `Rc<RefCell<ConnectionShared>>` — no hot-path locks (the brief's "mutex on every
@@ -193,6 +196,11 @@ Hand-rolled executor + reactor exposing `TcpListener`/`TcpStream`. Verified trap
   reaped once `Closed` and the app handle is dropped. (`async/N1,N10`)
 - Reactor: drive the core to quiescence each wake (bounded), recompute the deadline *after*
   processing TX, and clamp `poll_at` (None → block on the fd only; past → zero). (`async/N2,N7`)
+- The `Spawner`'s back-reference to the executor is a **`Weak`**, not an `Rc`: a spawned task
+  (the accept loop) captures a `Spawner` and is itself stored in the executor, so a strong
+  reference would close an `executor → task → Spawner → executor` cycle that leaks the executor
+  and every task when the runtime drops. With the `Weak`, Miri's leak checker is clean without
+  `-Zmiri-ignore-leaks`. (M8)
 
 ### 5.7 Device & demo (`tun`, `sys`, scripts, `http`) — M0/M5
 
@@ -209,6 +217,62 @@ Hand-rolled executor + reactor exposing `TcpListener`/`TcpStream`. Verified trap
   checksum of `0x0000` as a fallback. (`device-icmp/N2,X1`)
 - HTTP responder buffers until `\r\n\r\n`, responds exactly once (a `responded` flag; scans
   only newly-appended bytes), and sets `Content-Length`. (`device-icmp/T13,X7`)
+
+### 5.8 SACK, reassembly & RFC 6675 selective recovery (`sack`, `reasm`, `tcb`, `wire`) — M8
+
+Negotiated with **SACK-Permitted** (kind 4) on the handshake — the server echoes it on its
+SYN-ACK *only* when the client's SYN offered it — so a non-SACK peer keeps the exact go-back-N
+path. Everything below is gated on that one `sack_enabled` flag. The design was produced by a
+design-panel + adversarial-review pass; the review found and we fixed four real defects (noted
+inline). Verified subtleties:
+
+- **Receiver reassembly (`reasm`).** Out-of-order data above `RCV.NXT` is buffered as a small,
+  sorted list of coalesced runs (owned `Vec<u8>` per run — `RingBuffer` has no random-access
+  insert), drained into the in-order ring when a gap fills, and reported as SACK blocks
+  (kind 5, up to 4, most-recently-received first per RFC 2018 §4). The receive pool is **shared**
+  between the in-order ring and the OOO buffer, so `advertised_window = RX_BUFFER − rx.len() −
+  reasm.buffered()` and every OOO insert is clipped to that same byte budget — over-advertising
+  is unrecoverable (the right edge must not move left). An out-of-order **FIN** is remembered
+  (`pending_fin`) and consumed the instant reassembly reaches its slot. *Review fixes:* an
+  in-order write that overlaps a buffered run now **purges** the overtaken run (else it leaked
+  the budget and emitted a SACK block below the cumulative ACK, and could push occupancy past
+  `RX_BUFFER` and wedge the window); a segment overlapping the **left** window edge is now
+  left-trimmed so its fresh in-order tail is delivered rather than dropped.
+
+- **SACK wire format (`wire`).** A single audited option walker backs MSS / SACK-Permitted /
+  SACK-blocks parsing (bounds-checked against truncation). Emission adds the options 4-byte
+  aligned with NOP padding; `header_len()` and the emitter agree exactly, and the worst case
+  (four SACK blocks = 36 option bytes) stays within the 40-byte limit. MSS and SACK blocks never
+  coexist (MSS is SYN-ACK-only).
+
+- **Sender scoreboard (`sack`) + RFC 6675.** Incoming SACK blocks update a coalesced interval
+  set over `(SND.UNA, SND.NXT]` (validated: blocks at/below the cumulative ACK — stale/D-SACK —
+  and blocks acking unsent data are rejected). From it: `IsLost(seq)` (≥ DupThresh discontiguous
+  SACKed blocks above, **or** `> (DupThresh−1)·SMSS` bytes SACKed above — the literal RFC form),
+  a single-count `SetPipe()` (an unsacked span counts once if in flight *or* retransmitted —
+  never twice), and `NextSeg()` (the lowest lost, un-retransmitted hole; then a once-per-episode
+  rule-3 rescue). The send gate is `min(cwnd − pipe, rwnd − inflight)`, which is provably
+  identical to the old `min(cwnd, rwnd) − inflight` outside recovery (where `pipe == inflight`).
+
+- **Recovery composition with Reno.** Entry on the 3rd dup-ACK **or** an early `IsLost`, guarded
+  so it fires once (no double-halving); `cwnd` is held at `ssthresh` during recovery (the pipe
+  gate clocks transmission, not Reno's per-ACK growth) and `Reno` gains an idempotent
+  `enter_recovery` for the early path. Recovery exits when the cumulative ACK reaches the
+  `RecoveryPoint` captured at entry. An **RTO** abandons SACK recovery and falls back to
+  go-back-N, keeping the SACKed set (RFC 6675 §5.1) so a non-reneging peer's cumulative ACK still
+  jumps past data it already holds. *Review fixes:* the Karn `retransmitted` guard now clears on
+  recovery exit (not only on full drain), and a lost **FIN** that is the only outstanding octet
+  is now retransmitted at its own sequence slot (the go-back-N path peeked an empty `tx` and
+  emitted an empty segment — a pre-existing bug).
+
+- **The no-rewind invariant holds.** Selective retransmit resends a hole from inside
+  `[SND.UNA, SND.NXT)` and **never** assigns `SND.NXT` — so in-flight ACKs are never mistaken for
+  acks of unsent data (the same discipline as the M7 go-back-N fix).
+
+- **MTU-adaptive MSS.** The advertised MSS is `MTU − 40` (was hardcoded 1460), plumbed
+  device → Runtime → Stack → TCB. A larger MTU sends the same data in far fewer packets — the
+  practical syscall-reduction lever for a TUN char device, which is one packet per `write`
+  (`sendmmsg` needs a socket; `writev` only gathers into one packet).
 
 ## 6. End-to-end data flow (one `curl` request)
 
@@ -246,6 +310,8 @@ Hand-rolled executor + reactor exposing `TcpListener`/`TcpStream`. Verified trap
 | M4 | async executor + reactor + sockets | async echo server, concurrent connections |
 | M5 | HTTP responder | **`curl http://10.0.0.2:8080`** |
 | M6 | hardening + docs + portfolio polish | full suite green on 1.92 and 1.75 |
+| M7 | working loss recovery (Reno fast recovery, µs RTO, the no-rewind retransmit) | bulk transfer completes under live `tc netem` loss |
+| M8 | SACK + OOO reassembly + RFC 6675 selective recovery; MTU-adaptive MSS | ~4–5× faster recovery across the loss tail; ~2.3× throughput at a 65535 MTU |
 
 ## 9. Environment
 

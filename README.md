@@ -17,7 +17,7 @@ $ curl -v http://10.0.0.2:8080/
 < Connection: close
 ```
 
-`curl` believes it is talking to the Linux kernel. It is talking to ~3,000 lines of Rust.
+`curl` believes it is talking to the Linux kernel. It is talking to a few thousand lines of Rust.
 
 ## Why it's interesting
 
@@ -28,8 +28,9 @@ $ curl -v http://10.0.0.2:8080/
 - **sans-IO core.** `tcp-core` performs no I/O and contains no OS-specific code — it ingests
   received bytes and emits bytes to send, with time injected as a parameter. So the whole
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
-  unit-testable off-device, including under simulated packet loss. **68 tests**, green on Rust
-  1.92 and the 1.75 MSRV.
+  unit-testable off-device, including under simulated packet loss, reordering, and SACK-based
+  selective recovery. **100 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
+  leaks).
 - **It's real.** It runs on a Linux box over an actual `/dev/net/tun` device, answers `ping`,
   and serves HTTP to a stock `curl` — handshake, retransmission, congestion control, orderly
   teardown and TIME-WAIT, all on the wire.
@@ -39,22 +40,28 @@ $ curl -v http://10.0.0.2:8080/
 Measured on a 2-vCPU Ubuntu 22.04 VPS over `tun0` (MTU 1500). It's a same-host path, so it is
 CPU-bound — this measures the stack's processing efficiency, not link speed.
 
-- **Throughput** (`GET /bench`, 5 runs each): **~125–135 MB/s** from 1 MiB to 128 MiB transfers
-  (≈ 1 Gbit/s), single-threaded.
-- **Latency:** ICMP RTT (100 packets) min/avg/max = **0.039 / 0.105 / 0.212 ms**; small HTTP
-  request ~0.5 ms.
-- **CPU** during a 128 MiB transfer: ~1 core, dominated by **system** time (≈ 30% user / 50%
-  sys) — the per-packet `read`/`write` syscalls, which `writev`/`sendmmsg` batching would cut.
+- **Throughput** (`GET /bench`, single-threaded): **~135–145 MB/s** at the default 1500-byte MTU,
+  and **~290–340 MB/s** with the MTU raised to 65535. The advertised MSS auto-adapts to the
+  device MTU, so a larger MTU sends the same data in far fewer packets — and far fewer `write`
+  syscalls.
+- **Latency:** ICMP RTT (100 packets) min/avg/max ≈ **0.07 / 0.11 / 0.18 ms**; small HTTP request
+  ~0.5 ms.
+- **CPU** during a large transfer: ~1 core, dominated by **system** time — the per-packet
+  `read`/`write` syscalls. A TUN char device is one packet per `write` (it is not a socket, so
+  `sendmmsg` does not apply, and `writev` only *gathers* into a single packet), so raising the MTU
+  is the practical way to cut the syscall count — which is why match-MTU roughly doubles
+  throughput here.
 
-**Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB) — every transfer
-**completes correctly**; throughput degrades gracefully:
+**Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB transfer) — every
+transfer **completes correctly**, and **SACK selective repair** (RFC 2018 + RFC 6675) recovers the
+high-loss tail far faster than the previous go-back-N single-segment repair:
 
 | packet loss | 0% | 1% | 2% | 5% | 10% |
 |---|---|---|---|---|---|
-| throughput | 101 MB/s | 16.5 MB/s | 2.5 MB/s | 0.33 MB/s | 0.09 MB/s |
+| go-back-N (before) | 101 | 16.5 | 2.5 | 0.33 | 0.09 |
+| **SACK (now)** | **~98** | **~83** | **~9** | **~2** | **~0.5** |
 
-Recovery is fast-retransmit (Reno) + single-segment repair; SACK (on the roadmap) would speed
-up the high-loss tail.
+(MB/s; ~4–5× faster across the tail. Loss is stochastic, so these are small-sample figures.)
 
 **Kernel baseline** (Python `http.server` over `lo`, 16 MiB, 5 runs): ~420–640 MB/s. *Not*
 apples-to-apples — `lo`'s MTU is 65536 vs our 1500, and the kernel's loopback is fully in-kernel
@@ -95,8 +102,9 @@ and wakes the async tasks.
 
 1. **TCP state machine** — 11 RFC 793 states, the three-way handshake, active/passive/
    simultaneous close, and TIME-WAIT (2·MSL). (`state`, `tcb`)
-2. **Retransmission** — a send ring with go-back-N retransmission and Jacobson/Karn RTO
-   estimation (RFC 6298). (`tcb`, `rtt`)
+2. **Retransmission & selective repair** — a send ring with go-back-N retransmission, Jacobson/
+   Karn RTO estimation (RFC 6298), and SACK-based selective loss recovery with out-of-order
+   reassembly (RFC 2018 + RFC 6675). (`tcb`, `rtt`, `sack`, `reasm`)
 3. **Congestion control** — TCP Reno: slow start, congestion avoidance, fast retransmit on 3
    duplicate ACKs (RFC 5681 + 6928). (`congestion`)
 4. **Zero-copy parsing** — header views over `&[u8]` and the one's-complement Internet checksum
@@ -139,7 +147,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 68 tests: unit + in-memory integration + loss/teardown
+cargo test -p tcp-core      # 100 tests: unit + in-memory integration + loss/SACK/teardown
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -161,16 +169,14 @@ IP forwarding, so it is safe to run alongside other services.
 The core is deliberately small and focused. These are the natural next milestones, each a
 self-contained extension of an existing component:
 
-- **SACK + selective repair** — today a gap is dropped and recovered by the RTO via go-back-N;
-  selective acknowledgement would repair loss without resending data that already arrived.
 - **Delayed ACKs and TCP timestamps (RFC 7323)** — fewer pure-ACK segments, and RTTM-based RTT
   sampling that sidesteps Karn's ambiguity.
-- **Window scaling** — receive windows beyond 64 KiB for high bandwidth-delay paths.
-- **Out-of-order reassembly** — buffer and stitch gaps instead of dropping them.
+- **Window scaling** — receive windows beyond 64 KiB; without it, a large-MTU path is capped at
+  roughly one segment in flight per RTT (see the match-MTU benchmark).
 - **Active open (`connect`)** — make it a client as well as a server, which also unlocks a
   two-stack loopback test harness.
-- **A transmit scratch ring** — remove the one heap allocation per emitted segment; this is the
-  main lever on the throughput number above.
+- **A transmit scratch ring** — remove the one heap allocation per emitted segment. A minor lever
+  on a syscall-bound path (match-MTU above is the larger one), but it would tighten the hot loop.
 
 Nothing here is stubbed today — those code paths simply don't exist yet, which keeps the current
 implementation honest about exactly what it does.
@@ -178,6 +184,6 @@ implementation honest about exactly what it does.
 ## References
 
 RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP), RFC 1071 (checksum), RFC 1982 (serial numbers),
-RFC 5681 + 6928 (congestion control), RFC 6298 (RTO), RFC 5961 + 6528 (blind-attack hardening);
-W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built milestone by milestone (M0 → M6);
-see [`docs/DESIGN.md`](docs/DESIGN.md).
+RFC 5681 + 6928 (congestion control), RFC 6298 (RTO), RFC 2018 + 6675 (SACK & selective recovery),
+RFC 5961 + 6528 (blind-attack hardening); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built
+milestone by milestone (M0 → M8); see [`docs/DESIGN.md`](docs/DESIGN.md).
