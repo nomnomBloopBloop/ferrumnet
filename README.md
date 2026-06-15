@@ -36,17 +36,31 @@ $ curl -v http://10.0.0.2:8080/
 
 ## Benchmarks
 
-Measured on an Ubuntu 22.04 VPS over the `tun0` device (a localhost path, so it's CPU-bound —
-this measures the stack's processing efficiency, not link speed):
+Measured on a 2-vCPU Ubuntu 22.04 VPS over `tun0` (MTU 1500). It's a same-host path, so it is
+CPU-bound — this measures the stack's processing efficiency, not link speed.
 
-| Metric | Result |
-|---|---|
-| **Throughput** (`GET /bench`, 16 MiB) | **~140 MB/s** (≈ 1.1 Gbit/s) |
-| **ICMP RTT** (mean / min / max) | **0.099 ms** / 0.056 / 0.151 |
-| **HTTP request** (`GET /`, small response) | **~0.5 ms** |
+- **Throughput** (`GET /bench`, 5 runs each): **~125–135 MB/s** from 1 MiB to 128 MiB transfers
+  (≈ 1 Gbit/s), single-threaded.
+- **Latency:** ICMP RTT (100 packets) min/avg/max = **0.039 / 0.105 / 0.212 ms**; small HTTP
+  request ~0.5 ms.
+- **CPU** during a 128 MiB transfer: ~1 core, dominated by **system** time (≈ 30% user / 50%
+  sys) — the per-packet `read`/`write` syscalls, which `writev`/`sendmmsg` batching would cut.
 
-Single-threaded, with one heap allocation per emitted segment on the egress path — replacing
-that with a transmit scratch ring is the obvious next optimization.
+**Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB) — every transfer
+**completes correctly**; throughput degrades gracefully:
+
+| packet loss | 0% | 1% | 2% | 5% | 10% |
+|---|---|---|---|---|---|
+| throughput | 101 MB/s | 16.5 MB/s | 2.5 MB/s | 0.33 MB/s | 0.09 MB/s |
+
+Recovery is fast-retransmit (Reno) + single-segment repair; SACK (on the roadmap) would speed
+up the high-loss tail.
+
+**Kernel baseline** (Python `http.server` over `lo`, 16 MiB, 5 runs): ~420–640 MB/s. *Not*
+apples-to-apples — `lo`'s MTU is 65536 vs our 1500, and the kernel's loopback is fully in-kernel
+(no per-packet syscall or user/kernel copy), so it is structurally faster on this path. A
+userspace-over-TUN stack can close most of the gap (match the MTU, drop the per-segment
+allocation, batch syscalls) but won't beat in-kernel loopback here.
 
 ## Architecture
 
