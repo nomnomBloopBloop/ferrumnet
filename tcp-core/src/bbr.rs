@@ -123,7 +123,11 @@ impl RateSampler {
     /// Record a transmitted segment. `inflight` is the bytes outstanding *before* this send: when
     /// it is zero the connection restarted from idle, so the sample interval restarts here.
     fn on_transmit(&mut self, now: Instant, seq_end: SeqNumber, bytes: u32, inflight: u32, app_limited: bool) {
-        if inflight == 0 {
+        // Restart the sample interval here when nothing is outstanding from the sampler's view —
+        // a true idle restart (`inflight == 0`), or after `reset_in_flight` dropped the records on
+        // an RTO (FIFO empty though `inflight` may not be). Otherwise the next send would snapshot a
+        // `first_sent_time` spanning the gap and overstate the interval of the resulting sample.
+        if inflight == 0 || self.sent.is_empty() {
             self.first_sent_time = now;
             self.delivered_time = now;
         }
@@ -375,11 +379,12 @@ impl Bbr {
         }
     }
 
-    /// Enter PROBE_RTT when RTprop has not been refreshed within its window — unless already there.
-    fn maybe_enter_probe_rtt(&mut self, now: Instant) {
-        let stale = self.min_rtt_us != u32::MAX
-            && now.saturating_micros_since(self.min_rtt_stamp) > MIN_RTT_WINDOW_US;
-        if stale && self.mode != Mode::ProbeRtt {
+    /// Enter PROBE_RTT when RTprop has gone un-refreshed for its whole window. `expired` is computed
+    /// by the caller *before* the min-RTT refresh resets the stamp (cf. Linux `bbr_update_min_rtt`,
+    /// which derives `filter_expired` once and uses it for both the refresh and this trigger) — so
+    /// the refresh cannot consume the staleness signal this entry depends on.
+    fn maybe_enter_probe_rtt(&mut self, expired: bool) {
+        if expired && self.mode != Mode::ProbeRtt {
             self.mode = Mode::ProbeRtt;
             self.pacing_gain = 1.0;
             self.cwnd_gain = 1.0;
@@ -414,8 +419,8 @@ impl Bbr {
         }
     }
 
-    fn update_mode(&mut self, now: Instant, inflight: u32) {
-        self.maybe_enter_probe_rtt(now);
+    fn update_mode(&mut self, now: Instant, inflight: u32, min_rtt_expired: bool) {
+        self.maybe_enter_probe_rtt(min_rtt_expired);
         match self.mode {
             Mode::Startup => {
                 self.check_full_pipe();
@@ -520,12 +525,13 @@ impl CongestionControl for Bbr {
             self.round_start = false;
         }
 
-        // RTprop: keep the minimum RTT, refreshing if it is lower or the window has expired.
+        // RTprop: refresh the minimum RTT on a lower sample, or when the 10 s window has expired.
+        // Compute the expiry ONCE — it also drives PROBE_RTT entry in `update_mode` below — so the
+        // refresh here can't reset the stamp before the trigger reads it (the bug this replaced).
         let rtt = sample.rtt_us;
-        if rtt > 0
-            && (rtt < self.min_rtt_us
-                || now.saturating_micros_since(self.min_rtt_stamp) > MIN_RTT_WINDOW_US)
-        {
+        let min_rtt_expired = self.min_rtt_us != u32::MAX
+            && now.saturating_micros_since(self.min_rtt_stamp) > MIN_RTT_WINDOW_US;
+        if rtt > 0 && (rtt < self.min_rtt_us || min_rtt_expired) {
             self.min_rtt_us = rtt;
             self.min_rtt_stamp = now;
         }
@@ -539,7 +545,7 @@ impl CongestionControl for Bbr {
             self.btlbw = self.btlbw_filter.update(self.round_count, sample.delivery_rate);
         }
 
-        self.update_mode(now, inflight);
+        self.update_mode(now, inflight, min_rtt_expired);
         self.set_pacing_and_cwnd();
     }
 }
@@ -682,6 +688,37 @@ mod tests {
         assert!(!b.on_dup_ack(Instant::from_millis(500), 8000));
         assert!(b.on_dup_ack(Instant::from_millis(500), 8000), "3rd dup-ACK still triggers retransmit");
         assert_eq!(b.cwnd(), cwnd_before, "but BBR does not reduce its window on dup-ACKs");
+    }
+
+    #[test]
+    fn bbr_enters_probe_rtt_after_the_min_rtt_window() {
+        // Regression (review finding): on a steady path the min-RTT refresh used to consume the same
+        // staleness signal the PROBE_RTT trigger needed, so PROBE_RTT was never entered and RTprop
+        // was never re-probed. Drive a constant-RTT path well past the 10 s window and require that
+        // PROBE_RTT is reached at least once.
+        let mut b = Bbr::new(1000);
+        let rtt_ms = 20u64;
+        let mut t = 0u64;
+        let mut nxt = 1000u32;
+        let mut una = 0u32;
+        let mut saw_probe_rtt = false;
+        for _ in 0..700 {
+            // 700 rounds * 20 ms = 14 s > MIN_RTT_WINDOW_US (10 s).
+            let burst = b.cwnd().min(60_000);
+            let inflight_before = nxt.wrapping_sub(una);
+            let mut sent = 0u32;
+            while sent < burst {
+                let n = 1000u32.min(burst - sent);
+                b.on_transmit(Instant::from_millis(t), seq(nxt + n), n, inflight_before + sent, false);
+                nxt = nxt.wrapping_add(n);
+                sent += n;
+            }
+            t += rtt_ms;
+            una = nxt;
+            b.on_ack_sample(Instant::from_millis(t), seq(una), 0);
+            saw_probe_rtt |= b.mode == Mode::ProbeRtt;
+        }
+        assert!(saw_probe_rtt, "PROBE_RTT is entered once the min-RTT window expires on a steady path");
     }
 }
 

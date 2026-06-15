@@ -46,15 +46,17 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(Ipv4Addr::new(10, 0, 0, 2));
-    // Congestion controller: `FERRUM_CC=cubic` runs CUBIC (RFC 8312); anything else (default) is
-    // Reno. This is the swappable knob for the Reno-vs-CUBIC throughput comparison.
+    // Congestion controller: `FERRUM_CC=cubic` runs CUBIC (RFC 8312), `=bbr` runs BBR; anything
+    // else (default) is Reno. The swappable knob for the Reno-vs-CUBIC-vs-BBR comparison.
     let cc_kind = match std::env::var("FERRUM_CC").as_deref() {
         Ok("cubic") => CcKind::Cubic,
+        Ok("bbr") => CcKind::Bbr,
         _ => CcKind::Reno,
     };
     let cc_name = match cc_kind {
         CcKind::Reno => "reno",
         CcKind::Cubic => "cubic",
+        CcKind::Bbr => "bbr",
     };
 
     // `tcp-tun <dev> connect <server-ip> [path]` is the download client; otherwise serve.

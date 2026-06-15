@@ -594,6 +594,67 @@ mod tests {
         assert!(max_burst > 65_536, "window scaling let the client put >64 KiB in flight in one burst; got {max_burst}");
     }
 
+    #[test]
+    #[cfg_attr(miri, ignore)] // a time-advancing pacing loop over a multi-KB transfer; too slow under Miri
+    fn two_stacks_bulk_transfer_under_bbr() {
+        // Both ends run BBR. Unlike the fixed-time pumps above, this advances logical time by a
+        // fixed tick each round so the pacing timers fire and BBR sees a non-zero RTT to model — it
+        // proves the reactor's poll_at / run-loop drives a paced controller to completion without
+        // wedging, and that the data arrives intact.
+        use crate::congestion::CcKind;
+
+        let mut server = Runtime::new(MockDevice::new(), Endpoint::new(US, 8080), [31u8; 16]);
+        let mut client = Runtime::new(MockDevice::new(), Endpoint::new(HOST, 9), [32u8; 16]);
+        server.set_congestion_control(CcKind::Bbr);
+        client.set_congestion_control(CcKind::Bbr);
+
+        const N: usize = 128 * 1024;
+        let payload: std::rc::Rc<Vec<u8>> = std::rc::Rc::new((0..N).map(|i| (i % 251) as u8).collect());
+
+        let listener = server.listener();
+        let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        let rv = received.clone();
+        server.spawn(async move {
+            let stream = listener.accept().await;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                rv.borrow_mut().extend_from_slice(&buf[..n]);
+            }
+        });
+
+        let connector = client.connector();
+        let to_send = payload.clone();
+        client.spawn(async move {
+            let stream = connector.connect(Endpoint::new(US, 8080)).await.unwrap();
+            stream.write_all(&to_send).await.unwrap();
+            stream.close();
+        });
+
+        let mut t = Instant::from_millis(0);
+        for _ in 0..100_000 {
+            client.turn(t).unwrap();
+            server.turn(t).unwrap();
+            let c_out = client.device_mut().take_outbound();
+            let s_out = server.device_mut().take_outbound();
+            for f in s_out {
+                client.device_mut().inject(f);
+            }
+            for f in c_out {
+                server.device_mut().inject(f);
+            }
+            if received.borrow().len() == N {
+                break;
+            }
+            t = t.plus_millis(1); // a fixed tick: RTT ≈ 2 ticks, fine-grained enough for pacing
+        }
+        assert_eq!(received.borrow().len(), N, "BBR delivered the whole payload over the reactor");
+        assert_eq!(&**received.borrow(), &payload[..], "data integrity under BBR pacing");
+    }
+
     /// A segment from a peer at US:8080 to our client at HOST:`our_port`.
     fn peer_to(seq: SeqNumber, ack: SeqNumber, flags: u8, our_port: u16) -> Vec<u8> {
         let repr = TcpRepr {

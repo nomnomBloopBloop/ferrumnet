@@ -132,6 +132,13 @@ pub struct Tcb {
     /// segments since our last emitted ACK, to honour the "ACK every other segment" rule.
     delayed_ack_deadline: Option<Instant>,
     unacked_segs: u8,
+    /// Pacing (BBR): a token bucket that gates new-data sends to the controller's pacing rate. It
+    /// is entirely inert for a window-only controller — `pacing_rate()` is then `None`, so the
+    /// bucket is never consulted and `pace_deadline` never armed, leaving the send path and
+    /// `poll_at` byte-identical to a non-paced build.
+    pace_tokens: u64,
+    pace_last: Instant,
+    pace_deadline: Option<Instant>,
 
     // FIN bookkeeping.
     fin_queued: bool, // the application asked to close
@@ -231,6 +238,9 @@ impl Tcb {
             time_wait_deadline: None,
             delayed_ack_deadline: None,
             unacked_segs: 0,
+            pace_tokens: 0,
+            pace_last: now,
+            pace_deadline: None,
             fin_queued: false,
             fin_seq: None,
             fin_acked: false,
@@ -297,6 +307,9 @@ impl Tcb {
             time_wait_deadline: None,
             delayed_ack_deadline: None,
             unacked_segs: 0,
+            pace_tokens: 0,
+            pace_last: now,
+            pace_deadline: None,
             fin_queued: false,
             fin_seq: None,
             fin_acked: false,
@@ -756,6 +769,10 @@ impl Tcb {
                 }
             }
             self.snd_una = seg_ack;
+            // Feed a rate-based controller its delivery-rate sample now that SND.UNA has advanced
+            // (a no-op for Reno/CUBIC). Runs even during recovery — BBR keeps modelling the path
+            // where a window controller would freeze its growth.
+            self.cc.on_ack_sample(now, self.snd_una, self.snd_nxt.offset_from(self.snd_una));
             if self.sack_enabled {
                 self.scoreboard.trim(self.snd_una);
                 if self.scoreboard.recovery_reached(self.snd_una) {
@@ -1015,7 +1032,19 @@ impl Tcb {
         };
         let cwnd_room = self.cc.cwnd().saturating_sub(pipe);
         let rwnd_room = self.snd_wnd.saturating_sub(inflight);
-        let allowed = cwnd_room.min(rwnd_room);
+        let mut allowed = cwnd_room.min(rwnd_room);
+        // Pacing (BBR): a rate-based controller limits how many bytes may leave *now*, spacing the
+        // window out at its modelled rate instead of bursting it. A window controller returns
+        // `None`, so this whole block is skipped and `allowed` (and `poll_at`) are unchanged.
+        if let Some(rate) = self.cc.pacing_rate() {
+            self.pace_deadline = None;
+            let paced = self.pace_allowance(now, rate, max_payload as u32);
+            if paced < allowed && unsent_data > 0 {
+                // Pacing is the binding constraint: wake again once a segment's credit has accrued.
+                self.arm_pace(now, rate, paced);
+            }
+            allowed = allowed.min(paced);
+        }
         if allowed > 0 {
             let n = (allowed as usize).min(unsent_data).min(max_payload);
             if n > 0 {
@@ -1029,10 +1058,19 @@ impl Tcb {
                 if self.rtt_sample.is_none() && !self.retransmitted {
                     self.rtt_sample = Some((now, self.snd_nxt));
                 }
+                // Pacing bookkeeping + delivery-rate accounting (both no-ops for window controllers,
+                // whose `pacing_rate()` is `None` and whose `on_transmit` is the default no-op). The
+                // send is app-limited if it drained the write queue while the window had more room.
+                if self.cc.pacing_rate().is_some() {
+                    self.pace_tokens = self.pace_tokens.saturating_sub(n as u64);
+                }
+                let app_limited = n == unsent_data && cwnd_room.min(rwnd_room) > n as u32;
+                self.cc.on_transmit(now, self.snd_nxt, n as u32, inflight, app_limited);
                 self.start_rtx(now);
                 return Some(seg);
             }
-        } else if unsent_data > 0 && inflight == 0 {
+        } else if unsent_data > 0 && inflight == 0 && rwnd_room == 0 {
+            // A genuine zero *peer* window (not a pacing throttle, where rwnd_room > 0): probe it.
             // ...or, with a zero window and data to send, probe one byte at SND.UNA (without
             // advancing SND.NXT — the same byte is sent normally once the window reopens).
             self.arm_persist(now);
@@ -1065,10 +1103,16 @@ impl Tcb {
 
     /// The earliest armed deadline (the backend sleeps until then).
     pub fn poll_at(&self) -> Option<Instant> {
-        [self.rtx_deadline, self.persist_deadline, self.time_wait_deadline, self.delayed_ack_deadline]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.rtx_deadline,
+            self.persist_deadline,
+            self.time_wait_deadline,
+            self.delayed_ack_deadline,
+            self.pace_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Fire every timer whose deadline has passed (a late wake may pass several at once).
@@ -1202,6 +1246,28 @@ impl Tcb {
         if self.delayed_ack_deadline.is_none() {
             self.delayed_ack_deadline = Some(now.plus_millis(DELAYED_ACK_MILLIS));
         }
+    }
+
+    /// Pacing token bucket (BBR). Replenish the credit earned since the last call at `rate`
+    /// bytes/sec, capped at a small burst (~1 ms of rate, floored at two segments) so an idle gap
+    /// can't release a flood, and return the bytes pacing currently permits. Called once per
+    /// `transmit` attempt; within a single turn `now` does not advance, so it does not
+    /// double-replenish.
+    fn pace_allowance(&mut self, now: Instant, rate: u64, mss: u32) -> u32 {
+        let elapsed = now.saturating_micros_since(self.pace_last);
+        let earned = elapsed.saturating_mul(rate) / 1_000_000;
+        let cap = (rate / 1000).max(2 * mss as u64);
+        self.pace_tokens = self.pace_tokens.saturating_add(earned).min(cap);
+        self.pace_last = now;
+        self.pace_tokens.min(u32::MAX as u64) as u32
+    }
+
+    /// Arm the pacing timer for when at least one more segment's worth of credit will have accrued
+    /// (given `have` bytes already in the bucket), so the reactor wakes to send the next paced chunk.
+    fn arm_pace(&mut self, now: Instant, rate: u64, have: u32) {
+        let need = (self.snd_mss as u64).saturating_sub(have as u64);
+        let wait_us = need.saturating_mul(1_000_000).div_ceil(rate.max(1)).max(1);
+        self.pace_deadline = Some(now.plus_micros(wait_us));
     }
 
     fn arm_time_wait(&mut self, now: Instant) {
@@ -1388,6 +1454,10 @@ impl Tcb {
     #[cfg(test)]
     pub(crate) fn cc_kind_dbg(&self) -> CcKind {
         self.cc_kind
+    }
+    #[cfg(test)]
+    fn pacing_rate_dbg(&self) -> Option<u64> {
+        self.cc.pacing_rate()
     }
     #[cfg(test)]
     fn reasm_buffered_dbg(&self) -> usize {
@@ -2729,5 +2799,64 @@ mod tests {
         let sent: usize = out.iter().map(|o| o.payload.len()).sum();
         assert_eq!(sent, 14600, "CUBIC initial window matches RFC 6928");
         assert_eq!(tcb.cwnd_dbg(), 14600);
+    }
+
+    #[test]
+    fn bbr_connection_paces_and_delivers() {
+        let t0 = Instant::from_millis(0);
+        // Passive open with BBR selected at birth (as the Stack stamps it).
+        let syn = inbound(SeqNumber::new(50000), SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), b"");
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), t0, 1460);
+        tcb.set_congestion_control(CcKind::Bbr);
+        assert_eq!(tcb.cc_kind_dbg(), CcKind::Bbr);
+        let our_iss = drain(&mut tcb, t0)[0].seq;
+        let cnxt = SeqNumber::new(50000) + 1;
+        deliver(&mut tcb, t0, &inbound(cnxt, our_iss + 1, TcpFlags::ACK, 64000, None, b""));
+        assert_eq!(tcb.state, State::Established);
+        assert!(tcb.pacing_rate_dbg().is_none(), "no pacing until the first delivery-rate sample");
+
+        let full = tcb.tx_free();
+        assert_eq!(tcb.send(&vec![7u8; 30000]), 30000);
+
+        // First burst: BBR has no model yet, so it sends cwnd-limited at the RFC 6928 initial
+        // window (14600), exactly like Reno/CUBIC — no pacing throttle.
+        let out = drain(&mut tcb, t0);
+        let burst1: usize = out.iter().map(|o| o.payload.len()).sum();
+        assert_eq!(burst1, 14600, "unpaced initial-window burst before the first sample");
+        let mut high = out.last().unwrap().seq + out.last().unwrap().payload.len() as u32;
+
+        // ACK the burst one RTT (20 ms) later: BBR now has a bandwidth and a min-RTT, so it paces.
+        let t1 = t0.plus_millis(20);
+        deliver(&mut tcb, t1, &inbound(cnxt, high, TcpFlags::ACK, 64000, None, b""));
+        assert!(tcb.pacing_rate_dbg().is_some(), "BBR paces once it has a model");
+        let out = drain(&mut tcb, t1);
+        let burst2: usize = out.iter().map(|o| o.payload.len()).sum();
+        assert!(
+            burst2 > 0 && burst2 < burst1,
+            "the next burst is paced — throttled below what the window alone would send: {burst2}"
+        );
+        assert!(tcb.poll_at().is_some(), "a pacing timer is armed so the rest follows");
+        if let Some(o) = out.last() {
+            high = high.max(o.seq + o.payload.len() as u32);
+        }
+
+        // Advance to each pacing deadline, acking what goes out, until the whole buffer is gone.
+        // If pacing ever wedged (no timer / zero allowance forever) this would not converge.
+        for _ in 0..2000 {
+            if tcb.tx_free() == full {
+                break;
+            }
+            let d = tcb.poll_at().expect("a timer is armed while data remains to send");
+            let t = d.plus_micros(1);
+            tcb.on_timer(t);
+            let out = drain(&mut tcb, t);
+            for o in &out {
+                high = high.max(o.seq + o.payload.len() as u32);
+            }
+            deliver(&mut tcb, t, &inbound(cnxt, high, TcpFlags::ACK, 64000, None, b""));
+        }
+        assert_eq!(tcb.tx_free(), full, "pacing delivered the whole buffer without wedging");
     }
 }

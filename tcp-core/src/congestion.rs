@@ -27,6 +27,7 @@
 //! - The send gate is `min(cwnd, rwnd) − FlightSize`; the FlightSize subtraction uses wrapping
 //!   sequence arithmetic (tested in `crate::seq`). The zero-window probe bypasses `cwnd`.
 
+use crate::bbr::Bbr;
 use crate::seq::SeqNumber;
 use crate::time::Instant;
 
@@ -445,6 +446,7 @@ pub enum CcKind {
     #[default]
     Reno,
     Cubic,
+    Bbr,
 }
 
 /// The congestion controller the TCB holds. An **enum, not `Box<dyn CongestionControl>`**: dispatch
@@ -453,6 +455,7 @@ pub enum CcKind {
 pub enum Cc {
     Reno(Reno),
     Cubic(Cubic),
+    Bbr(Bbr),
 }
 
 impl Cc {
@@ -461,6 +464,7 @@ impl Cc {
         match kind {
             CcKind::Reno => Cc::Reno(Reno::new(mss)),
             CcKind::Cubic => Cc::Cubic(Cubic::new(mss)),
+            CcKind::Bbr => Cc::Bbr(Bbr::new(mss)),
         }
     }
 }
@@ -471,6 +475,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.cwnd(),
             Cc::Cubic(c) => c.cwnd(),
+            Cc::Bbr(c) => c.cwnd(),
         }
     }
 
@@ -479,6 +484,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.ssthresh(),
             Cc::Cubic(c) => c.ssthresh(),
+            Cc::Bbr(c) => c.ssthresh(),
         }
     }
 
@@ -486,6 +492,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.on_ack(now, acked),
             Cc::Cubic(c) => c.on_ack(now, acked),
+            Cc::Bbr(c) => c.on_ack(now, acked),
         }
     }
 
@@ -493,6 +500,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.on_dup_ack(now, flight_size),
             Cc::Cubic(c) => c.on_dup_ack(now, flight_size),
+            Cc::Bbr(c) => c.on_dup_ack(now, flight_size),
         }
     }
 
@@ -500,6 +508,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.enter_recovery(now, flight_size),
             Cc::Cubic(c) => c.enter_recovery(now, flight_size),
+            Cc::Bbr(c) => c.enter_recovery(now, flight_size),
         }
     }
 
@@ -507,6 +516,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.on_rto(now, flight_size),
             Cc::Cubic(c) => c.on_rto(now, flight_size),
+            Cc::Bbr(c) => c.on_rto(now, flight_size),
         }
     }
 
@@ -514,6 +524,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.set_mss(mss),
             Cc::Cubic(c) => c.set_mss(mss),
+            Cc::Bbr(c) => c.set_mss(mss),
         }
     }
 
@@ -521,6 +532,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.pacing_rate(),
             Cc::Cubic(c) => c.pacing_rate(),
+            Cc::Bbr(c) => c.pacing_rate(),
         }
     }
 
@@ -528,6 +540,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Cubic(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
+            Cc::Bbr(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
         }
     }
 
@@ -535,6 +548,7 @@ impl CongestionControl for Cc {
         match self {
             Cc::Reno(c) => c.on_ack_sample(now, snd_una, inflight),
             Cc::Cubic(c) => c.on_ack_sample(now, snd_una, inflight),
+            Cc::Bbr(c) => c.on_ack_sample(now, snd_una, inflight),
         }
     }
 }
