@@ -39,10 +39,11 @@ pub struct Runtime<D: Device> {
 impl<D: Device> Runtime<D> {
     pub fn new(device: D, local: Endpoint, isn_secret: [u8; 16]) -> Self {
         let mtu = device.mtu();
+        let mss = crate::tcb::mss_for_mtu(mtu);
         Runtime {
             device,
             state: Rc::new(RefCell::new(ReactorState {
-                stack: Stack::new(local, isn_secret),
+                stack: Stack::new(local, isn_secret, mss),
                 read_wakers: HashMap::new(),
                 write_wakers: HashMap::new(),
                 accept_waker: None,

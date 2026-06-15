@@ -13,6 +13,7 @@ DEV="${1:-tun0}"
 HOST_IP="10.0.0.1"    # the kernel side of the point-to-point link
 STACK_IP="10.0.0.2"   # the address our userspace stack answers as
 PREFIX=24
+MTU="${FERRUM_MTU:-1500}"   # must match the stack's FERRUM_MTU (drives the advertised MSS)
 
 if ! ip link show "$DEV" >/dev/null 2>&1; then
   echo "error: device '$DEV' does not exist — start the stack first; it creates the device." >&2
@@ -20,6 +21,7 @@ if ! ip link show "$DEV" >/dev/null 2>&1; then
 fi
 
 ip addr replace "$HOST_IP/$PREFIX" dev "$DEV"
+ip link set "$DEV" mtu "$MTU"
 ip link set "$DEV" up
 ip route replace "$STACK_IP/32" dev "$DEV"
 

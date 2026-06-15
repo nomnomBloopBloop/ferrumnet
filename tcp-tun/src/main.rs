@@ -20,10 +20,16 @@ fn main() -> std::io::Result<()> {
     use tun::TunDevice;
 
     let dev_name = std::env::args().nth(1).unwrap_or_else(|| "tun0".to_string());
-    let dev = TunDevice::open(&dev_name)?;
+    // The MTU the stack assumes (drives the advertised MSS); must match the kernel interface MTU
+    // set by tun-up.sh. Override for the match-MTU experiment, e.g. `FERRUM_MTU=65535`.
+    let mtu = std::env::var("FERRUM_MTU")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(tun::DEFAULT_MTU);
+    let dev = TunDevice::open(&dev_name, mtu)?;
     eprintln!(
-        "tcp-tun: {} up; serving HTTP on 10.0.0.2:8080. Configure with scripts/tun-up.sh, \
-         then `curl http://10.0.0.2:8080/`.",
+        "tcp-tun: {} up (MTU {mtu}); serving HTTP on 10.0.0.2:8080. Configure with \
+         scripts/tun-up.sh, then `curl http://10.0.0.2:8080/`.",
         dev.name(),
     );
 

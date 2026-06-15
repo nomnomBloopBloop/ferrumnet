@@ -24,8 +24,11 @@ pub struct TunDevice {
 }
 
 impl TunDevice {
-    /// Open `/dev/net/tun` and attach to (creating if necessary) the named TUN interface.
-    pub fn open(requested_name: &str) -> std::io::Result<Self> {
+    /// Open `/dev/net/tun` and attach to (creating if necessary) the named TUN interface, with
+    /// the device MTU the stack should assume. The MTU drives the advertised MSS, so it must
+    /// match the kernel interface MTU set by `tun-up.sh` (default 1500). A larger MTU yields a
+    /// larger MSS and far fewer packets — and `write` syscalls — for the same data.
+    pub fn open(requested_name: &str, mtu: usize) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -33,11 +36,7 @@ impl TunDevice {
             .open("/dev/net/tun")?;
         let flags = sys::IFF_TUN | sys::IFF_NO_PI;
         let name = sys::ioctl_tunsetiff(file.as_raw_fd(), requested_name, flags)?;
-        Ok(TunDevice {
-            file,
-            name,
-            mtu: DEFAULT_MTU,
-        })
+        Ok(TunDevice { file, name, mtu })
     }
 
     pub fn name(&self) -> &str {

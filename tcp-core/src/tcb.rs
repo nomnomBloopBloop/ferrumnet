@@ -29,8 +29,16 @@ use crate::state::State;
 use crate::time::Instant;
 use crate::wire::{SackBlocks, TcpFlags, TcpPacket, TcpRepr, MAX_SACK_BLOCKS};
 
-const MSS_ADVERTISE: u16 = 1460; // our MTU(1500) - IPv4(20) - TCP(20)
 const MSS_DEFAULT: u16 = 536; // RFC 9293 default when the peer sends no MSS option
+/// Largest MSS a single IPv4 datagram can carry: 65535 (IP total-length max) − 20 (IPv4) − 20 (TCP).
+const MSS_MAX: u16 = 65_495;
+
+/// The MSS to advertise for a device MTU: `MTU − IPv4(20) − TCP(20)`, clamped to a sane range.
+/// For the default 1500-byte MTU this is 1460; a jumbo/loopback-sized MTU yields a larger MSS and
+/// hence far fewer packets (and `write` syscalls) for the same data.
+pub fn mss_for_mtu(mtu: usize) -> u16 {
+    (mtu.saturating_sub(40)).clamp(MSS_DEFAULT as usize, MSS_MAX as usize) as u16
+}
 const TX_BUFFER: usize = 65_536;
 const RX_BUFFER: usize = 65_536;
 /// TIME-WAIT duration (2·MSL). A demo-friendly value; RFC 793 suggests up to ~4 min.
@@ -102,6 +110,8 @@ pub struct Tcb {
     /// A peer FIN whose sequence slot is above rcv_nxt (arrived out of order); consumed the
     /// instant a gap-fill makes rcv_nxt reach it.
     pending_fin: Option<SeqNumber>,
+    /// The MSS we advertise (derived from the device MTU); also the cap on our segment size.
+    mss_advertise: u16,
 }
 
 impl Tcb {
@@ -113,8 +123,9 @@ impl Tcb {
         syn: &TcpPacket<'_>,
         iss: SeqNumber,
         now: Instant,
+        mss_advertise: u16,
     ) -> Self {
-        let snd_mss = syn.mss_option().unwrap_or(MSS_DEFAULT).min(MSS_ADVERTISE);
+        let snd_mss = syn.mss_option().unwrap_or(MSS_DEFAULT).min(mss_advertise);
         let irs = syn.seq();
         let rcv_nxt = irs + 1; // the peer's SYN consumes one sequence number
         let rcv_wnd = RX_BUFFER.min(0xFFFF) as u16;
@@ -158,6 +169,7 @@ impl Tcb {
             reasm: Reasm::new(),
             scoreboard: Scoreboard::new(),
             pending_fin: None,
+            mss_advertise,
         }
     }
 
@@ -821,7 +833,7 @@ impl Tcb {
     fn build(&mut self, seq: SeqNumber, extra_flags: u8, payload: &[u8]) -> Vec<u8> {
         let flags = TcpFlags(extra_flags | TcpFlags::ACK);
         let window = self.advertised_window();
-        let mss = if flags.syn() { Some(MSS_ADVERTISE) } else { None };
+        let mss = if flags.syn() { Some(self.mss_advertise) } else { None };
         // Echo SACK-Permitted on the SYN-ACK; report out-of-order runs as SACK blocks on every
         // other ACK while reassembly holds data (never on the SYN-ACK, which carries the MSS
         // option and no data).
@@ -1035,7 +1047,7 @@ mod tests {
         let syn = inbound(SeqNumber::new(client_isn), SeqNumber::new(0), TcpFlags::SYN, window, Some(1460), b"");
         let ip = Ipv4Packet::new_checked(&syn).unwrap();
         let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now);
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
         let out = drain(&mut tcb, now);
         assert_eq!(out.len(), 1);
         assert!(out[0].flags.syn() && out[0].flags.ack());
@@ -1356,7 +1368,7 @@ mod tests {
         let syn = inbound_syn_sack(SeqNumber::new(client_isn), window);
         let ip = Ipv4Packet::new_checked(&syn).unwrap();
         let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now);
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
         let synack = tcb.poll_transmit(now).expect("SYN-ACK");
         assert!(parse_sack(&synack).0, "SYN-ACK must echo SACK-Permitted");
         let our_iss = parse(&synack).seq;
@@ -1375,7 +1387,7 @@ mod tests {
         let syn = inbound(SeqNumber::new(1), SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), b"");
         let ip = Ipv4Packet::new_checked(&syn).unwrap();
         let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now);
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
         let synack = tcb.poll_transmit(now).unwrap();
         assert!(!parse_sack(&synack).0);
         // A SACK-permitting SYN does (asserted inside established_sack).
@@ -1577,5 +1589,14 @@ mod tests {
         deliver(&mut tcb, now, &inbound(cnxt, iss + 5001, TcpFlags::ACK, 64000, None, b""));
         assert!(!tcb.in_sack_recovery_dbg());
         assert!(!tcb.retransmitted_dbg(), "RTT sampling resumes after recovery exit");
+    }
+
+    #[test]
+    fn mss_adapts_to_mtu() {
+        assert_eq!(mss_for_mtu(1500), 1460); // the default
+        assert_eq!(mss_for_mtu(65535), 65495); // jumbo: one IP datagram's worth
+        assert_eq!(mss_for_mtu(576), 536); // small MTU floors at the RFC 9293 default
+        assert_eq!(mss_for_mtu(100), 536); // below the floor clamps up
+        assert_eq!(mss_for_mtu(70000), 65495); // above the IP-datagram cap clamps down
     }
 }

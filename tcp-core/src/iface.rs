@@ -88,16 +88,21 @@ pub struct Stack {
     conns: HashMap<Endpoint, Tcb>,
     /// Datagrams not associated with a connection (e.g. resets to unknown peers).
     pending: VecDeque<Vec<u8>>,
+    /// MSS advertised on every SYN-ACK (derived from the device MTU).
+    mss_advertise: u16,
 }
 
 impl Stack {
     /// `isn_secret` must come from the OS CSPRNG (the backend reads `/dev/urandom`).
-    pub fn new(local: Endpoint, isn_secret: [u8; 16]) -> Self {
+    /// `mss_advertise` is the MSS to advertise, derived from the device MTU via
+    /// [`crate::tcb::mss_for_mtu`].
+    pub fn new(local: Endpoint, isn_secret: [u8; 16], mss_advertise: u16) -> Self {
         Stack {
             local,
             isn: IsnGenerator::new(isn_secret),
             conns: HashMap::new(),
             pending: VecDeque::new(),
+            mss_advertise,
         }
     }
 
@@ -153,7 +158,7 @@ impl Stack {
                 remote.port,
                 now.micros(),
             );
-            let tcb = Tcb::new_syn_received(self.local, remote, &tcp, iss, now);
+            let tcb = Tcb::new_syn_received(self.local, remote, &tcp, iss, now, self.mss_advertise);
             self.conns.insert(remote, tcb);
         } else if !tcp.flags().rst() {
             // Segment to a non-existent connection (and not itself a RST): reset it.
@@ -240,7 +245,7 @@ mod tests {
 
     #[test]
     fn three_way_handshake_then_data() {
-        let mut stack = Stack::new(us(), [0x42; 16]);
+        let mut stack = Stack::new(us(), [0x42; 16], 1460);
         let now = Instant::from_millis(0);
 
         let out = feed(&mut stack, now, &inbound(SeqNumber::new(1000), SeqNumber::new(0), TcpFlags::SYN, Some(1460), b""));
@@ -270,7 +275,7 @@ mod tests {
 
     #[test]
     fn rst_at_rcv_nxt_closes_connection() {
-        let mut stack = Stack::new(us(), [1; 16]);
+        let mut stack = Stack::new(us(), [1; 16], 1460);
         let now = Instant::from_millis(0);
         let out = feed(&mut stack, now, &inbound(SeqNumber::new(5000), SeqNumber::new(0), TcpFlags::SYN, Some(1460), b""));
         let our_iss = with_tcp(&out[0], |t| t.seq());
@@ -284,7 +289,7 @@ mod tests {
 
     #[test]
     fn segment_to_unknown_connection_is_reset() {
-        let mut stack = Stack::new(us(), [3; 16]);
+        let mut stack = Stack::new(us(), [3; 16], 1460);
         let now = Instant::from_millis(0);
         let out = feed(&mut stack, now, &inbound(SeqNumber::new(1), SeqNumber::new(99), TcpFlags::ACK, None, b""));
         assert_eq!(out.len(), 1);
