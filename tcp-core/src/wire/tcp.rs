@@ -206,6 +206,18 @@ impl<'a> TcpPacket<'a> {
         mss
     }
 
+    /// Parse the Window Scale option (kind 3, length 3 => 1-byte shift count), clamped to the
+    /// RFC 7323 maximum of 14. Sent only on SYN/SYN-ACK; enables windows beyond 64 KiB.
+    pub fn window_scale(&self) -> Option<u8> {
+        let mut scale = None;
+        self.for_each_option(|kind, value| {
+            if kind == 3 && value.len() == 1 && scale.is_none() {
+                scale = Some(value[0].min(14));
+            }
+        });
+        scale
+    }
+
     /// True if the peer offered the SACK-Permitted option (kind 4, length 2 — an empty value).
     /// Sent only on SYN; a server echoes it on its SYN-ACK to enable SACK for the connection.
     pub fn sack_permitted(&self) -> bool {
@@ -292,6 +304,8 @@ pub struct TcpRepr {
     pub mss: Option<u16>,
     pub sack_permitted: bool,
     pub sack: SackBlocks,
+    /// Window Scale shift to advertise (SYN-ACK only); the window field is the *scaled* value.
+    pub window_scale: Option<u8>,
 }
 
 impl TcpRepr {
@@ -307,6 +321,9 @@ impl TcpRepr {
         }
         if self.sack_permitted {
             opt += 4;
+        }
+        if self.window_scale.is_some() {
+            opt += 4; // NOP + kind3 + len3 + shift
         }
         let n = self.sack.len();
         if n > 0 {
@@ -352,6 +369,13 @@ impl TcpRepr {
             buf[o + 3] = 2; // length
             o += 4;
         }
+        if let Some(shift) = self.window_scale {
+            buf[o] = 1; // NOP (align the 3-byte option to 4 bytes)
+            buf[o + 1] = 3; // kind: Window Scale
+            buf[o + 2] = 3; // length
+            buf[o + 3] = shift; // shift count
+            o += 4;
+        }
         let n = self.sack.len();
         if n > 0 {
             buf[o] = 1; // NOP
@@ -393,6 +417,7 @@ mod tests {
             window: 64240,
             mss: Some(1460),
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         let mut buf = [0u8; 40];
@@ -424,6 +449,7 @@ mod tests {
             window: 1000,
             mss: None,
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         let payload = b"GET / HTTP/1.0\r\n\r\n";
@@ -460,6 +486,7 @@ mod tests {
             window: 0,
             mss: None,
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         let mut buf = [0u8; 28];
@@ -545,6 +572,7 @@ mod tests {
             window: 64000,
             mss: Some(1460),
             sack_permitted: true,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         let mut buf = [0u8; 60];
@@ -573,6 +601,7 @@ mod tests {
             window: 1000,
             mss: None,
             sack_permitted: false,
+            window_scale: None,
             sack,
         };
         let mut buf = [0u8; 80];
@@ -586,5 +615,34 @@ mod tests {
         assert_eq!(blocks[0], (SeqNumber::new(10), SeqNumber::new(20)));
         assert_eq!(blocks[3], (SeqNumber::new(70), SeqNumber::new(80)));
         assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()));
+    }
+
+    #[test]
+    fn emit_then_parse_window_scale_on_syn_ack() {
+        // A SYN-ACK carrying MSS + SACK-Permitted + Window Scale = 12 option bytes (header 32).
+        let repr = TcpRepr {
+            src_port: 8080,
+            dst_port: 40000,
+            seq: SeqNumber::new(1),
+            ack: SeqNumber::new(2),
+            flags: TcpFlags::default().with(TcpFlags::SYN).with(TcpFlags::ACK),
+            window: 65535,
+            mss: Some(1460),
+            sack_permitted: true,
+            window_scale: Some(7),
+            sack: SackBlocks::default(),
+        };
+        let mut buf = [0u8; 60];
+        let n = repr.emit(B, A, b"", &mut buf);
+        assert_eq!(n, 20 + 4 + 4 + 4); // 32-byte header
+        let pkt = TcpPacket::new_checked(&buf[..n]).unwrap();
+        assert_eq!(pkt.data_offset(), 32);
+        assert_eq!(pkt.window_scale(), Some(7));
+        assert_eq!(pkt.mss_option(), Some(1460));
+        assert!(pkt.sack_permitted());
+        assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()));
+        // A header with no WScale option parses to None.
+        let plain = seg_with_options(&[]);
+        assert_eq!(TcpPacket::new_checked(&plain).unwrap().window_scale(), None);
     }
 }

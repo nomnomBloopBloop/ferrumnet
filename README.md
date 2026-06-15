@@ -52,8 +52,11 @@ contention dip (median is robust).
   **50% system** / 20% idle; MTU 65535 → 28% user / **17% system** / 55% idle. **System time
   collapses with the larger MTU** — the stack is *syscall-bound* at small MTU (a TUN is one packet
   per `write`; it is not a socket, so `sendmmsg` does not apply, and `writev` only *gathers* into a
-  single packet), and becomes *window-bound* at large MTU (the 64 KiB window caps it at ~1 segment
-  in flight per RTT).
+  single packet). At large MTU the remaining 55% idle is *not* our window: window scaling (RFC 7323)
+  is implemented and lifts our 64 KiB cap, but on this same-host bench the limit is the **receiver's**
+  window (a localhost `curl` advertises ~64 KiB and refills one ~65 KB segment at a time) and the
+  **serial** per-segment processing across the two cores. So scaling doesn't move this number — it's
+  what keeps the pipe full on a real high-latency path; here the next lever is pipelined I/O (io_uring).
 
 **Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB), measured **before and
 after SACK in the same session** — every transfer completes correctly, and **SACK selective
@@ -176,8 +179,9 @@ self-contained extension of an existing component:
 
 - **Delayed ACKs and TCP timestamps (RFC 7323)** — fewer pure-ACK segments, and RTTM-based RTT
   sampling that sidesteps Karn's ambiguity.
-- **Window scaling** — receive windows beyond 64 KiB; without it, a large-MTU path is capped at
-  roughly one segment in flight per RTT (see the match-MTU benchmark).
+- **io_uring backend** — its `READ`/`WRITE` are generic file ops, so (unlike `sendmmsg`) they
+  work on a TUN fd; batching many packet I/Os per `io_uring_enter` cuts the syscall overhead the
+  CPU profile is dominated by. The sans-IO core stays untouched.
 - **Active open (`connect`)** — make it a client as well as a server, which also unlocks a
   two-stack loopback test harness.
 - **A transmit scratch ring** — remove the one heap allocation per emitted segment. A minor lever

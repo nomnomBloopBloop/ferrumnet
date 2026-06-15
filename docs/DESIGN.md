@@ -82,10 +82,10 @@ hashed timer wheel would be the O(1) generalization at thousands of connections,
 unnecessary at this scale.
 
 **Deliberately out of scope** (the demo does not need them): delayed-ACK (we ACK immediately),
-TCP timestamps, window scaling, IP fragmentation/reassembly, and active open (`connect`) — this
-is a server. None are stubbed; the code paths simply don't exist yet. (**SACK**, out-of-order
-**reassembly**, and **RFC 6675** selective recovery were originally out of scope and are now
-implemented — see §5.8.)
+TCP timestamps, IP fragmentation/reassembly, and active open (`connect`) — this is a server. None
+are stubbed; the code paths simply don't exist yet. (**SACK**, out-of-order **reassembly**,
+**RFC 6675** selective recovery, and **window scaling** (RFC 7323) were originally out of scope
+and are now implemented — see §5.8.)
 
 **Async model.** A single-threaded executor and reactor on one thread; shared connection
 state is `Rc<RefCell<ConnectionShared>>` — no hot-path locks (the brief's "mutex on every
@@ -273,6 +273,14 @@ inline). Verified subtleties:
   device → Runtime → Stack → TCB. A larger MTU sends the same data in far fewer packets — the
   practical syscall-reduction lever for a TUN char device, which is one packet per `write`
   (`sendmmsg` needs a socket; `writev` only gathers into one packet).
+
+- **Window scaling (RFC 7323).** Negotiated only if the SYN carried the WScale option (else both
+  scales are 0 and windows stay capped at 65535 — byte-identical to before). `snd_wnd` widened to
+  `u32`; the peer's window field is left-shifted by `snd_wscale`, and our advertised window is
+  right-shifted by `rcv_wscale` into the 16-bit field (the SYN-ACK window itself is never scaled).
+  The send/receive rings are 256 KiB, so a high-bandwidth or large-MTU path can keep many segments
+  in flight instead of ~one per RTT — without it, the 64 KiB window is the limiter at a large MTU
+  (the `vmstat` 55%-idle observation). The SACK scoreboard's run cap rises with the larger window.
 
 ## 6. End-to-end data flow (one `curl` request)
 

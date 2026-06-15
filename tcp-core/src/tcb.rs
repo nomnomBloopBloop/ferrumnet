@@ -39,8 +39,24 @@ const MSS_MAX: u16 = 65_495;
 pub fn mss_for_mtu(mtu: usize) -> u16 {
     (mtu.saturating_sub(40)).clamp(MSS_DEFAULT as usize, MSS_MAX as usize) as u16
 }
-const TX_BUFFER: usize = 65_536;
-const RX_BUFFER: usize = 65_536;
+// Send/receive ring sizes. Beyond the 64 KiB an unscaled window can address: with window
+// scaling negotiated (RFC 7323) we advertise the full buffer, so a high-bandwidth or large-MTU
+// path can keep many segments in flight instead of ~one per RTT. Non-scaling peers still see a
+// window capped at 65535.
+const TX_BUFFER: usize = 262_144; // 256 KiB
+const RX_BUFFER: usize = 262_144; // 256 KiB
+
+/// The smallest window-scale shift that lets `buf` be advertised in the 16-bit window field.
+const fn wscale_for(buf: usize) -> u8 {
+    let mut s = 0u8;
+    while (buf >> s) > 0xFFFF {
+        s += 1;
+    }
+    s
+}
+/// The window scale we advertise (and apply to our own advertised window) once negotiated.
+const RCV_WSCALE: u8 = wscale_for(RX_BUFFER);
+
 /// TIME-WAIT duration (2·MSL). A demo-friendly value; RFC 793 suggests up to ~4 min.
 const TIME_WAIT_MILLIS: u64 = 10_000;
 /// FIN-WAIT-2 bound: a peer that ACKs our FIN but never closes can't leak the connection.
@@ -58,10 +74,16 @@ pub struct Tcb {
     iss: SeqNumber,
     snd_una: SeqNumber,
     snd_nxt: SeqNumber,
-    snd_wnd: u16,
+    snd_wnd: u32, // peer's advertised window, already left-shifted by snd_wscale
     snd_wl1: SeqNumber, // seq of the segment that last updated the send window
     snd_wl2: SeqNumber, // ack of that segment
     snd_mss: u16,
+    /// Window scaling (RFC 7323), negotiated iff the SYN carried the WScale option. `snd_wscale`
+    /// is applied to the peer's advertised windows; `rcv_wscale` (= `RCV_WSCALE` when negotiated)
+    /// is what we advertise and apply to our own window. All inert when `window_scaling` is false.
+    window_scaling: bool,
+    snd_wscale: u8,
+    rcv_wscale: u8,
 
     // Receive sequence space.
     irs: SeqNumber,
@@ -130,6 +152,13 @@ impl Tcb {
         let rcv_nxt = irs + 1; // the peer's SYN consumes one sequence number
         let rcv_wnd = RX_BUFFER.min(0xFFFF) as u16;
         let sack_enabled = syn.sack_permitted(); // negotiated: echo it on the SYN-ACK
+        // Window scaling (RFC 7323) is negotiated only if the SYN carried the option. Then we
+        // apply the peer's scale to its windows and advertise our own; otherwise both scales are
+        // 0 and windows stay capped at 65535 (byte-identical to a non-scaling peer).
+        let (window_scaling, snd_wscale, rcv_wscale) = match syn.window_scale() {
+            Some(peer) => (true, peer, RCV_WSCALE),
+            None => (false, 0, 0),
+        };
         Tcb {
             state: State::SynReceived,
             local,
@@ -137,10 +166,13 @@ impl Tcb {
             iss,
             snd_una: iss,
             snd_nxt: iss, // the SYN-ACK has not been sent yet
-            snd_wnd: syn.window(),
+            snd_wnd: syn.window() as u32, // the SYN's window itself is never scaled (RFC 7323)
             snd_wl1: irs,
             snd_wl2: iss,
             snd_mss,
+            window_scaling,
+            snd_wscale,
+            rcv_wscale,
             irs,
             rcv_nxt,
             rcv_adv: rcv_nxt + rcv_wnd as u32,
@@ -660,7 +692,7 @@ impl Tcb {
             inflight
         };
         let cwnd_room = self.cc.cwnd().saturating_sub(pipe);
-        let rwnd_room = (self.snd_wnd as u32).saturating_sub(inflight);
+        let rwnd_room = self.snd_wnd.saturating_sub(inflight);
         let allowed = cwnd_room.min(rwnd_room);
         if allowed > 0 {
             let n = (allowed as usize).min(unsent_data).min(self.snd_mss as usize);
@@ -779,7 +811,8 @@ impl Tcb {
 
     fn update_window(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16) {
         if self.snd_wl1.lt(seg_seq) || (self.snd_wl1 == seg_seq && self.snd_wl2.le(seg_ack)) {
-            self.snd_wnd = seg_wnd;
+            // Post-handshake windows are scaled (RFC 7323); snd_wscale is 0 unless negotiated.
+            self.snd_wnd = (seg_wnd as u32) << self.snd_wscale;
             self.snd_wl1 = seg_seq;
             self.snd_wl2 = seg_ack;
             if seg_wnd > 0 {
@@ -832,8 +865,21 @@ impl Tcb {
     /// Stamps `needs_ack = false` implicitly handled by callers via [`Tcb::take_needs_ack`].
     fn build(&mut self, seq: SeqNumber, extra_flags: u8, payload: &[u8]) -> Vec<u8> {
         let flags = TcpFlags(extra_flags | TcpFlags::ACK);
-        let window = self.advertised_window();
+        // Encode the advertised window into the 16-bit field. The SYN-ACK's window is never
+        // scaled (RFC 7323); every later segment is right-shifted by rcv_wscale.
+        let window_true = self.advertised_window();
+        let window = if flags.syn() {
+            window_true.min(0xFFFF) as u16
+        } else {
+            (window_true >> self.rcv_wscale).min(0xFFFF) as u16
+        };
         let mss = if flags.syn() { Some(self.mss_advertise) } else { None };
+        // Advertise our window scale on the SYN-ACK iff scaling was negotiated.
+        let window_scale = if flags.syn() && self.window_scaling {
+            Some(self.rcv_wscale)
+        } else {
+            None
+        };
         // Echo SACK-Permitted on the SYN-ACK; report out-of-order runs as SACK blocks on every
         // other ACK while reassembly holds data (never on the SYN-ACK, which carries the MSS
         // option and no data).
@@ -855,6 +901,7 @@ impl Tcb {
             window,
             mss,
             sack_permitted,
+            window_scale,
             sack,
         };
         build_segment(self.local, self.remote, &repr, payload)
@@ -866,9 +913,14 @@ impl Tcb {
     /// `RX_BUFFER − rx.len() − reasm.buffered()` (== `rx.free()` when nothing is buffered OOO,
     /// so non-SACK connections are unaffected). Advertising `rx.free()` alone would promise space
     /// the reassembly buffer has already taken.
-    fn advertised_window(&mut self) -> u16 {
+    /// The true (unscaled) advertised window in bytes, capped to what the scaled 16-bit window
+    /// field can encode so `rcv_adv` stays representable. The caller ([`Tcb::build`]) encodes it
+    /// into the wire field, applying `rcv_wscale` on every segment except the SYN-ACK (whose
+    /// window field is never scaled, RFC 7323).
+    fn advertised_window(&mut self) -> u32 {
         let occupied = self.rx.len() + self.reasm.buffered();
-        let free = RX_BUFFER.saturating_sub(occupied).min(0xFFFF) as u32;
+        let max_window = 0xFFFFusize << self.rcv_wscale;
+        let free = RX_BUFFER.saturating_sub(occupied).min(max_window) as u32;
         let candidate_right = self.rcv_nxt + free;
         let right = if candidate_right.lt(self.rcv_adv) {
             self.rcv_adv
@@ -876,7 +928,7 @@ impl Tcb {
             candidate_right
         };
         self.rcv_adv = right;
-        right.offset_from(self.rcv_nxt).min(0xFFFF) as u16
+        right.offset_from(self.rcv_nxt)
     }
 
     /// The effective right edge for buffering out-of-order data: the lesser of the advertised
@@ -906,6 +958,7 @@ impl Tcb {
             window: 0,
             mss: None,
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         build_segment(self.local, self.remote, &repr, b"")
@@ -931,6 +984,10 @@ impl Tcb {
     #[cfg(test)]
     fn retransmitted_dbg(&self) -> bool {
         self.retransmitted
+    }
+    #[cfg(test)]
+    fn snd_wnd_dbg(&self) -> u32 {
+        self.snd_wnd
     }
 }
 
@@ -987,6 +1044,7 @@ mod tests {
             window,
             mss,
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         build_segment(ep_host(), ep_us(), &repr, payload)
@@ -1003,6 +1061,7 @@ mod tests {
             window,
             mss: Some(1460),
             sack_permitted: true,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
@@ -1023,6 +1082,7 @@ mod tests {
             window,
             mss: None,
             sack_permitted: false,
+            window_scale: None,
             sack,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
@@ -1417,14 +1477,16 @@ mod tests {
     #[test]
     fn ooo_buffer_is_window_bounded() {
         let now = Instant::from_millis(0);
+        // A non-scaled handshake (no WScale): the advertised window is capped at ~64 KiB, so OOO
+        // buffering is bounded by the window, not by the larger ring.
         let (mut tcb, iss, cnxt) = established_sack(now, 400, 64000);
-        // Buffer 60000 bytes out of order (fits the 65536 budget).
         deliver(&mut tcb, now, &inbound(cnxt + 100, iss + 1, TcpFlags::ACK, 64000, None, &vec![9u8; 60000]));
         assert_eq!(tcb.reasm_buffered_dbg(), 60000);
-        // A further out-of-order run beyond the remaining budget is clipped away entirely.
-        deliver(&mut tcb, now, &inbound(cnxt + 60200, iss + 1, TcpFlags::ACK, 64000, None, &vec![8u8; 10000]));
-        assert_eq!(tcb.reasm_buffered_dbg(), 60000, "OOO buffer stays within the receive budget");
-        assert!(tcb.reasm_buffered_dbg() + tcb.rx_available() <= 65536);
+        // A run past the advertised right edge (~rcv_nxt + 65535) is clipped.
+        deliver(&mut tcb, now, &inbound(cnxt + 64000, iss + 1, TcpFlags::ACK, 64000, None, &vec![8u8; 10000]));
+        let buffered = tcb.reasm_buffered_dbg();
+        assert!(buffered <= 65535, "OOO buffer bounded by the unscaled advertised window");
+        assert!(buffered + tcb.rx_available() <= RX_BUFFER);
     }
 
     #[test]
@@ -1598,5 +1660,118 @@ mod tests {
         assert_eq!(mss_for_mtu(576), 536); // small MTU floors at the RFC 9293 default
         assert_eq!(mss_for_mtu(100), 536); // below the floor clamps up
         assert_eq!(mss_for_mtu(70000), 65495); // above the IP-datagram cap clamps down
+    }
+
+    // ── window scaling (RFC 7323) ─────────────────────────────────────────────────────────────
+
+    /// A SYN offering MSS + SACK-Permitted + Window Scale (shift `wscale`).
+    fn inbound_syn_wscale(seq: SeqNumber, window: u16, wscale: u8) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: CPORT,
+            dst_port: 8080,
+            seq,
+            ack: SeqNumber::new(0),
+            flags: TcpFlags(TcpFlags::SYN),
+            window,
+            mss: Some(1460),
+            sack_permitted: true,
+            window_scale: Some(wscale),
+            sack: SackBlocks::default(),
+        };
+        build_segment(ep_host(), ep_us(), &repr, b"")
+    }
+
+    fn frame_window_scale(frame: &[u8]) -> Option<u8> {
+        let ip = Ipv4Packet::new_checked(frame).unwrap();
+        TcpPacket::new_checked(ip.payload()).unwrap().window_scale()
+    }
+
+    /// Bring up an Established connection that negotiated window scaling; the final ACK carries
+    /// `final_wnd_field` (scaled by `wscale` => effective send window).
+    fn established_wscale(now: Instant, client_isn: u32, final_wnd_field: u16, wscale: u8) -> (Tcb, SeqNumber, SeqNumber) {
+        let syn = inbound_syn_wscale(SeqNumber::new(client_isn), 64000, wscale);
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        let synack = tcb.poll_transmit(now).expect("SYN-ACK");
+        assert_eq!(frame_window_scale(&synack), Some(RCV_WSCALE), "SYN-ACK must advertise our scale");
+        let our_iss = parse(&synack).seq;
+        assert!(tcb.poll_transmit(now).is_none());
+        let client_nxt = SeqNumber::new(client_isn) + 1;
+        deliver(&mut tcb, now, &inbound(client_nxt, our_iss + 1, TcpFlags::ACK, final_wnd_field, None, b""));
+        assert_eq!(tcb.state, State::Established);
+        (tcb, our_iss, client_nxt)
+    }
+
+    #[test]
+    fn syn_ack_omits_wscale_when_not_offered() {
+        let now = Instant::from_millis(0);
+        let syn = inbound(SeqNumber::new(5), SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), b"");
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        let synack = tcb.poll_transmit(now).unwrap();
+        assert_eq!(frame_window_scale(&synack), None);
+        // A non-scaling peer's window field is taken literally.
+        let cnxt = SeqNumber::new(6);
+        deliver(&mut tcb, now, &inbound(cnxt, parse(&synack).seq + 1, TcpFlags::ACK, 50000, None, b""));
+        assert_eq!(tcb.snd_wnd_dbg(), 50000, "no scaling: window field is literal");
+    }
+
+    #[test]
+    fn negotiated_scale_is_applied_to_the_send_window() {
+        let now = Instant::from_millis(0);
+        // SYN offers scale 7; the final ACK's window field 1000 means 1000 << 7 = 128000 bytes.
+        let (tcb, _iss, _cnxt) = established_wscale(now, 1300, 1000, 7);
+        assert_eq!(tcb.snd_wnd_dbg(), 1000u32 << 7);
+        assert!(tcb.snd_wnd_dbg() > 65535, "scaled send window exceeds 64 KiB");
+    }
+
+    #[test]
+    fn our_advertised_window_can_exceed_64k_when_scaling() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established_wscale(now, 1400, 1000, 7);
+        // A post-handshake ACK we emit encodes a scaled window; reconstruct it (field << RCV_WSCALE).
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 1000, None, b"hi"));
+        let frames = drain_raw(&mut tcb, now);
+        let ip = Ipv4Packet::new_checked(&frames[0]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let effective = (tcp.window() as u32) << RCV_WSCALE;
+        assert!(effective > 65535, "advertised window reconstructs to > 64 KiB, got {effective}");
+        assert!(effective <= RX_BUFFER as u32);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // pumps ~16 MB through the rings — far too slow under Miri's
+                              // interpreter; the scaling code paths are covered by lighter tests.
+    fn scaled_window_allows_large_inflight() {
+        let now = Instant::from_millis(0);
+        // Scaling negotiated; peer window field 1000 with scale 7 => 128000 (> 64 KiB).
+        let (mut tcb, our_iss, cnxt) = established_wscale(now, 1100, 1000, 7);
+        assert_eq!(tcb.snd_wnd_dbg(), 1000u32 << 7);
+        let mut ack = our_iss + 1;
+        let mut max_burst = 0usize;
+        for _ in 0..80 {
+            tcb.send(&vec![0u8; 200_000]); // keep the send buffer topped up as ACKs free space
+            let frames = drain_raw(&mut tcb, now);
+            if frames.is_empty() {
+                break;
+            }
+            let mut total = 0usize;
+            let mut high = ack;
+            for f in &frames {
+                let p = parse(f);
+                total += p.payload.len();
+                let end = p.seq + p.payload.len() as u32;
+                if end.gt(high) {
+                    high = end;
+                }
+            }
+            max_burst = max_burst.max(total);
+            // Cumulatively ACK everything sent so far (cwnd grows; window stays 128000).
+            ack = high;
+            deliver(&mut tcb, now, &inbound(cnxt, ack, TcpFlags::ACK, 1000, None, b""));
+        }
+        assert!(max_burst > 65536, "scaled window lifts the >64 KiB in-flight cap; got {max_burst}");
     }
 }

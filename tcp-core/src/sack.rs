@@ -16,10 +16,11 @@ use crate::seq::SeqNumber;
 /// RFC 5681 / RFC 6675 duplicate-ACK threshold.
 pub const DUP_THRESH: u32 = 3;
 
-/// Anti-DoS cap on stored runs. A conforming peer (≤64 KiB window, MSS ≥ 536 ⇒ ≤122 segments)
-/// never reaches it; on overflow we drop SACK info so the affected bytes revert to "unsacked",
-/// biasing toward a redundant retransmission and never toward skipping a genuine hole.
-const MAX_RUNS: usize = 64;
+/// Anti-DoS cap on stored runs. Sized above the worst-case hole count for our 256 KiB window at
+/// a typical MSS (≈180 segments ⇒ ≤90 alternating holes); a conforming peer never reaches it. On
+/// overflow we drop SACK info so the affected bytes revert to "unsacked", biasing toward a
+/// redundant retransmission and never toward skipping a genuine hole.
+const MAX_RUNS: usize = 128;
 
 type Run = (SeqNumber, SeqNumber); // half-open [left, right) in sequence space
 

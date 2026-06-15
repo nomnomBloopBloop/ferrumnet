@@ -76,6 +76,7 @@ fn connectionless_reset(local: Endpoint, remote: Endpoint, tcp: &TcpPacket<'_>) 
         window: 0,
         mss: None,
         sack_permitted: false,
+        window_scale: None,
         sack: SackBlocks::default(),
     };
     build_segment(local, remote, &repr, b"")
@@ -221,6 +222,7 @@ mod tests {
             window: 64000,
             mss,
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         build_segment(Endpoint::new(HOST, CLIENT_PORT), us(), &repr, payload)

@@ -224,6 +224,7 @@ mod tests {
             window: 64000,
             mss: if flags & TcpFlags::SYN != 0 { Some(1460) } else { None },
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         build_segment(
@@ -438,6 +439,7 @@ mod tests {
             window: 64000,
             mss: if flags & TcpFlags::SYN != 0 { Some(1460) } else { None },
             sack_permitted: false,
+            window_scale: None,
             sack: SackBlocks::default(),
         };
         build_segment(Endpoint::new(HOST, cport), Endpoint::new(US, 8080), &repr, payload)
