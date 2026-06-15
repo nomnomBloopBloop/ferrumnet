@@ -49,7 +49,7 @@ impl TunDevice {
 }
 
 impl Device for TunDevice {
-    fn poll_readable(&self, timeout_ms: i32) -> std::io::Result<bool> {
+    fn poll_readable(&mut self, timeout_ms: i32) -> std::io::Result<bool> {
         sys::poll_readable(self.as_raw_fd(), timeout_ms)
     }
 

@@ -23,8 +23,10 @@ use std::collections::VecDeque;
 /// `tcp-tun` and by [`MockDevice`] for tests.
 pub trait Device {
     /// Block until readable or `timeout_ms` elapses (`-1` = forever). Returns `true` if a
-    /// packet is ready to read.
-    fn poll_readable(&self, timeout_ms: i32) -> std::io::Result<bool>;
+    /// packet is ready to read. Takes `&mut self` so a backend can flush queued egress and reap
+    /// completions here (the io_uring backend submits its batch in one syscall before waiting);
+    /// the blocking TUN and mock backends ignore the mutability.
+    fn poll_readable(&mut self, timeout_ms: i32) -> std::io::Result<bool>;
     /// Read one IP datagram. `Ok(Some(n))` is a packet of length `n`; `Ok(None)` means nothing
     /// was ready.
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>>;
@@ -59,7 +61,7 @@ impl MockDevice {
 }
 
 impl Device for MockDevice {
-    fn poll_readable(&self, _timeout_ms: i32) -> std::io::Result<bool> {
+    fn poll_readable(&mut self, _timeout_ms: i32) -> std::io::Result<bool> {
         Ok(!self.inbound.is_empty())
     }
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
