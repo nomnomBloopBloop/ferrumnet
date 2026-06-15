@@ -60,6 +60,13 @@ contention dip (median is robust).
   `WRITE` are generic file ops, so (unlike `sendmmsg`, which returns `ENOTSOCK`) they work on a TUN
   fd. It trades single-packet latency for batch throughput (ICMP RTT 0.10 → 0.32 ms), which bulk
   transfer hides; the sans-IO core is untouched.
+- **Two userspace instances, over the wire** (one `connect`s and downloads from the other; the
+  kernel forwards between their two TUNs — *both* peers are this stack, so neither end is a
+  `curl`-sized window): **125 MB/s** at MTU 1500, **300 MB/s** at MTU 65535 (still ~2.4× — match-MTU
+  holds between two fast peers). And the window-scaling result the same-host `curl` bench can't
+  show: with **+20 ms RTT** (`netem`) so the window, not CPU, is the limiter, it sustains **11.2
+  MB/s** — **3.5× the 3.2 MB/s a 64 KiB window allows at 20 ms** (≈224 KiB in flight), which only
+  window scaling (RFC 7323) enables.
 - **Latency:** ICMP RTT (100 packets), blocking backend, min/avg/max/mdev =
   **0.047 / 0.099 / 0.180 / 0.028 ms**.
 - **CPU** under sustained load (`vmstat`, system-wide over 2 vCPU): MTU 1500 → 30% user /
@@ -70,9 +77,10 @@ contention dip (median is robust).
   is implemented and lifts our 64 KiB cap, but on this same-host bench the limit is the **receiver's**
   window (a localhost `curl` advertises ~64 KiB and refills one ~65 KB segment at a time) and the
   **serial** per-segment processing across the two cores. So scaling doesn't move this number — it's
-  what keeps the pipe full on a real high-latency path (the two-stack loopback shows it: with two
-  fast peers we keep >64 KiB in flight). The remaining lever is pipelined I/O — the **io_uring
-  backend above** does exactly that at MTU 1500, where the profile is syscall-bound.
+  what keeps the pipe full on a real high-latency path, which the **two-instance benchmark above
+  measures directly** (11.2 MB/s at +20 ms RTT, 3.5× the 64 KiB cap). The remaining lever is
+  pipelined I/O — the **io_uring backend above** does exactly that at MTU 1500, where the profile is
+  syscall-bound.
 
 **Under packet loss** (live `tc netem` dropping our *outbound* data, 4 MiB), measured **before and
 after SACK in the same session** — every transfer completes correctly, and **SACK selective

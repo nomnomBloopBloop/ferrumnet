@@ -313,7 +313,15 @@ finished code (which caught 5 real bugs across active open and delayed ACKs). Ve
   segments, and PAWS drops `SEG.TSval < TS.Recent` — which cannot false-drop a reordered segment,
   because out-of-order data is sent *later* and so carries a newer timestamp. Timestamps (12 bytes)
   collide with SACK in the 40-byte option area, so the emitter caps SACK at 3 blocks when
-  timestamps are present (`12 + 4 + 8·3 = 40`).
+  timestamps are present (`12 + 4 + 8·3 = 40`). The sender **subtracts its per-segment option bytes
+  from the MSS** when segmenting (`MSS − 12` for timestamps, mirroring what `build` emits): without
+  it a full 1460-byte payload plus a 12-byte timestamp option is a 1512-byte datagram that overruns
+  a 1500 MTU — invisible under same-host local delivery, but dropped by any forwarding hop or
+  smaller-MTU path. (Found by the two-instance-over-TUN benchmark, §8 M12.)
+- **The run() ordering trap.** The blocking reactor processes timers/ingress/tasks/egress *before*
+  it blocks on `poll_readable`. A freshly spawned active-open `connect` must emit its SYN before we
+  wait; otherwise, with no timer armed yet, `poll_at()` is None, the loop blocks forever, and the
+  task is never polled. A pure server is unaffected — it has nothing to emit first.
 - **Delayed ACKs (RFC 1122 §4.2.3.2).** Only a *clean* in-order segment defers its ACK (≤ 40 ms, or
   until a second segment / piggyback): in order, fully accepted, and with nothing buffered
   out-of-order. The **trap the review found:** a segment that fills *part* of a gap, or is dropped
@@ -370,6 +378,7 @@ finished code (which caught 5 real bugs across active open and delayed ACKs). Ve
 | M9 | active open (`connect`) + reactor `TcpConnector` + two-stack userspace loopback | two instances connect and round-trip in userspace; >64 KiB in flight proves window scaling |
 | M10 | io_uring backend (hand-rolled, zero-dependency; batched I/O) | ~1.24× throughput at MTU 1500 (148.6 → 184.3 MB/s, medians of 9) |
 | M11 | RFC 7323 timestamps (Karn-free RTT + PAWS) + delayed ACKs (RFC 1122) | timestamps interoperate with the Linux kernel on the wire; fewer pure-ACK packets |
+| M12 | folded checksum; `tcp-tun` client mode + two-instance-over-TUN benchmark (caught + fixed the run()-ordering and MSS-options bugs) | two userspace stacks: 125→300 MB/s match-MTU; 11.2 MB/s at +20 ms RTT (3.5× the 64 KiB cap) — window scaling on real hardware |
 
 ## 9. Environment
 
