@@ -67,6 +67,10 @@ const CHALLENGE_ACK_LIMIT: u32 = 100; // RFC 5961 per-connection budget per seco
 /// How many times the SYN of an active open (SYN-SENT) is retransmitted before the connect
 /// attempt is abandoned (the connection moves to Closed and the connector observes a timeout).
 const MAX_SYN_RETRIES: u16 = 7;
+/// Delayed-ACK timeout (RFC 1122 §4.2.3.2 requires ≤ 500 ms). A short value keeps the tail of a
+/// burst from stalling while still coalescing ACKs; the every-other-segment rule does most of the
+/// work, so this only bounds the wait for a lone or trailing in-order segment.
+const DELAYED_ACK_MILLIS: u64 = 40;
 
 pub struct Tcb {
     pub state: State,
@@ -119,6 +123,11 @@ pub struct Tcb {
     persist_deadline: Option<Instant>,
     persist_backoff: u64,
     time_wait_deadline: Option<Instant>,
+    /// Delayed ACK (RFC 1122): a lone in-order segment defers its ACK until this deadline (or
+    /// until a second segment / outgoing data piggybacks it). `unacked_segs` counts in-order
+    /// segments since our last emitted ACK, to honour the "ACK every other segment" rule.
+    delayed_ack_deadline: Option<Instant>,
+    unacked_segs: u8,
 
     // FIN bookkeeping.
     fin_queued: bool, // the application asked to close
@@ -215,6 +224,8 @@ impl Tcb {
             persist_deadline: None,
             persist_backoff: PERSIST_MIN_MILLIS,
             time_wait_deadline: None,
+            delayed_ack_deadline: None,
+            unacked_segs: 0,
             fin_queued: false,
             fin_seq: None,
             fin_acked: false,
@@ -278,6 +289,8 @@ impl Tcb {
             persist_deadline: None,
             persist_backoff: PERSIST_MIN_MILLIS,
             time_wait_deadline: None,
+            delayed_ack_deadline: None,
+            unacked_segs: 0,
             fin_queued: false,
             fin_seq: None,
             fin_acked: false,
@@ -519,10 +532,15 @@ impl Tcb {
             } else {
                 (seg_seq, payload)
             };
+            let mut in_order = false;
+            let mut no_room = false;
+            let reasm_before = self.reasm.buffered();
             if !data.is_empty() {
                 if data_seq == self.rcv_nxt {
+                    in_order = true;
                     let n = self.rx.write(data);
                     self.rcv_nxt += n as u32;
+                    no_room = n < data.len(); // part of the segment dropped for lack of rx space
                     if self.sack_enabled {
                         // The in-order write may have overtaken buffered runs: purge/clip those
                         // now below RCV.NXT, then drain any run it made contiguous.
@@ -548,8 +566,25 @@ impl Tcb {
                     self.reasm.insert(self.rcv_nxt, edge, data_seq, data);
                 }
             }
-            // In-order or not (gap / no room), the peer is owed an ACK of our RCV.NXT.
-            self.needs_ack = true;
+            // ACK scheduling (RFC 1122 §4.2.3.2). Only a *clean* in-order segment may defer its ACK
+            // (coalesced with the next, or piggybacked on outgoing data): in order, fully accepted,
+            // and with no out-of-order data buffered before it — i.e. no reassembly/recovery in
+            // progress. Everything else ACKs immediately: out-of-order data and any in-order
+            // segment that filled all or part of a gap (RFC 5681 §4.2 — keep the sender's SACK
+            // scoreboard current), a no-room/duplicate segment (signal the shrunk window / drive
+            // the dup-ACK), and every second clean segment.
+            let clean_in_order = in_order && !no_room && reasm_before == 0;
+            if clean_in_order {
+                self.unacked_segs = self.unacked_segs.saturating_add(1);
+                if self.unacked_segs >= 2 {
+                    self.needs_ack = true;
+                    self.unacked_segs = 0;
+                } else {
+                    self.arm_delayed_ack(now);
+                }
+            } else {
+                self.needs_ack = true;
+            }
         }
 
         // (7) Peer FIN. Its sequence slot is `seg_seq + payload.len()`. In order -> consume it;
@@ -1010,7 +1045,7 @@ impl Tcb {
 
     /// The earliest armed deadline (the backend sleeps until then).
     pub fn poll_at(&self) -> Option<Instant> {
-        [self.rtx_deadline, self.persist_deadline, self.time_wait_deadline]
+        [self.rtx_deadline, self.persist_deadline, self.time_wait_deadline, self.delayed_ack_deadline]
             .into_iter()
             .flatten()
             .min()
@@ -1059,6 +1094,13 @@ impl Tcb {
         if let Some(d) = self.time_wait_deadline {
             if now >= d {
                 self.state = State::Closed;
+            }
+        }
+        if let Some(d) = self.delayed_ack_deadline {
+            if now >= d {
+                // The deferred ACK timed out: owe it now (poll_transmit emits it and clears state).
+                self.needs_ack = true;
+                self.delayed_ack_deadline = None;
             }
         }
     }
@@ -1136,6 +1178,12 @@ impl Tcb {
         }
     }
 
+    fn arm_delayed_ack(&mut self, now: Instant) {
+        if self.delayed_ack_deadline.is_none() {
+            self.delayed_ack_deadline = Some(now.plus_millis(DELAYED_ACK_MILLIS));
+        }
+    }
+
     fn arm_time_wait(&mut self, now: Instant) {
         self.time_wait_deadline = Some(now.plus_millis(TIME_WAIT_MILLIS));
         self.rtx_deadline = None;
@@ -1145,6 +1193,10 @@ impl Tcb {
     /// Build a segment carrying ACK (+ any `extra_flags`) and the current advertised window.
     /// Stamps `needs_ack = false` implicitly handled by callers via [`Tcb::take_needs_ack`].
     fn build(&mut self, seq: SeqNumber, extra_flags: u8, payload: &[u8]) -> Vec<u8> {
+        // Any segment we emit carries the cumulative ACK (RCV.NXT), so it satisfies a pending
+        // delayed ACK — clear it so the delayed-ACK timer does not later fire a redundant one.
+        self.delayed_ack_deadline = None;
+        self.unacked_segs = 0;
         let flags = TcpFlags(extra_flags | TcpFlags::ACK);
         // Encode the advertised window into the 16-bit field. The SYN-ACK's window is never
         // scaled (RFC 7323); every later segment is right-shifted by rcv_wscale.
@@ -2068,7 +2120,10 @@ mod tests {
         let (mut tcb, iss, cnxt) = established_wscale(now, 1400, 1000, 7);
         // A post-handshake ACK we emit encodes a scaled window; reconstruct it (field << RCV_WSCALE).
         deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 1000, None, b"hi"));
-        let frames = drain_raw(&mut tcb, now);
+        // The lone in-order segment defers its ACK; fire the delayed-ACK timer to emit it.
+        let later = now.plus_millis(50);
+        tcb.on_timer(later);
+        let frames = drain_raw(&mut tcb, later);
         let ip = Ipv4Packet::new_checked(&frames[0]).unwrap();
         let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
         let effective = (tcp.window() as u32) << RCV_WSCALE;
@@ -2511,5 +2566,76 @@ mod tests {
         deliver(&mut tcb, now, &inbound_ts(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, 5002, 5001, b"new"));
         assert_eq!(tcb.rx_available(), 3, "a fresh-timestamp segment is accepted");
         assert_eq!(tcb.ts_recent_dbg(), 5002, "TS.Recent advanced");
+    }
+
+    // ── delayed ACKs (RFC 1122 §4.2.3.2) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn delayed_ack_defers_a_lone_segment_until_the_timer() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 21000, 64000);
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"a"));
+        assert!(drain(&mut tcb, now).is_empty(), "a lone in-order segment's ACK is delayed");
+        let deadline = tcb.poll_at().expect("the delayed-ACK timer is armed");
+        let later = deadline.plus_millis(1);
+        tcb.on_timer(later);
+        let out = drain(&mut tcb, later);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags.ack() && out[0].payload.is_empty());
+        assert_eq!(out[0].ack, cnxt + 1, "the timed-out ACK covers the received byte");
+    }
+
+    #[test]
+    fn delayed_ack_fires_immediately_on_the_second_segment() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 22000, 64000);
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"a"));
+        assert!(drain(&mut tcb, now).is_empty(), "first segment delayed");
+        deliver(&mut tcb, now, &inbound(cnxt + 1, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"b"));
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1, "the second in-order segment forces an immediate ACK");
+        assert_eq!(out[0].ack, cnxt + 2);
+    }
+
+    #[test]
+    fn delayed_ack_piggybacks_on_outgoing_data() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 23000, 64000);
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"a"));
+        tcb.send(b"reply"); // a response is queued: its segment carries the ACK
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1, "just the data segment — no separate ACK");
+        assert_eq!(out[0].payload, b"reply");
+        assert_eq!(out[0].ack, cnxt + 1, "the data piggybacks the deferred ACK");
+    }
+
+    #[test]
+    fn out_of_order_segment_acks_immediately() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established_sack(now, 24000, 64000);
+        // A gap below it: out-of-order data must ACK at once so the dup-ACK drives fast retransmit.
+        deliver(&mut tcb, now, &inbound(cnxt + 100, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, &[7u8; 50]));
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1, "out-of-order data is ACKed immediately, not delayed");
+        assert_eq!(out[0].ack, cnxt, "a dup-ACK at the gap");
+    }
+
+    #[test]
+    fn partial_gap_fill_acks_immediately() {
+        // Regression (review finding): an in-order segment that advances RCV.NXT but leaves a SACK
+        // hole still open must ACK at once (RFC 5681 §4.2), not defer — the sender needs the fresh
+        // cumulative ACK + remaining SACK block to keep recovering, not a 40 ms-delayed one.
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established_sack(now, 25000, 64000);
+        // Out-of-order run [cnxt+100, cnxt+200): a gap [cnxt, cnxt+100) sits below it.
+        deliver(&mut tcb, now, &inbound(cnxt + 100, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, &[7u8; 100]));
+        drain(&mut tcb, now); // the immediate dup-ACK for the out-of-order data
+        // Fill only PART of the gap: [cnxt, cnxt+50). The hole [cnxt+50, cnxt+100) and the buffered
+        // run both remain, so reassembly is still in progress — the ACK must not be delayed.
+        deliver(&mut tcb, now, &inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, &[5u8; 50]));
+        let frames = drain_raw(&mut tcb, now);
+        assert_eq!(frames.len(), 1, "a partial gap fill ACKs immediately, not delayed");
+        assert_eq!(parse(&frames[0]).ack, cnxt + 50, "cumulative ACK advanced over the filled part");
+        assert_eq!(parse_sack(&frames[0]).1, vec![((cnxt + 100).raw(), (cnxt + 200).raw())], "still reports the open hole");
     }
 }

@@ -317,11 +317,18 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(stack.connection_count(), 1);
 
+        // A lone in-order segment defers its ACK (delayed ACK), so nothing is emitted yet.
         let out = feed(
             &mut stack,
             now,
             &inbound(SeqNumber::new(1001), our_iss + 1, TcpFlags::ACK | TcpFlags::PSH, None, b"hello"),
         );
+        assert!(out.is_empty(), "the ACK of a lone segment is delayed");
+        // The delayed-ACK timer fires and the cumulative ACK of RCV.NXT goes out.
+        let later = now.plus_millis(50);
+        stack.on_timer(later);
+        let mut out = Vec::new();
+        stack.poll_transmit(later, &mut out);
         assert_eq!(out.len(), 1);
         with_tcp(&out[0], |t| {
             assert!(t.flags().ack());
