@@ -142,6 +142,12 @@ impl<D: Device> Runtime<D> {
         let start = std::time::Instant::now();
         let now = || Instant::from_micros(start.elapsed().as_micros() as u64);
         loop {
+            // Process timers, ingress, tasks, and egress FIRST, then wait. A freshly spawned task
+            // — e.g. an active-open `connect` — must emit its SYN before we block; otherwise, with
+            // no timer armed yet, `poll_at()` is None, we would block forever on `poll_readable`,
+            // and the task would never be polled. (A pure server has nothing to emit first, so it
+            // simply blocks waiting for the peer, exactly as before.)
+            self.turn(now())?;
             let timeout_ms: i32 = match self.poll_at() {
                 None => -1,
                 Some(deadline) => {
@@ -150,7 +156,6 @@ impl<D: Device> Runtime<D> {
                 }
             };
             self.device.poll_readable(timeout_ms)?;
-            self.turn(now())?;
         }
     }
 

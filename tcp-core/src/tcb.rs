@@ -919,6 +919,8 @@ impl Tcb {
         let sent_data = (inflight as usize).min(self.tx.len());
         let unsent_data = self.tx.len() - sent_data;
         let data_end = self.snd_una + self.tx.len() as u32;
+        // The MSS minus our per-segment TCP options, so the datagram never exceeds the path MTU.
+        let max_payload = self.max_segment_payload();
 
         // 0. A pending retransmission of the oldest unacked segment takes priority. Critically,
         //    we resend from SND.UNA WITHOUT rewinding SND.NXT: the receiver buffers out-of-order
@@ -928,7 +930,7 @@ impl Tcb {
         //    go-back-N path used on RTO and (without SACK) on fast retransmit.
         if self.retransmit && inflight > 0 {
             self.retransmit = false;
-            let n = (inflight as usize).min(self.tx.len()).min(self.snd_mss as usize);
+            let n = (inflight as usize).min(self.tx.len()).min(max_payload);
             if n > 0 {
                 let mut payload = vec![0u8; n];
                 self.tx.peek(0, &mut payload);
@@ -964,7 +966,7 @@ impl Tcb {
                     let off = seq.offset_from(self.snd_una) as usize;
                     let hole = self.scoreboard.unsacked_run_len(seq, self.snd_nxt) as usize;
                     let avail = self.tx.len().saturating_sub(off);
-                    let n = hole.min(self.snd_mss as usize).min(avail);
+                    let n = hole.min(max_payload).min(avail);
                     if n > 0 {
                         let mut payload = vec![0u8; n];
                         self.tx.peek(off, &mut payload);
@@ -997,7 +999,7 @@ impl Tcb {
         let rwnd_room = self.snd_wnd.saturating_sub(inflight);
         let allowed = cwnd_room.min(rwnd_room);
         if allowed > 0 {
-            let n = (allowed as usize).min(unsent_data).min(self.snd_mss as usize);
+            let n = (allowed as usize).min(unsent_data).min(max_payload);
             if n > 0 {
                 let mut payload = vec![0u8; n];
                 self.tx.peek(sent_data, &mut payload);
@@ -1285,6 +1287,31 @@ impl Tcb {
     /// RFC 6675 `IsLost` for the sender's current SMSS — the predicate gating recovery entry.
     fn is_lost(&self, seq: SeqNumber) -> bool {
         self.scoreboard.is_lost(seq, self.snd_mss as u32)
+    }
+
+    /// The largest data payload a single segment may carry. SND.MSS is the peer's advertised MSS
+    /// (its MTU − 40), but our segment *also* carries TCP options — Timestamps (12 bytes) once
+    /// negotiated, and SACK blocks while we hold out-of-order data — which RFC 9293 requires the
+    /// sender to subtract from the MSS. Otherwise `20 (IP) + 20 (TCP) + options + payload` exceeds
+    /// the MTU the MSS was derived from, and any forwarding hop or smaller-MTU path drops the
+    /// oversized segment (it merely *looks* fine under same-host local delivery, which ignores the
+    /// egress MTU). The option byte count here mirrors exactly what [`Tcb::build`] emits.
+    fn max_segment_payload(&self) -> usize {
+        let mut opt = 0;
+        if self.ts_enabled {
+            opt += 12; // NOP,NOP,kind8,len10 + TSval(4) + TSecr(4)
+        }
+        if self.sack_enabled && !self.reasm.is_empty() {
+            let mut blocks = [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS];
+            let mut n = self.reasm.report(&mut blocks);
+            if self.ts_enabled {
+                n = n.min(3); // the same cap build() applies when timestamps share the option area
+            }
+            if n > 0 {
+                opt += 4 + 8 * n;
+            }
+        }
+        (self.snd_mss as usize).saturating_sub(opt)
     }
 
     /// Build our active-open SYN: a pure SYN (no ACK — we have acknowledged nothing yet) offering
@@ -2549,6 +2576,19 @@ mod tests {
         let now2 = Instant::from_micros(now1.micros() + 3_000_000);
         deliver(&mut tcb, now2, &inbound_ts(cnxt, iss + 1 + 4, TcpFlags::ACK, 64000, 7000, retx_tsval, b""));
         assert!(tcb.rto_dbg() > 2_000_000, "the retransmit's 3 s RTT was measured despite Karn");
+    }
+
+    #[test]
+    fn segment_payload_leaves_room_for_the_timestamp_option() {
+        // Regression: with timestamps negotiated, a full segment carries MSS − 12 bytes of payload
+        // so the datagram (20 IP + 20 TCP + 12 TS + payload) fits the MTU the MSS was derived from
+        // — otherwise a forwarding hop / smaller-MTU path drops the oversized 1512-byte segment.
+        let now = Instant::from_micros(1_000_000);
+        let (mut tcb, _iss, _cnxt) = established_ts(now, 30000, 64000, 5000);
+        assert_eq!(tcb.send(&vec![0xab; 5000]), 5000);
+        let frames = drain_raw(&mut tcb, now);
+        assert_eq!(parse(&frames[0]).payload.len(), 1460 - 12, "payload leaves room for the TS option");
+        assert_eq!(frames[0].len(), 1500, "the full datagram is exactly the MTU (20 + 32 + 1448)");
     }
 
     #[test]
