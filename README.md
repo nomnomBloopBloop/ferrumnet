@@ -64,10 +64,11 @@ high-loss tail far faster than the previous go-back-N single-segment repair:
 (MB/s; ~4–5× faster across the tail. Loss is stochastic, so these are small-sample figures.)
 
 **Kernel baseline** (Python `http.server` over `lo`, 16 MiB, 5 runs): ~420–640 MB/s. *Not*
-apples-to-apples — `lo`'s MTU is 65536 vs our 1500, and the kernel's loopback is fully in-kernel
-(no per-packet syscall or user/kernel copy), so it is structurally faster on this path. A
-userspace-over-TUN stack can close most of the gap (match the MTU, drop the per-segment
-allocation, batch syscalls) but won't beat in-kernel loopback here.
+apples-to-apples — `lo`'s MTU is 65536 vs our default 1500, and the kernel's loopback is fully
+in-kernel (no per-packet syscall or user/kernel copy), so it is structurally faster on this path.
+Matching the MTU closes much of the gap (done — ~2.3× here); dropping the per-segment allocation
+would tighten the hot loop a little more. It won't beat in-kernel loopback, which has neither a
+per-packet syscall nor a user/kernel copy.
 
 ## Architecture
 
