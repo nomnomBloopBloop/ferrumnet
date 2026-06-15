@@ -36,6 +36,7 @@ pub mod tcb;
 pub mod time;
 pub mod wire;
 
+pub use congestion::CcKind;
 pub use iface::{Endpoint, Stack};
 pub use runtime::{
     Connect, Device, MockDevice, Runtime, Spawner, TcpConnector, TcpListener, TcpStream,

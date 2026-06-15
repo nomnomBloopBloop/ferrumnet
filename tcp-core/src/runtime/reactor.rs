@@ -7,6 +7,7 @@ use std::future::Future;
 use std::rc::Rc;
 use std::task::Waker;
 
+use crate::congestion::CcKind;
 use crate::iface::{Endpoint, Stack};
 use crate::state::State;
 use crate::time::Instant;
@@ -82,6 +83,13 @@ impl<D: Device> Runtime<D> {
 
     pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
         self.exec.spawner().spawn(fut);
+    }
+
+    /// Select the congestion controller for connections opened from now on (default Reno). Call
+    /// before the runtime starts handling connections — e.g. from `FERRUM_CC` at startup; existing
+    /// connections keep the controller they were born with.
+    pub fn set_congestion_control(&self, kind: CcKind) {
+        self.state.borrow_mut().stack.set_cc_kind(kind);
     }
 
     /// The earliest timer deadline across all connections.

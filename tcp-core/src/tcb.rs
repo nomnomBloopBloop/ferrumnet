@@ -21,7 +21,7 @@
 //! [`CongestionControl`] trait, threading `now` so a time-based controller can read the clock.
 
 use crate::buffers::RingBuffer;
-use crate::congestion::{Cc, CongestionControl};
+use crate::congestion::{Cc, CcKind, CongestionControl};
 use crate::iface::{build_segment, Endpoint};
 use crate::reasm::Reasm;
 use crate::rtt::RttEstimator;
@@ -113,6 +113,8 @@ pub struct Tcb {
 
     rtt: RttEstimator,
     cc: Cc,
+    /// Which controller `cc` is, so it can be rebuilt for the same kind when the MSS is learned.
+    cc_kind: CcKind,
     /// (sent_at, seq_end) of the segment currently being timed for RTT, if any.
     rtt_sample: Option<(Instant, SeqNumber)>,
     /// The outstanding window has been retransmitted; suppress RTT sampling (Karn).
@@ -218,7 +220,8 @@ impl Tcb {
             tx: RingBuffer::with_capacity(TX_BUFFER),
             rx: RingBuffer::with_capacity(RX_BUFFER),
             rtt: RttEstimator::new(),
-            cc: Cc::reno(snd_mss),
+            cc: Cc::new(CcKind::Reno, snd_mss),
+            cc_kind: CcKind::Reno,
             rtt_sample: None,
             retransmitted: false,
             retransmit: false,
@@ -283,7 +286,8 @@ impl Tcb {
             tx: RingBuffer::with_capacity(TX_BUFFER),
             rx: RingBuffer::with_capacity(RX_BUFFER),
             rtt: RttEstimator::new(),
-            cc: Cc::reno(MSS_DEFAULT),
+            cc: Cc::new(CcKind::Reno, MSS_DEFAULT),
+            cc_kind: CcKind::Reno,
             rtt_sample: None,
             retransmitted: false,
             retransmit: false,
@@ -309,6 +313,17 @@ impl Tcb {
             scoreboard: Scoreboard::new(),
             pending_fin: None,
             mss_advertise,
+        }
+    }
+
+    /// Select the congestion controller for this connection. The [`crate::iface::Stack`] calls this
+    /// right after construction — before any data flows — so rebuilding `cc` at the current MSS is
+    /// lossless (the window is still its initial value). A no-op when the kind is unchanged, so the
+    /// default Reno path is byte-identical to never calling it.
+    pub fn set_congestion_control(&mut self, kind: CcKind) {
+        if kind != self.cc_kind {
+            self.cc_kind = kind;
+            self.cc = Cc::new(kind, self.snd_mss);
         }
     }
 
@@ -667,8 +682,9 @@ impl Tcb {
             // offered all three on our SYN, so each is enabled iff the peer also offers it.
             self.snd_mss = tcp.mss_option().unwrap_or(MSS_DEFAULT).min(self.mss_advertise);
             // No data has been sent yet, so re-sizing the congestion window to the negotiated MSS
-            // (giving the correct RFC 6928 initial window) loses no state.
-            self.cc = Cc::reno(self.snd_mss);
+            // (giving the correct RFC 6928 initial window) loses no state. Rebuild the same kind
+            // the connection was assigned (Reno by default, or whatever the backend selected).
+            self.cc = Cc::new(self.cc_kind, self.snd_mss);
             self.sack_enabled = tcp.sack_permitted();
             match tcp.window_scale() {
                 Some(peer) => {
@@ -1368,6 +1384,10 @@ impl Tcb {
     #[cfg(test)]
     fn cwnd_dbg(&self) -> u32 {
         self.cc.cwnd()
+    }
+    #[cfg(test)]
+    pub(crate) fn cc_kind_dbg(&self) -> CcKind {
+        self.cc_kind
     }
     #[cfg(test)]
     fn reasm_buffered_dbg(&self) -> usize {
@@ -2679,5 +2699,35 @@ mod tests {
         assert_eq!(frames.len(), 1, "a partial gap fill ACKs immediately, not delayed");
         assert_eq!(parse(&frames[0]).ack, cnxt + 50, "cumulative ACK advanced over the filled part");
         assert_eq!(parse_sack(&frames[0]).1, vec![((cnxt + 100).raw(), (cnxt + 200).raw())], "still reports the open hole");
+    }
+
+    // ── pluggable congestion control (CUBIC selected at birth) ──────────────────────────────────
+
+    #[test]
+    fn cubic_connection_handshakes_and_sends() {
+        let now = Instant::from_millis(0);
+        // Passive open, with CUBIC selected before the handshake completes — exactly how the Stack
+        // stamps a connection at birth.
+        let syn = inbound(SeqNumber::new(40000), SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), b"");
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        tcb.set_congestion_control(CcKind::Cubic);
+        assert_eq!(tcb.cc_kind_dbg(), CcKind::Cubic);
+
+        let out = drain(&mut tcb, now);
+        let our_iss = out[0].seq;
+        let client_nxt = SeqNumber::new(40000) + 1;
+        deliver(&mut tcb, now, &inbound(client_nxt, our_iss + 1, TcpFlags::ACK, 64000, None, b""));
+        assert_eq!(tcb.state, State::Established);
+
+        // Before any loss CUBIC is in slow start at the RFC 6928 initial window (== Reno), so the
+        // first burst is exactly 10 * 1460 = 14600 bytes — the send path drives the enum correctly.
+        let data = vec![0u8; 30000];
+        assert_eq!(tcb.send(&data), 30000);
+        let out = drain(&mut tcb, now);
+        let sent: usize = out.iter().map(|o| o.payload.len()).sum();
+        assert_eq!(sent, 14600, "CUBIC initial window matches RFC 6928");
+        assert_eq!(tcb.cwnd_dbg(), 14600);
     }
 }

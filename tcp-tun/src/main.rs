@@ -28,7 +28,7 @@ fn main() -> std::io::Result<()> {
     use std::net::Ipv4Addr;
 
     use iou::IoUringTun;
-    use tcp_core::Endpoint;
+    use tcp_core::{CcKind, Endpoint};
     use tun::TunDevice;
 
     let args: Vec<String> = std::env::args().collect();
@@ -46,6 +46,16 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(Ipv4Addr::new(10, 0, 0, 2));
+    // Congestion controller: `FERRUM_CC=cubic` runs CUBIC (RFC 8312); anything else (default) is
+    // Reno. This is the swappable knob for the Reno-vs-CUBIC throughput comparison.
+    let cc_kind = match std::env::var("FERRUM_CC").as_deref() {
+        Ok("cubic") => CcKind::Cubic,
+        _ => CcKind::Reno,
+    };
+    let cc_name = match cc_kind {
+        CcKind::Reno => "reno",
+        CcKind::Cubic => "cubic",
+    };
 
     // `tcp-tun <dev> connect <server-ip> [path]` is the download client; otherwise serve.
     let (mode, local) = if args.get(2).map(|s| s == "connect").unwrap_or(false) {
@@ -69,15 +79,15 @@ fn main() -> std::io::Result<()> {
     if want_uring {
         match IoUringTun::open(&dev_name, mtu) {
             Ok(dev) => {
-                eprintln!("tcp-tun: {} up (MTU {mtu}, {backend}, IP {local_ip})", dev.name());
-                return run(dev, mode, local, secret);
+                eprintln!("tcp-tun: {} up (MTU {mtu}, {backend}, IP {local_ip}, cc {cc_name})", dev.name());
+                return run(dev, mode, local, secret, cc_kind);
             }
             Err(e) => eprintln!("tcp-tun: io_uring unavailable ({e}); using blocking I/O."),
         }
     }
     let dev = TunDevice::open(&dev_name, mtu)?;
-    eprintln!("tcp-tun: {} up (MTU {mtu}, blocking, IP {local_ip})", dev.name());
-    run(dev, mode, local, secret)
+    eprintln!("tcp-tun: {} up (MTU {mtu}, blocking, IP {local_ip}, cc {cc_name})", dev.name());
+    run(dev, mode, local, secret, cc_kind)
 }
 
 /// Dispatch to the server or client event loop over `dev` (generic so both I/O backends share it).
@@ -87,10 +97,11 @@ fn run<D: tcp_core::Device>(
     mode: Mode,
     local: tcp_core::Endpoint,
     secret: [u8; 16],
+    cc_kind: tcp_core::CcKind,
 ) -> std::io::Result<()> {
     match mode {
-        Mode::Server => run_server(dev, local, secret),
-        Mode::Client { server, path } => run_client(dev, local, secret, server, path),
+        Mode::Server => run_server(dev, local, secret, cc_kind),
+        Mode::Client { server, path } => run_client(dev, local, secret, server, path, cc_kind),
     }
 }
 
@@ -100,11 +111,13 @@ fn run_server<D: tcp_core::Device>(
     dev: D,
     local: tcp_core::Endpoint,
     secret: [u8; 16],
+    cc_kind: tcp_core::CcKind,
 ) -> std::io::Result<()> {
     use tcp_core::Runtime;
 
     eprintln!("tcp-tun: serving HTTP on {local:?}");
     let mut rt = Runtime::new(dev, local, secret);
+    rt.set_congestion_control(cc_kind);
     let listener = rt.listener();
     let spawner = rt.spawner();
     rt.spawn(async move {
@@ -125,10 +138,12 @@ fn run_client<D: tcp_core::Device>(
     secret: [u8; 16],
     server: tcp_core::Endpoint,
     path: String,
+    cc_kind: tcp_core::CcKind,
 ) -> std::io::Result<()> {
     use tcp_core::Runtime;
 
     let mut rt = Runtime::new(dev, local, secret);
+    rt.set_congestion_control(cc_kind);
     let connector = rt.connector();
     rt.spawn(async move {
         let stream = match connector.connect(server).await {

@@ -10,6 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 
+use crate::congestion::CcKind;
 use crate::isn::IsnGenerator;
 use crate::seq::SeqNumber;
 use crate::state::State;
@@ -101,6 +102,8 @@ pub struct Stack {
     mss_advertise: u16,
     /// Next ephemeral local port to try for an active open (wraps within the dynamic range).
     ephemeral_next: u16,
+    /// The congestion controller stamped on every new connection (default Reno).
+    cc_kind: CcKind,
 }
 
 impl Stack {
@@ -115,11 +118,18 @@ impl Stack {
             pending: VecDeque::new(),
             mss_advertise,
             ephemeral_next: EPHEMERAL_MIN,
+            cc_kind: CcKind::default(),
         }
     }
 
     pub fn local(&self) -> Endpoint {
         self.local
+    }
+
+    /// Select the congestion controller for connections opened after this call. Existing
+    /// connections keep the controller they were born with; the default is Reno.
+    pub fn set_cc_kind(&mut self, kind: CcKind) {
+        self.cc_kind = kind;
     }
 
     /// Begin an active open to `remote`: pick an ephemeral local port, install a SYN-SENT TCB
@@ -135,7 +145,8 @@ impl Stack {
         let iss = self
             .isn
             .generate(local.ip, local_port, remote.ip, remote.port, now.micros());
-        let tcb = Tcb::new_syn_sent(local, remote, iss, now, self.mss_advertise);
+        let mut tcb = Tcb::new_syn_sent(local, remote, iss, now, self.mss_advertise);
+        tcb.set_congestion_control(self.cc_kind);
         self.conns.insert(remote, tcb);
         remote
     }
@@ -212,7 +223,8 @@ impl Stack {
                 remote.port,
                 now.micros(),
             );
-            let tcb = Tcb::new_syn_received(self.local, remote, &tcp, iss, now, self.mss_advertise);
+            let mut tcb = Tcb::new_syn_received(self.local, remote, &tcp, iss, now, self.mss_advertise);
+            tcb.set_congestion_control(self.cc_kind);
             self.conns.insert(remote, tcb);
         } else if !tcp.flags().rst() {
             // Segment to a non-existent connection (and not itself a RST): reset it.
@@ -429,5 +441,18 @@ mod tests {
         stack.poll_transmit(now, &mut out);
         assert!(out.is_empty(), "no reset for an ephemeral port with no connection");
         assert_eq!(stack.connection_count(), 0);
+    }
+
+    #[test]
+    fn set_cc_kind_stamps_new_connections() {
+        let mut stack = Stack::new(us(), [13; 16], 1460);
+        stack.set_cc_kind(CcKind::Cubic);
+        let now = Instant::from_millis(0);
+        // A passive open after selecting CUBIC: the new connection must run CUBIC, not the default.
+        feed(&mut stack, now, &inbound(SeqNumber::new(7000), SeqNumber::new(0), TcpFlags::SYN, Some(1460), b""));
+        let tcb = stack
+            .connection_mut(&Endpoint::new(HOST, CLIENT_PORT))
+            .expect("passive open installed a connection");
+        assert_eq!(tcb.cc_kind_dbg(), CcKind::Cubic);
     }
 }
