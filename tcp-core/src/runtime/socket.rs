@@ -52,7 +52,7 @@ impl Future for Accept {
             let usable = s
                 .stack
                 .connection_mut(&remote)
-                .map_or(false, |t| t.is_synchronized() || t.rx_available() > 0);
+                .is_some_and(|t| t.is_synchronized() || t.rx_available() > 0);
             if usable {
                 return Poll::Ready(TcpStream {
                     state: self.state.clone(),

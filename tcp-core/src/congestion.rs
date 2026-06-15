@@ -93,6 +93,18 @@ impl Reno {
         }
     }
 
+    /// Enter fast recovery directly (used when RFC 6675 `IsLost` declares loss from SACK
+    /// information *before* the third duplicate ACK). Applies the same FlightSize-based window
+    /// reduction as the `dup_acks == 3` branch of [`Reno::on_dup_ack`] — `cwnd = ssthresh =
+    /// max(FlightSize/2, 2·MSS)` — and resets the dup-ACK counter so the internal threshold does
+    /// not fire a second halving. Idempotent given the caller's "not already in recovery" guard.
+    pub fn enter_recovery(&mut self, flight_size: u32) {
+        self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.cwnd = self.ssthresh;
+        self.ca_acc = 0;
+        self.dup_acks = 0;
+    }
+
     /// The retransmission timer fired — a much stronger loss signal than dup-ACKs. Collapse to
     /// one segment and restart slow start (Reno and Reno agree here).
     pub fn on_rto(&mut self, flight_size: u32) {
@@ -170,6 +182,18 @@ mod tests {
         assert!(t.on_dup_ack(5000));
         assert!(!t.on_dup_ack(5000)); // 4th and beyond do not re-trigger
         assert!(!t.on_dup_ack(5000));
+    }
+
+    #[test]
+    fn enter_recovery_halves_from_flight_size() {
+        let mut t = Reno::new(1000);
+        for _ in 0..20 {
+            t.on_ack(1000); // grow cwnd well past any plausible flight size
+        }
+        assert!(t.cwnd() > 14600);
+        t.enter_recovery(8000); // halve from FlightSize, not cwnd
+        assert_eq!(t.ssthresh(), 4000);
+        assert_eq!(t.cwnd(), 4000); // fast recovery: cwnd = ssthresh (not 1 MSS)
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::seq::SeqNumber;
 use crate::state::State;
 use crate::tcb::Tcb;
 use crate::time::Instant;
-use crate::wire::{checksum, Ipv4Packet, Ipv4Repr, TcpFlags, TcpPacket, TcpRepr, IPPROTO_TCP};
+use crate::wire::{checksum, Ipv4Packet, Ipv4Repr, SackBlocks, TcpFlags, TcpPacket, TcpRepr, IPPROTO_TCP};
 
 /// An IPv4 address + TCP port. The connection table is keyed by the *remote* endpoint.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -75,6 +75,8 @@ fn connectionless_reset(local: Endpoint, remote: Endpoint, tcp: &TcpPacket<'_>) 
         flags,
         window: 0,
         mss: None,
+        sack_permitted: false,
+        sack: SackBlocks::default(),
     };
     build_segment(local, remote, &repr, b"")
 }
@@ -213,6 +215,8 @@ mod tests {
             flags: TcpFlags(flag_bits),
             window: 64000,
             mss,
+            sack_permitted: false,
+            sack: SackBlocks::default(),
         };
         build_segment(Endpoint::new(HOST, CLIENT_PORT), us(), &repr, payload)
     }

@@ -13,6 +13,11 @@ use crate::seq::SeqNumber;
 pub const TCP_MIN_HEADER_LEN: usize = 20;
 pub const TCP_MAX_HEADER_LEN: usize = 60;
 
+/// Maximum SACK blocks we parse or emit. With no TCP-timestamps option in play, four 8-byte
+/// blocks plus the 2-byte option header and 2 NOP-pad bytes is 36 bytes — within the 40-byte
+/// TCP options limit. (RFC 2018 §3.)
+pub const MAX_SACK_BLOCKS: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
     /// Buffer shorter than the header, or shorter than the declared data offset.
@@ -163,21 +168,17 @@ impl<'a> TcpPacket<'a> {
         self.buf
     }
 
-    /// Parse the Maximum Segment Size option, if present (kind 2, length 4).
-    pub fn mss_option(&self) -> Option<u16> {
+    /// Walk the TCP options, invoking `f(kind, value)` for every well-formed TLV option.
+    /// EOL (kind 0) ends the walk; NOP (kind 1) is skipped; a truncated or malformed length
+    /// silently ends the walk (the segment view is already bounds-checked, so this never
+    /// panics). This single audited walker backs every option accessor below.
+    fn for_each_option(&self, mut f: impl FnMut(u8, &[u8])) {
         let opts = self.options();
         let mut i = 0;
         while i < opts.len() {
             match opts[i] {
-                0 => break,            // End of Option List
-                1 => i += 1,           // No-Operation (single byte)
-                2 => {
-                    // MSS: kind(1) len(1)==4 value(2)
-                    if i + 4 > opts.len() || opts[i + 1] != 4 {
-                        break;
-                    }
-                    return Some(u16::from_be_bytes([opts[i + 2], opts[i + 3]]));
-                }
+                0 => break,      // End of Option List
+                1 => i += 1,     // No-Operation (single byte, no length/value)
                 _ => {
                     // Generic TLV option: kind(1) len(1) value(len-2).
                     if i + 1 >= opts.len() {
@@ -187,16 +188,99 @@ impl<'a> TcpPacket<'a> {
                     if len < 2 || i + len > opts.len() {
                         break;
                     }
+                    f(opts[i], &opts[i + 2..i + len]);
                     i += len;
                 }
             }
         }
-        None
+    }
+
+    /// Parse the Maximum Segment Size option, if present (kind 2, length 4 => 2-byte value).
+    pub fn mss_option(&self) -> Option<u16> {
+        let mut mss = None;
+        self.for_each_option(|kind, value| {
+            if kind == 2 && value.len() == 2 && mss.is_none() {
+                mss = Some(u16::from_be_bytes([value[0], value[1]]));
+            }
+        });
+        mss
+    }
+
+    /// True if the peer offered the SACK-Permitted option (kind 4, length 2 — an empty value).
+    /// Sent only on SYN; a server echoes it on its SYN-ACK to enable SACK for the connection.
+    pub fn sack_permitted(&self) -> bool {
+        let mut permitted = false;
+        self.for_each_option(|kind, value| {
+            if kind == 4 && value.is_empty() {
+                permitted = true;
+            }
+        });
+        permitted
+    }
+
+    /// Parse the SACK option (kind 5): up to [`MAX_SACK_BLOCKS`] `(left_edge, right_edge)`
+    /// sequence-number pairs reporting blocks of data the peer has buffered out of order.
+    /// Fills `out` and returns the number of blocks parsed; extra blocks beyond the array and
+    /// any trailing partial pair are ignored. (RFC 2018 §3.)
+    pub fn sack_blocks(&self, out: &mut [(SeqNumber, SeqNumber); MAX_SACK_BLOCKS]) -> usize {
+        let mut n = 0;
+        self.for_each_option(|kind, value| {
+            if kind != 5 {
+                return;
+            }
+            let mut j = 0;
+            while j + 8 <= value.len() && n < MAX_SACK_BLOCKS {
+                let left = u32::from_be_bytes([value[j], value[j + 1], value[j + 2], value[j + 3]]);
+                let right =
+                    u32::from_be_bytes([value[j + 4], value[j + 5], value[j + 6], value[j + 7]]);
+                out[n] = (SeqNumber::new(left), SeqNumber::new(right));
+                n += 1;
+                j += 8;
+            }
+        });
+        n
+    }
+}
+
+/// Up to [`MAX_SACK_BLOCKS`] `(left, right)` SACK blocks to emit (kind 5). Inline and `Copy`, so
+/// [`TcpRepr`] stays `Copy`. `(SeqNumber, SeqNumber)` is not `Default` (`SeqNumber` has no
+/// `Default`), so the `Default` impl is hand-written rather than derived.
+#[derive(Debug, Clone, Copy)]
+pub struct SackBlocks {
+    pub blocks: [(SeqNumber, SeqNumber); MAX_SACK_BLOCKS],
+    pub len: u8,
+}
+
+impl Default for SackBlocks {
+    fn default() -> Self {
+        SackBlocks {
+            blocks: [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS],
+            len: 0,
+        }
+    }
+}
+
+impl SackBlocks {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Append a block, silently capped at [`MAX_SACK_BLOCKS`].
+    pub fn push(&mut self, left: SeqNumber, right: SeqNumber) {
+        if (self.len as usize) < MAX_SACK_BLOCKS {
+            self.blocks[self.len as usize] = (left, right);
+            self.len += 1;
+        }
     }
 }
 
 /// A description of a TCP segment to emit. `ack` is meaningful only when `flags` includes ACK;
-/// `mss` emits the MSS option (used on SYN / SYN-ACK).
+/// `mss` emits the MSS option (used on SYN / SYN-ACK); `sack_permitted` emits the SACK-Permitted
+/// option (SYN-ACK only); a non-empty `sack` emits the SACK option (kind 5) on data/pure ACKs.
 #[derive(Debug, Clone, Copy)]
 pub struct TcpRepr {
     pub src_port: u16,
@@ -206,14 +290,31 @@ pub struct TcpRepr {
     pub flags: TcpFlags,
     pub window: u16,
     pub mss: Option<u16>,
+    pub sack_permitted: bool,
+    pub sack: SackBlocks,
 }
 
 impl TcpRepr {
-    /// Header length including options, always a multiple of 4 (the only option we emit, MSS,
-    /// is itself 4 bytes).
+    /// Header length including options, always a multiple of 4. Each emitted option is padded to
+    /// a 4-byte boundary: MSS is 4 bytes; SACK-Permitted is 2 NOPs + 2 bytes = 4; the SACK block
+    /// option is 2 NOPs + 2 header bytes + 8·n. MSS (SYN-ACK only) and SACK blocks (data ACKs
+    /// only) never coexist, so the worst case is 4 blocks = 36 bytes, within the 40-byte limit.
     #[inline]
     pub fn header_len(&self) -> usize {
-        TCP_MIN_HEADER_LEN + if self.mss.is_some() { 4 } else { 0 }
+        let mut opt = 0;
+        if self.mss.is_some() {
+            opt += 4;
+        }
+        if self.sack_permitted {
+            opt += 4;
+        }
+        let n = self.sack.len();
+        if n > 0 {
+            opt += 4 + 8 * n;
+        }
+        debug_assert!(opt <= 40, "TCP options exceed the 40-byte limit");
+        debug_assert_eq!(opt % 4, 0, "TCP options must be 4-byte aligned");
+        TCP_MIN_HEADER_LEN + opt
     }
 
     /// Write the complete TCP segment (header + options + `payload`) into `buf`, using the IP
@@ -235,11 +336,36 @@ impl TcpRepr {
         buf[16..18].copy_from_slice(&[0, 0]); // checksum zeroed for computation
         buf[18..20].copy_from_slice(&[0, 0]); // urgent pointer
 
+        // Options, in a fixed order. Each is laid down 4-byte aligned (NOP padding where the
+        // option's own length is not a multiple of 4); `header_len()` accounts for exactly this.
+        let mut o = TCP_MIN_HEADER_LEN;
         if let Some(mss) = self.mss {
-            buf[20] = 2; // kind: MSS
-            buf[21] = 4; // length
-            buf[22..24].copy_from_slice(&mss.to_be_bytes());
+            buf[o] = 2; // kind: MSS
+            buf[o + 1] = 4; // length
+            buf[o + 2..o + 4].copy_from_slice(&mss.to_be_bytes());
+            o += 4;
         }
+        if self.sack_permitted {
+            buf[o] = 1; // NOP
+            buf[o + 1] = 1; // NOP (align the option to 4 bytes)
+            buf[o + 2] = 4; // kind: SACK-Permitted
+            buf[o + 3] = 2; // length
+            o += 4;
+        }
+        let n = self.sack.len();
+        if n > 0 {
+            buf[o] = 1; // NOP
+            buf[o + 1] = 1; // NOP
+            buf[o + 2] = 5; // kind: SACK
+            buf[o + 3] = (2 + 8 * n) as u8; // length
+            o += 4;
+            for &(left, right) in &self.sack.blocks[..n] {
+                buf[o..o + 4].copy_from_slice(&left.raw().to_be_bytes());
+                buf[o + 4..o + 8].copy_from_slice(&right.raw().to_be_bytes());
+                o += 8;
+            }
+        }
+        debug_assert_eq!(o, hlen, "emitted option bytes must match header_len()");
 
         buf[hlen..total].copy_from_slice(payload);
 
@@ -266,6 +392,8 @@ mod tests {
             flags: TcpFlags::default().with(TcpFlags::SYN).with(TcpFlags::ACK),
             window: 64240,
             mss: Some(1460),
+            sack_permitted: false,
+            sack: SackBlocks::default(),
         };
         let mut buf = [0u8; 40];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -295,6 +423,8 @@ mod tests {
             flags: TcpFlags::default().with(TcpFlags::ACK).with(TcpFlags::PSH),
             window: 1000,
             mss: None,
+            sack_permitted: false,
+            sack: SackBlocks::default(),
         };
         let payload = b"GET / HTTP/1.0\r\n\r\n";
         let mut buf = [0u8; 80];
@@ -329,6 +459,8 @@ mod tests {
             flags: TcpFlags::default().with(TcpFlags::SYN),
             window: 0,
             mss: None,
+            sack_permitted: false,
+            sack: SackBlocks::default(),
         };
         let mut buf = [0u8; 28];
         repr.emit(A, B, b"", &mut buf);
@@ -343,5 +475,116 @@ mod tests {
         buf[27] = 0;
         let pkt = TcpPacket::new_checked(&buf[..28]).unwrap();
         assert_eq!(pkt.mss_option(), Some(536));
+    }
+
+    /// Build a minimal TCP segment whose options area is exactly `opts` (must be 4-byte
+    /// aligned). The checksum is irrelevant for option parsing, which `new_checked` does not
+    /// verify.
+    fn seg_with_options(opts: &[u8]) -> Vec<u8> {
+        assert_eq!(opts.len() % 4, 0, "TCP options must be 4-byte aligned");
+        let hlen = TCP_MIN_HEADER_LEN + opts.len();
+        let mut buf = vec![0u8; hlen];
+        buf[12] = ((hlen / 4) as u8) << 4; // data offset in 32-bit words
+        buf[13] = TcpFlags::ACK;
+        buf[TCP_MIN_HEADER_LEN..].copy_from_slice(opts);
+        buf
+    }
+
+    #[test]
+    fn sack_permitted_option_parsed() {
+        // NOP, NOP, kind=4 (SACK-Permitted), len=2.
+        let seg = seg_with_options(&[1, 1, 4, 2]);
+        let pkt = TcpPacket::new_checked(&seg).unwrap();
+        assert!(pkt.sack_permitted());
+        assert!(pkt.mss_option().is_none());
+        // A header with no options does not claim SACK-Permitted.
+        let plain = seg_with_options(&[]);
+        assert!(!TcpPacket::new_checked(&plain).unwrap().sack_permitted());
+    }
+
+    #[test]
+    fn sack_blocks_parsed_in_order() {
+        // NOP, NOP, kind=5, len=18 (header + two 8-byte blocks), then the two blocks.
+        let mut opts = vec![1u8, 1, 5, 18];
+        opts.extend_from_slice(&1000u32.to_be_bytes());
+        opts.extend_from_slice(&2000u32.to_be_bytes());
+        opts.extend_from_slice(&3000u32.to_be_bytes());
+        opts.extend_from_slice(&4000u32.to_be_bytes()); // 4 + 16 = 20 bytes, 4-aligned
+        let seg = seg_with_options(&opts);
+        let pkt = TcpPacket::new_checked(&seg).unwrap();
+        let mut blocks = [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS];
+        assert_eq!(pkt.sack_blocks(&mut blocks), 2);
+        assert_eq!(blocks[0], (SeqNumber::new(1000), SeqNumber::new(2000)));
+        assert_eq!(blocks[1], (SeqNumber::new(3000), SeqNumber::new(4000)));
+    }
+
+    #[test]
+    fn sack_blocks_absent_or_malformed_are_safe() {
+        let mut blocks = [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS];
+
+        // Only an MSS option present: no SACK blocks, MSS still parses.
+        let mss_seg = seg_with_options(&[2, 4, 0x05, 0xb4]);
+        let pkt = TcpPacket::new_checked(&mss_seg).unwrap();
+        assert_eq!(pkt.sack_blocks(&mut blocks), 0);
+        assert_eq!(pkt.mss_option(), Some(0x05b4));
+
+        // A SACK option whose declared length (18) overruns the options area is rejected by the
+        // walker's bound check — no panic, zero blocks.
+        let seg = seg_with_options(&[5, 18, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(TcpPacket::new_checked(&seg).unwrap().sack_blocks(&mut blocks), 0);
+    }
+
+    #[test]
+    fn emit_sack_permitted_on_syn_ack() {
+        let repr = TcpRepr {
+            src_port: 8080,
+            dst_port: 40000,
+            seq: SeqNumber::new(1),
+            ack: SeqNumber::new(2),
+            flags: TcpFlags::default().with(TcpFlags::SYN).with(TcpFlags::ACK),
+            window: 64000,
+            mss: Some(1460),
+            sack_permitted: true,
+            sack: SackBlocks::default(),
+        };
+        let mut buf = [0u8; 60];
+        let n = repr.emit(B, A, b"", &mut buf);
+        assert_eq!(n, 28); // 20-byte header + MSS(4) + SACK-Permitted(4)
+        let pkt = TcpPacket::new_checked(&buf[..n]).unwrap();
+        assert_eq!(pkt.data_offset(), 28);
+        assert_eq!(pkt.mss_option(), Some(1460));
+        assert!(pkt.sack_permitted());
+        assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()));
+    }
+
+    #[test]
+    fn emit_four_sack_blocks_round_trip_within_limit() {
+        let mut sack = SackBlocks::default();
+        sack.push(SeqNumber::new(10), SeqNumber::new(20));
+        sack.push(SeqNumber::new(30), SeqNumber::new(40));
+        sack.push(SeqNumber::new(50), SeqNumber::new(60));
+        sack.push(SeqNumber::new(70), SeqNumber::new(80));
+        let repr = TcpRepr {
+            src_port: 8080,
+            dst_port: 40000,
+            seq: SeqNumber::new(1),
+            ack: SeqNumber::new(2),
+            flags: TcpFlags::default().with(TcpFlags::ACK),
+            window: 1000,
+            mss: None,
+            sack_permitted: false,
+            sack,
+        };
+        let mut buf = [0u8; 80];
+        let n = repr.emit(B, A, b"", &mut buf);
+        assert_eq!(n, 20 + 4 + 8 * 4); // 56-byte header (NOP,NOP,kind5,len + four 8-byte blocks)
+        let pkt = TcpPacket::new_checked(&buf[..n]).unwrap();
+        assert_eq!(pkt.data_offset(), 56);
+        assert!(pkt.data_offset() <= TCP_MAX_HEADER_LEN, "within the 60-byte header limit");
+        let mut blocks = [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS];
+        assert_eq!(pkt.sack_blocks(&mut blocks), 4);
+        assert_eq!(blocks[0], (SeqNumber::new(10), SeqNumber::new(20)));
+        assert_eq!(blocks[3], (SeqNumber::new(70), SeqNumber::new(80)));
+        assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()));
     }
 }

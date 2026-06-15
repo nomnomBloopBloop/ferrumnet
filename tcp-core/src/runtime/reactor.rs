@@ -205,7 +205,7 @@ mod tests {
     use super::*;
     use crate::iface::build_segment;
     use crate::seq::SeqNumber;
-    use crate::wire::{TcpFlags, TcpPacket, TcpRepr};
+    use crate::wire::{SackBlocks, TcpFlags, TcpPacket, TcpRepr};
     use crate::runtime::MockDevice;
     use std::net::Ipv4Addr;
 
@@ -222,6 +222,8 @@ mod tests {
             flags: TcpFlags(flags),
             window: 64000,
             mss: if flags & TcpFlags::SYN != 0 { Some(1460) } else { None },
+            sack_permitted: false,
+            sack: SackBlocks::default(),
         };
         build_segment(
             Endpoint::new(HOST, CPORT),
@@ -434,6 +436,8 @@ mod tests {
             flags: TcpFlags(flags),
             window: 64000,
             mss: if flags & TcpFlags::SYN != 0 { Some(1460) } else { None },
+            sack_permitted: false,
+            sack: SackBlocks::default(),
         };
         build_segment(Endpoint::new(HOST, cport), Endpoint::new(US, 8080), &repr, payload)
     }
