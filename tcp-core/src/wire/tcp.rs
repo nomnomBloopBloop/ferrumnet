@@ -206,6 +206,20 @@ impl<'a> TcpPacket<'a> {
         mss
     }
 
+    /// Parse the Timestamps option (kind 8, length 10 => `(TSval, TSecr)`). Sent on every segment
+    /// once negotiated on the handshake (RFC 7323 §3).
+    pub fn timestamps(&self) -> Option<(u32, u32)> {
+        let mut ts = None;
+        self.for_each_option(|kind, value| {
+            if kind == 8 && value.len() == 8 && ts.is_none() {
+                let tsval = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+                let tsecr = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
+                ts = Some((tsval, tsecr));
+            }
+        });
+        ts
+    }
+
     /// Parse the Window Scale option (kind 3, length 3 => 1-byte shift count), clamped to the
     /// RFC 7323 maximum of 14. Sent only on SYN/SYN-ACK; enables windows beyond 64 KiB.
     pub fn window_scale(&self) -> Option<u8> {
@@ -306,13 +320,19 @@ pub struct TcpRepr {
     pub sack: SackBlocks,
     /// Window Scale shift to advertise (SYN-ACK only); the window field is the *scaled* value.
     pub window_scale: Option<u8>,
+    /// RFC 7323 Timestamps `(TSval, TSecr)`, emitted on every segment once negotiated. When this
+    /// is set alongside SACK blocks the option area would exceed 40 bytes, so the emitter caps the
+    /// SACK blocks at 3 (12 bytes for timestamps + 4 + 8·3 = 40).
+    pub timestamps: Option<(u32, u32)>,
 }
 
 impl TcpRepr {
     /// Header length including options, always a multiple of 4. Each emitted option is padded to
-    /// a 4-byte boundary: MSS is 4 bytes; SACK-Permitted is 2 NOPs + 2 bytes = 4; the SACK block
-    /// option is 2 NOPs + 2 header bytes + 8·n. MSS (SYN-ACK only) and SACK blocks (data ACKs
-    /// only) never coexist, so the worst case is 4 blocks = 36 bytes, within the 40-byte limit.
+    /// a 4-byte boundary: MSS is 4 bytes; SACK-Permitted is 2 NOPs + 2 bytes = 4; Timestamps is
+    /// 2 NOPs + 2 header bytes + 8 = 12; the SACK block option is 2 NOPs + 2 header bytes + 8·n.
+    /// MSS (SYN-ACK only) and SACK blocks (data ACKs only) never coexist; the contended worst case
+    /// is Timestamps + SACK, which [`TcpRepr::sack_blocks_to_emit`] caps at 3 blocks so the option
+    /// area is `12 + 4 + 8·3 = 40`, exactly the limit.
     #[inline]
     pub fn header_len(&self) -> usize {
         let mut opt = 0;
@@ -325,13 +345,25 @@ impl TcpRepr {
         if self.window_scale.is_some() {
             opt += 4; // NOP + kind3 + len3 + shift
         }
-        let n = self.sack.len();
+        if self.timestamps.is_some() {
+            opt += 12; // NOP + NOP + kind8 + len10 + TSval(4) + TSecr(4)
+        }
+        let n = self.sack_blocks_to_emit();
         if n > 0 {
             opt += 4 + 8 * n;
         }
         debug_assert!(opt <= 40, "TCP options exceed the 40-byte limit");
         debug_assert_eq!(opt % 4, 0, "TCP options must be 4-byte aligned");
         TCP_MIN_HEADER_LEN + opt
+    }
+
+    /// SACK blocks that fit the option budget. With timestamps present (12 bytes) at most 3 blocks
+    /// fit (12 + 4 + 8·3 = 40); without them, up to [`MAX_SACK_BLOCKS`]. MSS (SYN-only) and SACK
+    /// blocks (data-ACK-only) never coexist, so this is the only contended case.
+    #[inline]
+    fn sack_blocks_to_emit(&self) -> usize {
+        let cap = if self.timestamps.is_some() { 3 } else { MAX_SACK_BLOCKS };
+        self.sack.len().min(cap)
     }
 
     /// Write the complete TCP segment (header + options + `payload`) into `buf`, using the IP
@@ -376,7 +408,16 @@ impl TcpRepr {
             buf[o + 3] = shift; // shift count
             o += 4;
         }
-        let n = self.sack.len();
+        if let Some((tsval, tsecr)) = self.timestamps {
+            buf[o] = 1; // NOP
+            buf[o + 1] = 1; // NOP (align the 10-byte option to 4 bytes)
+            buf[o + 2] = 8; // kind: Timestamps
+            buf[o + 3] = 10; // length
+            buf[o + 4..o + 8].copy_from_slice(&tsval.to_be_bytes());
+            buf[o + 8..o + 12].copy_from_slice(&tsecr.to_be_bytes());
+            o += 12;
+        }
+        let n = self.sack_blocks_to_emit();
         if n > 0 {
             buf[o] = 1; // NOP
             buf[o + 1] = 1; // NOP
@@ -419,6 +460,7 @@ mod tests {
             sack_permitted: false,
             window_scale: None,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         let mut buf = [0u8; 40];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -451,6 +493,7 @@ mod tests {
             sack_permitted: false,
             window_scale: None,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         let payload = b"GET / HTTP/1.0\r\n\r\n";
         let mut buf = [0u8; 80];
@@ -488,6 +531,7 @@ mod tests {
             sack_permitted: false,
             window_scale: None,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         let mut buf = [0u8; 28];
         repr.emit(A, B, b"", &mut buf);
@@ -574,6 +618,7 @@ mod tests {
             sack_permitted: true,
             window_scale: None,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         let mut buf = [0u8; 60];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -603,6 +648,7 @@ mod tests {
             sack_permitted: false,
             window_scale: None,
             sack,
+            timestamps: None,
         };
         let mut buf = [0u8; 80];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -631,6 +677,7 @@ mod tests {
             sack_permitted: true,
             window_scale: Some(7),
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         let mut buf = [0u8; 60];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -644,5 +691,65 @@ mod tests {
         // A header with no WScale option parses to None.
         let plain = seg_with_options(&[]);
         assert_eq!(TcpPacket::new_checked(&plain).unwrap().window_scale(), None);
+    }
+
+    #[test]
+    fn emit_then_parse_timestamps() {
+        let repr = TcpRepr {
+            src_port: 8080,
+            dst_port: 40000,
+            seq: SeqNumber::new(1),
+            ack: SeqNumber::new(2),
+            flags: TcpFlags::default().with(TcpFlags::ACK),
+            window: 1000,
+            mss: None,
+            sack_permitted: false,
+            window_scale: None,
+            sack: SackBlocks::default(),
+            timestamps: Some((0x1122_3344, 0x5566_7788)),
+        };
+        let mut buf = [0u8; 60];
+        let n = repr.emit(B, A, b"", &mut buf);
+        assert_eq!(n, 20 + 12); // header + NOP,NOP,kind8,len10 + TSval(4) + TSecr(4)
+        let pkt = TcpPacket::new_checked(&buf[..n]).unwrap();
+        assert_eq!(pkt.data_offset(), 32);
+        assert_eq!(pkt.timestamps(), Some((0x1122_3344, 0x5566_7788)));
+        assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()));
+        // Absent option parses to None.
+        let plain = seg_with_options(&[]);
+        assert_eq!(TcpPacket::new_checked(&plain).unwrap().timestamps(), None);
+    }
+
+    #[test]
+    fn timestamps_cap_sack_to_three_blocks_within_limit() {
+        // Timestamps (12 bytes) + 4 SACK blocks would be 12 + 4 + 32 = 48 > 40; the emitter caps
+        // the SACK blocks at 3 so the option area stays within the 40-byte limit.
+        let mut sack = SackBlocks::default();
+        sack.push(SeqNumber::new(10), SeqNumber::new(20));
+        sack.push(SeqNumber::new(30), SeqNumber::new(40));
+        sack.push(SeqNumber::new(50), SeqNumber::new(60));
+        sack.push(SeqNumber::new(70), SeqNumber::new(80));
+        let repr = TcpRepr {
+            src_port: 8080,
+            dst_port: 40000,
+            seq: SeqNumber::new(1),
+            ack: SeqNumber::new(2),
+            flags: TcpFlags::default().with(TcpFlags::ACK),
+            window: 1000,
+            mss: None,
+            sack_permitted: false,
+            window_scale: None,
+            sack,
+            timestamps: Some((1, 2)),
+        };
+        assert_eq!(repr.header_len(), 20 + 12 + 4 + 8 * 3); // 60-byte header, exactly the max
+        let mut buf = [0u8; 80];
+        let n = repr.emit(B, A, b"", &mut buf);
+        let pkt = TcpPacket::new_checked(&buf[..n]).unwrap();
+        assert!(pkt.data_offset() <= TCP_MAX_HEADER_LEN);
+        assert_eq!(pkt.timestamps(), Some((1, 2)));
+        let mut blocks = [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS];
+        assert_eq!(pkt.sack_blocks(&mut blocks), 3, "the 4th SACK block is dropped under timestamps");
+        assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()));
     }
 }

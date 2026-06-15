@@ -87,6 +87,15 @@ pub struct Tcb {
     window_scaling: bool,
     snd_wscale: u8,
     rcv_wscale: u8,
+    /// TCP Timestamps (RFC 7323), negotiated iff both SYNs carried the option. When enabled every
+    /// segment carries `(TSval, TSecr)`: `TSval` is our microsecond clock at send time, `TSecr`
+    /// echoes `ts_recent` (the peer's most recent in-order TSval). Enables RTT measurement on every
+    /// ACK (free of Karn's restriction) and PAWS. All inert when `ts_enabled` is false.
+    ts_enabled: bool,
+    ts_recent: u32,
+    /// Our TSval to stamp on outgoing segments: the microsecond clock captured at the top of each
+    /// `poll_transmit` (every `build` runs inside `poll_transmit`, so it is always fresh).
+    cur_tsval: u32,
 
     // Receive sequence space.
     irs: SeqNumber,
@@ -169,6 +178,12 @@ impl Tcb {
             Some(peer) => (true, peer, RCV_WSCALE),
             None => (false, 0, 0),
         };
+        // Timestamps (RFC 7323): negotiated only if the SYN carried the option; seed TS.Recent
+        // with the SYN's TSval so the SYN-ACK echoes it.
+        let (ts_enabled, ts_recent) = match syn.timestamps() {
+            Some((tsval, _)) => (true, tsval),
+            None => (false, 0),
+        };
         Tcb {
             state: State::SynReceived,
             local,
@@ -183,6 +198,9 @@ impl Tcb {
             window_scaling,
             snd_wscale,
             rcv_wscale,
+            ts_enabled,
+            ts_recent,
+            cur_tsval: 0,
             irs,
             rcv_nxt,
             rcv_adv: rcv_nxt + rcv_wnd as u32,
@@ -243,6 +261,9 @@ impl Tcb {
             window_scaling: false,
             snd_wscale: 0,
             rcv_wscale: 0,
+            ts_enabled: false, // negotiated on the SYN-ACK
+            ts_recent: 0,
+            cur_tsval: 0,
             irs: SeqNumber::new(0), // unknown until the SYN/SYN-ACK carries IRS
             rcv_nxt: SeqNumber::new(0),
             rcv_adv: SeqNumber::new(0),
@@ -348,6 +369,7 @@ impl Tcb {
         let flags = tcp.flags();
         let payload = tcp.payload();
         let seg_len = payload.len() as u32 + u32::from(flags.syn()) + u32::from(flags.fin());
+        let seg_ts = if self.ts_enabled { tcp.timestamps() } else { None };
 
         // (1) RST (RFC 5961 §3.2): in-window only; never ACK an out-of-window RST.
         if flags.rst() {
@@ -381,11 +403,31 @@ impl Tcb {
             return;
         }
 
+        // (2b) PAWS (RFC 7323 §5.3): drop a segment whose timestamp predates TS.Recent — it is an
+        // old duplicate (from this or a prior incarnation). A genuine retransmit is never older
+        // because we re-stamp every emitted segment with the current clock, and out-of-order
+        // segments are sent *after* the in-order stream that set TS.Recent, so their TSval is newer.
+        // (We omit the 24-day idle invalidation; our connections are far shorter than the wrap.)
+        if let Some((seg_tsval, _)) = seg_ts {
+            if (seg_tsval.wrapping_sub(self.ts_recent) as i32) < 0 {
+                self.needs_ack = true;
+                return;
+            }
+        }
+
         // (3) Four-case acceptability (RFC 793 §3.9). An unacceptable segment still gets a
         // current ACK (so the peer learns RCV.NXT) — including a zero-length out-of-order one.
         if !self.segment_acceptable(seg_seq, seg_len) {
             self.needs_ack = true;
             return;
+        }
+
+        // RFC 7323 §4.3: advance TS.Recent from an accepted segment that reaches the left window
+        // edge (PAWS above guarantees its TSval is not older). This is the value we echo in TSecr.
+        if let Some((seg_tsval, _)) = seg_ts {
+            if seg_seq.le(self.rcv_nxt) {
+                self.ts_recent = seg_tsval;
+            }
         }
 
         // (4) After the handshake every segment must carry ACK.
@@ -421,7 +463,7 @@ impl Tcb {
                 && !flags.syn()
                 && seg_ack == self.snd_una
                 && self.snd_una != self.snd_nxt;
-            if !self.process_ack(seg_seq, seg_ack, tcp.window(), now) {
+            if !self.process_ack(seg_seq, seg_ack, tcp.window(), seg_ts.map(|(_, e)| e), now) {
                 return; // SEG.ACK > SND.NXT: ACK already owed, drop the segment
             }
             if self.sack_enabled {
@@ -603,6 +645,14 @@ impl Tcb {
                     self.rcv_wscale = 0;
                 }
             }
+            // Timestamps: enabled iff the SYN-ACK (or simultaneous-open SYN) also carried them.
+            match tcp.timestamps() {
+                Some((tsval, _)) => {
+                    self.ts_enabled = true;
+                    self.ts_recent = tsval;
+                }
+                None => self.ts_enabled = false,
+            }
             // The SYN/SYN-ACK window field is never scaled (RFC 7323); take it literally.
             self.snd_wnd = tcp.window() as u32;
             self.snd_wl1 = seg_seq;
@@ -629,9 +679,10 @@ impl Tcb {
         // (5) Neither SYN nor RST: drop the segment (nothing to do).
     }
 
-    /// Advance over acked data/FIN, sample RTT (Karn), manage the rtx timer and send window.
+    /// Advance over acked data/FIN, sample RTT, manage the rtx timer and send window. `seg_tsecr`
+    /// is the ACK's echoed timestamp (RFC 7323), used for RTT when timestamps are negotiated.
     /// Returns `false` if the ACK is for unsent data (caller drops the segment).
-    fn process_ack(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16, now: Instant) -> bool {
+    fn process_ack(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16, seg_tsecr: Option<u32>, now: Instant) -> bool {
         if seg_ack.gt(self.snd_nxt) {
             self.needs_ack = true; // acks data we never sent: ACK and drop (RFC 793)
             return false;
@@ -666,8 +717,23 @@ impl Tcb {
                 }
             }
 
-            // Karn: suppress the RTT *sample* on retransmitted data (an ACK is ambiguous).
-            if !self.retransmitted {
+            // RTT measurement. With timestamps (RFC 7323) the ACK's TSecr echoes our TSval from
+            // when the now-acked data was sent, so RTT = now − TSecr on EVERY ack — free of Karn's
+            // restriction, since a retransmit carries a fresh TSval and its ACK therefore times the
+            // retransmit, not the original. Without timestamps, fall back to the single
+            // Karn-guarded sample per window (suppressed while any data has been retransmitted).
+            if self.ts_enabled {
+                if let Some(tsecr) = seg_tsecr {
+                    // A real echo is a TSval we sent, so it lies in the past: `now − TSecr` is a
+                    // small, non-negative elapsed time. Reading it as signed catches a peer that
+                    // echoes a value "in the future" (one we never sent) — ignore that rather than
+                    // let a fabricated sample pin the RTO.
+                    let elapsed = (now.micros() as u32).wrapping_sub(tsecr);
+                    if elapsed as i32 >= 0 {
+                        self.rtt.on_sample(elapsed.max(1));
+                    }
+                }
+            } else if !self.retransmitted {
                 if let Some((sent_at, seq_end)) = self.rtt_sample {
                     if seg_ack.ge(seq_end) {
                         let rtt_us =
@@ -752,6 +818,8 @@ impl Tcb {
 
     /// Produce the next datagram to send, or `None` if nothing is pending.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
+        // Capture the timestamp clock once for every segment this call emits (RFC 7323 TSval).
+        self.cur_tsval = now.micros() as u32;
         // An owed RST takes priority. The state transition (if any) was already applied where the
         // bad ACK was detected, so this only emits the segment — never a state change.
         if let Some(seq) = self.pending_reset.take() {
@@ -1105,6 +1173,12 @@ impl Tcb {
                 sack.push(l, r);
             }
         }
+        // Timestamps on every segment once negotiated: our current TSval, echoing TS.Recent.
+        let timestamps = if self.ts_enabled {
+            Some((self.cur_tsval, self.ts_recent))
+        } else {
+            None
+        };
         let repr = TcpRepr {
             src_port: self.local.port,
             dst_port: self.remote.port,
@@ -1116,6 +1190,7 @@ impl Tcb {
             sack_permitted,
             window_scale,
             sack,
+            timestamps,
         };
         build_segment(self.local, self.remote, &repr, payload)
     }
@@ -1161,9 +1236,10 @@ impl Tcb {
     }
 
     /// Build our active-open SYN: a pure SYN (no ACK — we have acknowledged nothing yet) offering
-    /// MSS + SACK-Permitted + Window Scale. Unlike [`Tcb::build`], which always sets ACK and gates
-    /// the SACK/WScale options on what the peer offered, the active SYN advertises all three
-    /// unconditionally — it is the *offer* that the peer's SYN-ACK then accepts or declines.
+    /// MSS + SACK-Permitted + Window Scale + Timestamps. Unlike [`Tcb::build`], which always sets
+    /// ACK and gates the options on what the peer offered, the active SYN advertises all of them
+    /// unconditionally — it is the *offer* that the peer's SYN-ACK then accepts or declines. TSecr
+    /// is 0: we have not yet seen the peer's TSval.
     fn build_syn(&self) -> Vec<u8> {
         let repr = TcpRepr {
             src_port: self.local.port,
@@ -1176,6 +1252,7 @@ impl Tcb {
             sack_permitted: true,
             window_scale: Some(RCV_WSCALE),
             sack: SackBlocks::default(),
+            timestamps: Some((self.cur_tsval, 0)),
         };
         build_segment(self.local, self.remote, &repr, b"")
     }
@@ -1193,6 +1270,7 @@ impl Tcb {
             sack_permitted: false,
             window_scale: None,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         build_segment(self.local, self.remote, &repr, b"")
     }
@@ -1229,6 +1307,18 @@ impl Tcb {
     #[cfg(test)]
     fn window_scaling_dbg(&self) -> bool {
         self.window_scaling
+    }
+    #[cfg(test)]
+    fn ts_enabled_dbg(&self) -> bool {
+        self.ts_enabled
+    }
+    #[cfg(test)]
+    fn ts_recent_dbg(&self) -> u32 {
+        self.ts_recent
+    }
+    #[cfg(test)]
+    fn rto_dbg(&self) -> u32 {
+        self.rtt.rto_micros()
     }
 }
 
@@ -1287,6 +1377,7 @@ mod tests {
             sack_permitted: false,
             window_scale: None,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         build_segment(ep_host(), ep_us(), &repr, payload)
     }
@@ -1304,6 +1395,7 @@ mod tests {
             sack_permitted: true,
             window_scale: None,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
     }
@@ -1325,6 +1417,7 @@ mod tests {
             sack_permitted: false,
             window_scale: None,
             sack,
+            timestamps: None,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
     }
@@ -1918,6 +2011,7 @@ mod tests {
             sack_permitted: true,
             window_scale: Some(wscale),
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
     }
@@ -2042,6 +2136,7 @@ mod tests {
             sack_permitted,
             window_scale: wscale,
             sack: SackBlocks::default(),
+            timestamps: None,
         };
         build_segment(server_remote(), client_local(), &repr, payload)
     }
@@ -2262,5 +2357,159 @@ mod tests {
         assert!(out[0].flags.syn() && out[0].flags.ack());
         assert_eq!(out[0].seq, iss, "retransmitted at ISS");
         assert_eq!(tcb.state, State::SynReceived);
+    }
+
+    // ── TCP timestamps (RFC 7323) ─────────────────────────────────────────────────────────────
+
+    /// A SYN offering MSS + SACK-Permitted + Timestamps (TSval `tsval`).
+    fn inbound_syn_ts(seq: SeqNumber, window: u16, tsval: u32) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: CPORT,
+            dst_port: 8080,
+            seq,
+            ack: SeqNumber::new(0),
+            flags: TcpFlags(TcpFlags::SYN),
+            window,
+            mss: Some(1460),
+            sack_permitted: true,
+            window_scale: None,
+            sack: SackBlocks::default(),
+            timestamps: Some((tsval, 0)),
+        };
+        build_segment(ep_host(), ep_us(), &repr, b"")
+    }
+
+    /// A segment carrying a Timestamps option `(tsval, tsecr)`.
+    #[allow(clippy::too_many_arguments)]
+    fn inbound_ts(seq: SeqNumber, ack: SeqNumber, flags: u8, window: u16, tsval: u32, tsecr: u32, payload: &[u8]) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: CPORT,
+            dst_port: 8080,
+            seq,
+            ack,
+            flags: TcpFlags(flags),
+            window,
+            mss: None,
+            sack_permitted: false,
+            window_scale: None,
+            sack: SackBlocks::default(),
+            timestamps: Some((tsval, tsecr)),
+        };
+        build_segment(ep_host(), ep_us(), &repr, payload)
+    }
+
+    fn frame_timestamps(frame: &[u8]) -> Option<(u32, u32)> {
+        let ip = Ipv4Packet::new_checked(frame).unwrap();
+        TcpPacket::new_checked(ip.payload()).unwrap().timestamps()
+    }
+
+    /// Establish a server connection that negotiated timestamps (client SYN TSval `cli_ts`).
+    fn established_ts(now: Instant, client_isn: u32, window: u16, cli_ts: u32) -> (Tcb, SeqNumber, SeqNumber) {
+        let syn = inbound_syn_ts(SeqNumber::new(client_isn), window, cli_ts);
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        let synack = tcb.poll_transmit(now).expect("SYN-ACK");
+        let (synack_tsval, synack_tsecr) = frame_timestamps(&synack).expect("SYN-ACK carries timestamps");
+        assert_eq!(synack_tsecr, cli_ts, "SYN-ACK echoes the client's SYN TSval");
+        let our_iss = parse(&synack).seq;
+        assert!(tcb.poll_transmit(now).is_none());
+        let client_nxt = SeqNumber::new(client_isn) + 1;
+        deliver(&mut tcb, now, &inbound_ts(client_nxt, our_iss + 1, TcpFlags::ACK, window, cli_ts + 1, synack_tsval, b""));
+        assert!(drain(&mut tcb, now).is_empty());
+        assert_eq!(tcb.state, State::Established);
+        assert!(tcb.ts_enabled_dbg());
+        (tcb, our_iss, client_nxt)
+    }
+
+    #[test]
+    fn ts_negotiated_and_synack_echoes_tsval() {
+        let now = Instant::from_millis(0);
+        let syn = inbound_syn_ts(SeqNumber::new(1), 64000, 777);
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        assert!(tcb.ts_enabled_dbg(), "timestamps negotiated from the SYN");
+        let synack = tcb.poll_transmit(now).unwrap();
+        let (_, tsecr) = frame_timestamps(&synack).expect("SYN-ACK carries timestamps");
+        assert_eq!(tsecr, 777, "TSecr echoes the SYN's TSval");
+    }
+
+    #[test]
+    fn ts_not_enabled_when_not_offered() {
+        let now = Instant::from_millis(0);
+        let syn = inbound(SeqNumber::new(1), SeqNumber::new(0), TcpFlags::SYN, 64000, Some(1460), b"");
+        let ip = Ipv4Packet::new_checked(&syn).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut tcb = Tcb::new_syn_received(ep_us(), ep_host(), &tcp, SeqNumber::new(OUR_ISS), now, 1460);
+        assert!(!tcb.ts_enabled_dbg());
+        let synack = tcb.poll_transmit(now).unwrap();
+        assert_eq!(frame_timestamps(&synack), None, "no timestamps emitted when not offered");
+    }
+
+    #[test]
+    fn ts_emitted_on_every_segment_and_echoes_recent() {
+        let now = Instant::from_micros(2_000_000);
+        let (mut tcb, _iss, _cnxt) = established_ts(now, 1000, 64000, 5000);
+        assert_eq!(tcb.ts_recent_dbg(), 5001, "TS.Recent advanced from the client's final ACK");
+        tcb.send(b"hi");
+        let frames = drain_raw(&mut tcb, now);
+        let (tsval, tsecr) = frame_timestamps(&frames[0]).expect("data carries timestamps");
+        assert_eq!(tsval, 2_000_000, "TSval is our microsecond clock (now)");
+        assert_eq!(tsecr, 5001, "TSecr echoes TS.Recent");
+    }
+
+    #[test]
+    fn ts_rtt_responds_to_tsecr() {
+        let now0 = Instant::from_micros(1_000_000);
+        let (mut tcb, iss, cnxt) = established_ts(now0, 1000, 64000, 5000);
+        tcb.send(b"data");
+        let frames = drain_raw(&mut tcb, now0);
+        let (data_tsval, _) = frame_timestamps(&frames[0]).unwrap();
+        assert_eq!(data_tsval, 1_000_000);
+        // The peer ACKs 300 ms later, echoing our data TSval — the first RTT sample (the
+        // SYN-RECEIVED→ESTABLISHED handshake path does not sample). First sample (RFC 6298):
+        // RTO = R + 4·(R/2) = 3R = 900 ms.
+        let now1 = Instant::from_micros(1_300_000);
+        deliver(&mut tcb, now1, &inbound_ts(cnxt, iss + 1 + 4, TcpFlags::ACK, 64000, 6000, data_tsval, b""));
+        assert_eq!(tcb.rto_dbg(), 900_000, "the 300 ms ts-RTT became the RTO estimate");
+    }
+
+    #[test]
+    fn ts_rtt_is_karn_free_on_a_retransmit() {
+        // The headline: timestamps let the retransmit's ACK measure RTT, which Karn forbids
+        // without them. A 3 s retransmit RTT pushes the RTO well past 2 s; the Karn path would
+        // take no sample and the RTO would fall back to the ~200 ms base.
+        let now0 = Instant::from_micros(1_000_000);
+        let (mut tcb, iss, cnxt) = established_ts(now0, 1000, 64000, 5000);
+        tcb.send(b"data");
+        drain_raw(&mut tcb, now0);
+        let deadline = tcb.poll_at().expect("rtx armed");
+        let now1 = deadline.plus_millis(1);
+        tcb.on_timer(now1); // RTO: retransmit pending, backoff applied
+        let rfrm = drain_raw(&mut tcb, now1);
+        let (retx_tsval, _) = frame_timestamps(&rfrm[0]).unwrap();
+        assert_eq!(retx_tsval, now1.micros() as u32, "the retransmit carries a fresh TSval");
+        // The peer ACKs the RETRANSMIT 3 s later, echoing its fresh TSval.
+        let now2 = Instant::from_micros(now1.micros() + 3_000_000);
+        deliver(&mut tcb, now2, &inbound_ts(cnxt, iss + 1 + 4, TcpFlags::ACK, 64000, 7000, retx_tsval, b""));
+        assert!(tcb.rto_dbg() > 2_000_000, "the retransmit's 3 s RTT was measured despite Karn");
+    }
+
+    #[test]
+    fn paws_drops_stale_then_accepts_fresh() {
+        let now = Instant::from_micros(1_000_000);
+        let (mut tcb, iss, cnxt) = established_ts(now, 1000, 64000, 5000);
+        assert_eq!(tcb.ts_recent_dbg(), 5001);
+        // A segment whose TSval (4000) predates TS.Recent (5001) is an old duplicate: PAWS drops it.
+        deliver(&mut tcb, now, &inbound_ts(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, 4000, 5001, b"old"));
+        assert_eq!(tcb.rx_available(), 0, "PAWS drops the stale segment");
+        let out = drain(&mut tcb, now);
+        assert!(out.iter().any(|o| o.flags.ack()), "PAWS still ACKs RCV.NXT");
+        assert_eq!(tcb.ts_recent_dbg(), 5001, "TS.Recent unchanged by the dropped segment");
+        // A fresh-timestamp segment is accepted and advances TS.Recent.
+        deliver(&mut tcb, now, &inbound_ts(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, 5002, 5001, b"new"));
+        assert_eq!(tcb.rx_available(), 3, "a fresh-timestamp segment is accepted");
+        assert_eq!(tcb.ts_recent_dbg(), 5002, "TS.Recent advanced");
     }
 }
