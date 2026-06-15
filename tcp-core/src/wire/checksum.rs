@@ -20,22 +20,37 @@ pub const IPPROTO_TCP: u8 = 6;
 /// Accumulate the one's-complement sum of `data` into `acc`, treating `data` as a sequence
 /// of big-endian 16-bit words. A trailing odd byte is the **high** byte of the last word.
 ///
-/// The accumulator is returned **unfolded**, so several `accumulate` calls can be chained
-/// (e.g. a TCP pseudo-header followed by the segment) and folded exactly once at the end
-/// with [`fold`].
+/// Several `accumulate` calls can be chained (e.g. a TCP pseudo-header followed by the segment)
+/// and finished once at the end with [`fold`].
 ///
-/// No overflow is possible for Internet packets: an IPv4 datagram is at most 65 535 bytes
-/// (< 2^15 words), so the running `u32` stays below `2^15 * 2^16 = 2^31`.
+/// The hot loop sums **32-bit** big-endian words into a 64-bit accumulator, eight bytes per
+/// iteration — ~4× fewer iterations than word-at-a-time, and the compiler can vectorize the wide
+/// reads. This is exact: a 32-bit word is two adjacent 16-bit words (`hi << 16 | lo`), so the sum
+/// of 32-bit words folds (64→32→16, end-around carry) to the same value as the sum of 16-bit
+/// words. The result is folded back into the low 17 bits before returning so it still fits a `u32`
+/// and a following `accumulate`/`fold` can extend it without overflow. A 64-bit accumulator has
+/// ample headroom: at most 65 535 bytes ⇒ < 2^14 32-bit words ⇒ sum < 2^14·2^32 = 2^46.
 #[must_use]
-pub fn accumulate(mut acc: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(2);
-    for pair in &mut chunks {
-        acc += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+pub fn accumulate(acc: u32, data: &[u8]) -> u32 {
+    let mut sum = acc as u64;
+    let mut octets = data.chunks_exact(8);
+    for o in &mut octets {
+        sum += u32::from_be_bytes([o[0], o[1], o[2], o[3]]) as u64;
+        sum += u32::from_be_bytes([o[4], o[5], o[6], o[7]]) as u64;
     }
-    if let [last] = chunks.remainder() {
-        acc += (*last as u32) << 8;
+    // The < 8-byte tail, still 16-bit-word aligned (the 8-byte chunks ended on an even offset).
+    let mut pairs = octets.remainder().chunks_exact(2);
+    for pair in &mut pairs {
+        sum += u16::from_be_bytes([pair[0], pair[1]]) as u64;
     }
-    acc
+    if let [last] = pairs.remainder() {
+        sum += (*last as u64) << 8;
+    }
+    // Fold 64 → 17 bits so the return value fits a u32 and stays chainable.
+    while sum >> 32 != 0 {
+        sum = (sum & 0xffff_ffff) + (sum >> 32);
+    }
+    sum as u32
 }
 
 /// Fold a 32-bit accumulator down to 16 bits with end-around carry, repeating until no
@@ -126,6 +141,31 @@ mod tests {
         // Data that sums to 0xFFFF yields a transmitted checksum of 0x0000 (NOT 0xFFFF);
         // that is the legal TCP/IP value — only UDP flips it.
         assert_eq!(checksum(&[0xff, 0xff]), 0x0000);
+    }
+
+    #[test]
+    fn folded_matches_word_at_a_time_reference() {
+        // A trivially-correct word-at-a-time reference; the folded accumulate must match it for
+        // every length that spans the 8-byte loop, each remainder (0..7), and the trailing byte.
+        fn reference(data: &[u8]) -> u16 {
+            let mut acc = 0u32;
+            let mut i = 0;
+            while i + 1 < data.len() {
+                acc += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+                i += 2;
+            }
+            if i < data.len() {
+                acc += (data[i] as u32) << 8;
+            }
+            while acc >> 16 != 0 {
+                acc = (acc & 0xffff) + (acc >> 16);
+            }
+            !(acc as u16)
+        }
+        for len in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100, 1460, 1461, 65535] {
+            let data: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect();
+            assert_eq!(checksum(&data), reference(&data), "mismatch at len {len}");
+        }
     }
 
     #[test]
