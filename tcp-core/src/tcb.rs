@@ -770,9 +770,16 @@ impl Tcb {
             }
             self.snd_una = seg_ack;
             // Feed a rate-based controller its delivery-rate sample now that SND.UNA has advanced
-            // (a no-op for Reno/CUBIC). Runs even during recovery — BBR keeps modelling the path
-            // where a window controller would freeze its growth.
-            self.cc.on_ack_sample(now, self.snd_una, self.snd_nxt.offset_from(self.snd_una));
+            // (a no-op for Reno/CUBIC). `pipe` is the RFC 6675 in-flight estimate so a model-based
+            // controller can hold its window near it during recovery (a BBRv2-style loss response);
+            // `in_recovery` gates that — it keeps modelling but stops overshooting into the loss.
+            let cc_inflight = self.snd_nxt.offset_from(self.snd_una);
+            let cc_pipe = if self.sack_enabled {
+                self.scoreboard.pipe(self.snd_una, self.snd_nxt, self.snd_mss as u32)
+            } else {
+                cc_inflight
+            };
+            self.cc.on_ack_sample(now, self.snd_una, cc_inflight, data_acked as u32, cc_pipe, in_recovery);
             if self.sack_enabled {
                 self.scoreboard.trim(self.snd_una);
                 if self.scoreboard.recovery_reached(self.snd_una) {

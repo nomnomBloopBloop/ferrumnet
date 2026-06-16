@@ -119,11 +119,14 @@ pub trait CongestionControl {
     /// delivery-rate estimator; retransmissions are not reported here.
     fn on_transmit(&mut self, _now: Instant, _seq_end: SeqNumber, _bytes: u32, _inflight: u32, _app_limited: bool) {}
 
-    /// An ACK advanced the cumulative acknowledgement to `snd_una` (with `inflight` bytes still
-    /// outstanding after it): produce a delivery-rate sample and update the model (bottleneck
-    /// bandwidth, min-RTT, mode). Runs on every advancing ACK, *including* during loss recovery —
-    /// a rate-based controller keeps modelling where Reno would freeze.
-    fn on_ack_sample(&mut self, _now: Instant, _snd_una: SeqNumber, _inflight: u32) {}
+    /// An ACK advanced the cumulative acknowledgement to `snd_una`. `inflight` is the bytes still
+    /// outstanding after it, `acked` the bytes this ACK newly delivered, `pipe` the RFC 6675
+    /// in-flight estimate (≤ `inflight`, discounting SACKed data), and `in_recovery` whether a loss
+    /// is currently being repaired. A rate-based controller produces a delivery-rate sample and
+    /// updates its model here, growing its window by `acked` toward the model rather than jumping —
+    /// and, while `in_recovery`, holding the window near `pipe` (a BBRv2-style loss response) so it
+    /// stops overshooting into the loss. Runs on every advancing ACK, including during recovery.
+    fn on_ack_sample(&mut self, _now: Instant, _snd_una: SeqNumber, _inflight: u32, _acked: u32, _pipe: u32, _in_recovery: bool) {}
 }
 
 pub struct Reno {
@@ -544,11 +547,11 @@ impl CongestionControl for Cc {
         }
     }
 
-    fn on_ack_sample(&mut self, now: Instant, snd_una: SeqNumber, inflight: u32) {
+    fn on_ack_sample(&mut self, now: Instant, snd_una: SeqNumber, inflight: u32, acked: u32, pipe: u32, in_recovery: bool) {
         match self {
-            Cc::Reno(c) => c.on_ack_sample(now, snd_una, inflight),
-            Cc::Cubic(c) => c.on_ack_sample(now, snd_una, inflight),
-            Cc::Bbr(c) => c.on_ack_sample(now, snd_una, inflight),
+            Cc::Reno(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
+            Cc::Cubic(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
+            Cc::Bbr(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
         }
     }
 }

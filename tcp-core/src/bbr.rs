@@ -440,19 +440,42 @@ impl Bbr {
         }
     }
 
-    fn set_pacing_and_cwnd(&mut self) {
+    fn set_pacing_and_cwnd(&mut self, acked: u32, pipe: u32, in_recovery: bool) {
         if self.btlbw == 0 || self.min_rtt_us == u32::MAX {
             // Not enough model yet: stay at the initial window and send unpaced (cwnd-limited).
             self.pacing_rate = 0;
             return;
         }
         self.pacing_rate = (self.btlbw as f64 * self.pacing_gain) as u64;
-        if self.mode == Mode::ProbeRtt {
-            self.cwnd = self.min_cwnd();
+        let min_cwnd = self.min_cwnd() as u64;
+        let target = ((self.bdp() as f64 * self.cwnd_gain) as u64).max(min_cwnd);
+        let cwnd = if in_recovery {
+            // BBRv2-style loss response. BBR v1 ignores loss and would refill its whole window,
+            // burying SND.UNA behind more simultaneous holes than the 4-block SACK option can report
+            // — recovery then wedges into one-segment-per-RTO go-back-N. Instead, while a loss is
+            // being repaired hold cwnd just ABOVE the RFC 6675 `pipe` estimate (by a few segments):
+            // that keeps `cwnd > pipe` so the selective retransmit still fires, while throttling
+            // *new* data to a trickle (the send gate is `cwnd − pipe`), so recovery drains the holes
+            // instead of adding to them. This tracks `pipe`, NOT the BDP `target`: clamping down to
+            // target would let cwnd fall to/below pipe whenever pipe ≥ target (reachable at recovery
+            // entry under bursty loss, or after a BtlBw re-measure shrank target), closing both send
+            // gates and re-wedging into the very RTO death-spiral this response removes.
+            (pipe as u64 + 3 * self.mss as u64).max(min_cwnd)
         } else {
-            let target = (self.bdp() as f64 * self.cwnd_gain) as u64;
-            self.cwnd = (target.max(self.min_cwnd() as u64)).min(u32::MAX as u64) as u32;
+            // GROW toward the model target by what this ACK delivered — never JUMP to it. After a
+            // collapse (an RTO sets cwnd to one segment) this rebuilds gradually instead of
+            // re-bursting the whole BDP straight into the next loss.
+            (self.cwnd as u64 + acked as u64).min(target).max(min_cwnd)
+        };
+        // PROBE_RTT drains to a minimal window to re-read RTprop — but NOT while a loss is being
+        // repaired: forcing cwnd to min_cwnd there would drop it below `pipe` and wedge recovery (the
+        // same gate closure). Defer the drain until recovery completes.
+        self.cwnd = if self.mode == Mode::ProbeRtt && !in_recovery {
+            cwnd.min(min_cwnd)
+        } else {
+            cwnd
         }
+        .min(u32::MAX as u64) as u32;
     }
 }
 
@@ -510,7 +533,7 @@ impl CongestionControl for Bbr {
         self.sampler.on_transmit(now, seq_end, bytes, inflight, app_limited);
     }
 
-    fn on_ack_sample(&mut self, now: Instant, snd_una: SeqNumber, inflight: u32) {
+    fn on_ack_sample(&mut self, now: Instant, snd_una: SeqNumber, inflight: u32, acked: u32, pipe: u32, in_recovery: bool) {
         let sample = match self.sampler.on_ack(now, snd_una) {
             Some(s) => s,
             None => return, // this ACK delivered nothing new
@@ -546,7 +569,7 @@ impl CongestionControl for Bbr {
         }
 
         self.update_mode(now, inflight, min_rtt_expired);
-        self.set_pacing_and_cwnd();
+        self.set_pacing_and_cwnd(acked, pipe, in_recovery);
     }
 }
 
@@ -622,7 +645,7 @@ mod tests {
             // ACK the burst one RTT later.
             t += rtt_ms;
             una = nxt;
-            b.on_ack_sample(Instant::from_millis(t), seq(una), 0);
+            b.on_ack_sample(Instant::from_millis(t), seq(una), 0, burst, 0, false);
         }
         b
     }
@@ -661,7 +684,7 @@ mod tests {
             }
             t += rtt_ms;
             una = nxt;
-            b.on_ack_sample(Instant::from_millis(t), seq(una), 0);
+            b.on_ack_sample(Instant::from_millis(t), seq(una), 0, burst, 0, false);
             if b.mode != Mode::Startup {
                 break;
             }
@@ -715,10 +738,33 @@ mod tests {
             }
             t += rtt_ms;
             una = nxt;
-            b.on_ack_sample(Instant::from_millis(t), seq(una), 0);
+            b.on_ack_sample(Instant::from_millis(t), seq(una), 0, burst, 0, false);
             saw_probe_rtt |= b.mode == Mode::ProbeRtt;
         }
         assert!(saw_probe_rtt, "PROBE_RTT is entered once the min-RTT window expires on a steady path");
+    }
+
+    #[test]
+    fn bbr_recovery_window_tracks_pipe() {
+        // BBRv2-style loss response: while a loss is being repaired (`in_recovery`), BBR holds cwnd
+        // just above the RFC 6675 `pipe` estimate instead of jumping back to the full BDP target —
+        // that is what stops it overshooting into the loss. Crucially cwnd must stay > pipe (so the
+        // selective retransmit still fires) even when pipe is large, which is why the recovery
+        // window tracks pipe and is NOT clamped down to the (possibly smaller) BDP target.
+        let mut b = pump_startup(); // an established model (btlbw > 0, min-RTT set)
+        let full = b.cwnd();
+        assert!(full > 40_000, "post-startup cwnd is well above one segment, got {full}");
+        // A small pipe (most outstanding data already SACKed): cwnd tracks pipe + a few segments.
+        b.on_transmit(Instant::from_millis(500), seq(2_000_000), 1000, 40_000, false);
+        b.on_ack_sample(Instant::from_millis(520), seq(2_000_000), 40_000, 1000, 10_000, true);
+        assert!(b.cwnd() > 10_000, "cwnd stays ABOVE pipe so the retransmit can fire");
+        assert!(b.cwnd() <= 10_000 + 4 * 1000, "but only by a few MSS, got {}", b.cwnd());
+        assert!(b.cwnd() < full, "and far below the un-throttled BDP target ({full})");
+        // A LARGE pipe (recovery entry, little SACKed): cwnd must STILL exceed pipe, not collapse to
+        // the BDP target below it (the wedge bug the review caught).
+        b.on_transmit(Instant::from_millis(540), seq(3_000_000), 1000, 40_000, false);
+        b.on_ack_sample(Instant::from_millis(560), seq(3_000_000), 40_000, 1000, 200_000, true);
+        assert!(b.cwnd() > 200_000, "cwnd > pipe even when pipe exceeds the BDP target, got {}", b.cwnd());
     }
 }
 
