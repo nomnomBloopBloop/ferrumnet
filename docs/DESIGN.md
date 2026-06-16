@@ -221,14 +221,20 @@ trigger needed (fixed Linux-style: compute the expiry once, use it for both).
 **Measured comparison** (two-instance bench, 8 MiB, 20 ms RTT, MB/s medians): at 0% loss BBR leads
 (**10.5** vs Reno 7.6, CUBIC 7.2) — pacing to the BDP fills a short high-RTT flow faster than
 slow-start. Under random loss Reno collapses and CUBIC's gentler cut holds marginally better.
-**BBR under random loss is a known limitation:** v1 is loss-agnostic and should excel, but the
-from-scratch delivery-rate estimator under-measures bandwidth under random loss — the rate samples
-across recovery have inflated intervals, the windowed-max BtlBw decays as the clean samples age
-out, pacing drops, in-flight falls below the dup-ACK threshold for fast retransmit, and the flow
-spirals into RTO-based recovery (≈200 RTOs on an 8 MiB transfer at 0.5% loss). This is the
-documented BBRv1 random-loss weakness amplified by the estimator; the fix (loss-robust BtlBw +
-the BBRv1 recovery/restart cwnd states, of which packet conservation is the first piece) is the
-active congestion-control task.
+**BBR under random loss is a known, precisely-diagnosed limitation.** BBR v1 is loss-agnostic by
+design, so it keeps sending new data through a loss episode until its whole send buffer (≈ the BDP
+on this path) is in flight. Under random loss that accumulates **more simultaneous holes than our
+4-block SACK option can report**: the unreported holes are invisible to the sender, so the RFC 6675
+scoreboard returns `NextSeg = None` (nothing it can see to retransmit) while `snd_una` is wedged
+*behind* those holes — and recovery degrades to **one-segment-per-RTO go-back-N** (≈180 RTOs to
+drain a 256 KiB window at 0.5% loss; traced directly: `flight == TX_BUFFER`, `next_seg = None`,
+`una` advancing exactly one MSS per RTO). Reno/CUBIC sidestep this by cutting cwnd on the first loss
+— they stop filling and keep the live hole count within SACK's capacity. The fix is a **BBRv2-style
+loss response co-designed with the SACK recovery** — bound the in-flight during a loss episode so
+the hole count stays reportable, and let it drain — carefully tested against the reviewed recovery
+paths; this is the active congestion-control task. Two pieces were prototyped this session (packet
+conservation; BBRv1 incremental cwnd growth) but are insufficient alone, because the sender keeps
+emitting new data past the *invisible* holes — the in-flight bound is the load-bearing part.
 
 ### 5.6 Async runtime (`runtime`) — M4
 

@@ -115,10 +115,13 @@ the *window*, not the CPU, is the bottleneck (MB/s, medians of 3):
 At **0% loss** BBR leads by ~40%: pacing to the BDP fills a short high-RTT flow faster than
 Reno/CUBIC's slow-start ramp. **Under loss**, Reno collapses (multiplicative decrease, costly at
 20 ms RTT) and CUBIC's gentler β = 0.7 cut holds marginally better. † **BBR under random loss is a
-known limitation:** BBR v1 is loss-*agnostic* by design and should excel here, but the from-scratch
-delivery-rate estimator under-measures bandwidth under random loss and spirals into RTO-based
-recovery — the documented BBRv1 random-loss weakness, amplified. Making BBR robust under random loss
-is the next congestion-control task. At **sub-millisecond RTT** (no shaping, CPU-bound) the ranking
+known, precisely-diagnosed limitation:** BBR v1 is loss-*agnostic*, so it keeps filling until its
+whole send buffer (≈ the BDP) is in flight — which accumulates more simultaneous holes than the
+4-block SACK option can report, so the unreported holes wedge `snd_una` and recovery degrades to
+one-segment-per-RTO go-back-N. Reno/CUBIC sidestep it by cutting cwnd on the first loss. The fix is
+a BBRv2-style loss response that bounds the in-flight during a loss episode (so holes stay
+reportable), co-designed with the SACK recovery — the active congestion-control task (see
+`docs/DESIGN.md`). At **sub-millisecond RTT** (no shaping, CPU-bound) the ranking
 inverts: Reno's aggressive window (~111 MB/s) beats BBR's pacing (~80 MB/s), which carries overhead
 at a tiny BDP. The honest takeaway is the *bottleneck story* — at high BDP the model wins, under
 loss the loss-based controllers are more robust in this build, and at tiny BDP window aggression
@@ -239,10 +242,11 @@ The big milestones are done — active open, SACK loss recovery, MTU-adaptive MS
 RFC 7323 timestamps, delayed ACKs, an io_uring backend, and **pluggable Reno/CUBIC/BBR congestion
 control** measured head-to-head over the two-instance hardware bench. What's left:
 
-- **BBR robustness under random loss** — BBR leads at 0% loss but its from-scratch delivery-rate
-  estimator under-measures bandwidth under random loss and falls into RTO-based recovery (the known
-  BBRv1 random-loss weakness). Loss-robust BtlBw estimation (and the BBRv1 recovery/restart cwnd
-  states) is the active congestion-control task; the diagnosis is in `docs/DESIGN.md`.
+- **BBR robustness under random loss** — BBR leads at 0% loss but, being loss-agnostic, fills its
+  whole send buffer and accumulates more holes than the 4-block SACK can report, wedging recovery
+  into one-segment-per-RTO go-back-N. A BBRv2-style loss response that bounds the in-flight during a
+  loss episode (co-designed with the SACK recovery) is the active congestion-control task; the full
+  diagnosis is in `docs/DESIGN.md`.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
 - **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, ECN (RFC 3168), TCP Fast
   Open, keepalives, Nagle — the details that separate "a TCP" from "real TCP".
