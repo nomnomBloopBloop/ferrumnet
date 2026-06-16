@@ -30,9 +30,9 @@ $ curl -v http://10.0.0.2:8080/
   received bytes and emits bytes to send, with time injected as a parameter. So the whole
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
-  selective recovery, and a **two-stack userspace loopback** (two instances connecting to each
-  other entirely in memory). **136 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no
-  UB, no leaks, no suppression).
+  selective recovery, **pluggable congestion control** (Reno / CUBIC / BBR), and a **two-stack
+  userspace loopback** (two instances connecting to each other entirely in memory). **160 tests**,
+  green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -95,6 +95,35 @@ repair** (RFC 2018 + RFC 6675) recovers the tail far faster than go-back-N:
 (MB/s, medians; ~4–10× faster across the tail. Loss is stochastic — the 2% cell is bimodal,
 splitting between ~6–14 and ~70–78 MB/s depending on where losses fall.)
 
+**Congestion control — Reno vs CUBIC vs BBR.** The controller is **pluggable**: a
+`CongestionControl` trait behind a match-dispatched `Cc` enum (no `Box<dyn>`, zero-alloc, sans-IO),
+selectable at runtime with `FERRUM_CC={reno,cubic,bbr}`. All three are hand-written from the RFCs —
+**Reno** (RFC 5681), **CUBIC** (RFC 8312, the Linux default: cubic window growth + the TCP-friendly
+region), and **BBR** v1 (model-based — it estimates bottleneck bandwidth and min-RTT and *paces* to
+the bandwidth-delay product instead of reacting to loss, with a full STARTUP→DRAIN→PROBE_BW→PROBE_RTT
+state machine and a Cheng/Cardwell delivery-rate estimator). The sans-IO core makes every phase
+deterministically unit-testable off-device. Measured over the two-instance bench (one stack
+downloads 8 MiB from another across two kernel-forwarded TUNs) at a `netem`-imposed **20 ms RTT** so
+the *window*, not the CPU, is the bottleneck (MB/s, medians of 3):
+
+| 20 ms RTT | 0% loss | 0.5% | 1% | 2% |
+|---|---|---|---|---|
+| Reno    | 7.6 | 1.1 | 0.7 | 0.5 |
+| CUBIC   | 7.2 | 1.1 | 0.9 | 0.5 |
+| **BBR** | **10.5** | †  | † | † |
+
+At **0% loss** BBR leads by ~40%: pacing to the BDP fills a short high-RTT flow faster than
+Reno/CUBIC's slow-start ramp. **Under loss**, Reno collapses (multiplicative decrease, costly at
+20 ms RTT) and CUBIC's gentler β = 0.7 cut holds marginally better. † **BBR under random loss is a
+known limitation:** BBR v1 is loss-*agnostic* by design and should excel here, but the from-scratch
+delivery-rate estimator under-measures bandwidth under random loss and spirals into RTO-based
+recovery — the documented BBRv1 random-loss weakness, amplified. Making BBR robust under random loss
+is the next congestion-control task. At **sub-millisecond RTT** (no shaping, CPU-bound) the ranking
+inverts: Reno's aggressive window (~111 MB/s) beats BBR's pacing (~80 MB/s), which carries overhead
+at a tiny BDP. The honest takeaway is the *bottleneck story* — at high BDP the model wins, under
+loss the loss-based controllers are more robust in this build, and at tiny BDP window aggression
+wins.
+
 **Kernel baseline** (Python `http.server` over `lo`, kernel TCP, 16 MiB): median **~800 MB/s**
 (556–893). *Not* apples-to-apples — `lo`'s MTU is 65536 and it is fully in-kernel (no per-packet
 syscall or user/kernel copy), so it is structurally faster on this path. Matching the MTU closes
@@ -115,7 +144,7 @@ neither beats in-kernel loopback, which has neither a per-packet syscall nor a u
   │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream / TcpConnector│
   │    Stack  →  TCB per connection (active + passive open)                            │
   │      wire (parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)            │
-  │      rtt (RFC 6298) · congestion (Reno) · sack + reasm (RFC 2018/6675)             │
+  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR (pluggable) · sack+reasm (2018/6675)│
   │      timestamps (RFC 7323) · delayed ACKs (RFC 1122) · buffers · timers            │
   └────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -141,8 +170,9 @@ and wakes the async tasks.
    Karn RTO estimation (RFC 6298), SACK-based selective loss recovery with out-of-order
    reassembly (RFC 2018 + RFC 6675), RFC 7323 **timestamps** (Karn-free RTT + PAWS), and **delayed
    ACKs** (RFC 1122). (`tcb`, `rtt`, `sack`, `reasm`)
-3. **Congestion control** — TCP Reno: slow start, congestion avoidance, fast retransmit on 3
-   duplicate ACKs (RFC 5681 + 6928). (`congestion`)
+3. **Congestion control** — **pluggable** behind a `CongestionControl` trait + match-dispatched
+   `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312), and **BBR** v1
+   (model-based, paced to the BDP). Selectable with `FERRUM_CC`. (`congestion`, `bbr`)
 4. **Zero-copy parsing** — header views over `&[u8]` and the one's-complement Internet checksum
    (RFC 1071), with a clean RX/TX borrow split. (`wire`)
 5. **Async integration** — the `Waker` lifecycle over the sans-IO core, built on the safe
@@ -183,8 +213,9 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 136 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 160 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
+                            #            + CUBIC + BBR (rate sampler, windowed filter, phases)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -205,26 +236,28 @@ IP forwarding, so it is safe to run alongside other services.
 ## Roadmap
 
 The big milestones are done — active open, SACK loss recovery, MTU-adaptive MSS, window scaling,
-RFC 7323 timestamps, delayed ACKs, and an io_uring backend. What's left is the hot loop and a
-hardware measurement:
+RFC 7323 timestamps, delayed ACKs, an io_uring backend, and **pluggable Reno/CUBIC/BBR congestion
+control** measured head-to-head over the two-instance hardware bench. What's left:
 
-- **A transmit scratch ring + folded/SIMD checksum** — remove the one heap allocation per emitted
-  segment and tighten the checksum. Worthwhile now that io_uring has made the I/O cheaper; a
-  marginal lever otherwise (match-MTU and io_uring are the larger ones).
-- **A two-instance measurement over a real TUN** — the two-stack loopback already proves window
-  scaling *in memory* (>64 KiB in flight with two fast peers); running two instances over the wire
-  would measure the compounding on hardware (needs IP forwarding + a second TUN, beyond the current
-  single-device footprint).
+- **BBR robustness under random loss** — BBR leads at 0% loss but its from-scratch delivery-rate
+  estimator under-measures bandwidth under random loss and falls into RTO-based recovery (the known
+  BBRv1 random-loss weakness). Loss-robust BtlBw estimation (and the BBRv1 recovery/restart cwnd
+  states) is the active congestion-control task; the diagnosis is in `docs/DESIGN.md`.
+- **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
+- **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, ECN (RFC 3168), TCP Fast
+  Open, keepalives, Nagle — the details that separate "a TCP" from "real TCP".
 
 Deliberately *not* on the roadmap: AF_XDP / DPDK / RDMA (a different kind of project — RDMA replaces
 the TCP stack rather than speeding it) and multi-threading (single-threaded by design; an
 `Arc<Mutex>` variant is the documented extension). Nothing in the codebase is stubbed — every code
-path that exists is complete and tested.
+path that exists is complete and tested; BBR's random-loss behaviour is a measured limitation of a
+complete implementation, not a stub.
 
 ## References
 
 RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP + host requirements, incl. delayed ACKs), RFC 1071
-(checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (congestion control), RFC 6298 (RTO),
+(checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (Reno + initial window), RFC 8312 (CUBIC),
+the BBR congestion-control draft + Cheng/Cardwell delivery-rate estimation, RFC 6298 (RTO),
 RFC 2018 + 6675 (SACK & selective recovery), RFC 7323 (timestamps & window scaling), RFC 5961 +
 6528 (blind-attack hardening); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built milestone by
 milestone; see [`docs/DESIGN.md`](docs/DESIGN.md).

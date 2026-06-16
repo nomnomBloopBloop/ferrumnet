@@ -68,7 +68,8 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
                reliability, flow control, teardown, per-connection timers, SACK recovery,
                active open (SYN-SENT), RFC 7323 timestamps + PAWS, delayed ACKs
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
-  congestion   TCP Reno controller                                     [M3]
+  congestion   pluggable CongestionControl trait + Cc enum: Reno, CUBIC  [M3,M13]
+  bbr          BBR v1: delivery-rate sampler + windowed-max + state machine [M13]
   buffers      rx/tx ring buffers                                       [M2]
   reasm        receiver out-of-order reassembly (coalesced runs)        [M8]
   sack         sender SACK scoreboard + RFC 6675 predicates             [M8]
@@ -173,9 +174,14 @@ RTO per RFC 6298 with Jacobson's estimator and Karn's amendment. Verified traps:
   contract is mandatory — it is the lost-wakeup guard for delayed-ACK and zero-window probes.
   (`retx/T7,N5,N6,X6`)
 
-### 5.5 Congestion control (`congestion`) — M3
+### 5.5 Congestion control (`congestion`, `bbr`) — M3, M13
 
-TCP Reno, everything in **bytes**. Verified traps:
+Congestion control is **pluggable**: a `CongestionControl` trait, held by the TCB in a
+match-dispatched `Cc` enum (`Reno`/`Cubic`/`Bbr`) — **not `Box<dyn>`**, so the send path stays
+zero-alloc and the engine stays sans-IO. Every event method takes the current `Instant` (a
+time-based controller needs the clock; Reno ignores it). Selectable with `FERRUM_CC`.
+
+**Reno** (RFC 5681 + 6928), everything in **bytes**. Verified traps:
 
 - Congestion avoidance counts **bytes acked** with a `while` loop
   (`ca_acc += acked; while ca_acc >= cwnd { ca_acc -= cwnd; cwnd += mss }`). The naive
@@ -189,6 +195,40 @@ TCP Reno, everything in **bytes**. Verified traps:
 - The load-bearing send gate lives *inside* the tested module:
   `allowed_to_send = min(cwnd, rwnd).saturating_sub(snd_nxt − snd_una)`, unit-tested across a
   2³² wrap. The zero-window probe bypasses cwnd. (`congestion/X5,T4`)
+
+**CUBIC** (RFC 8312, the Linux default). Window growth is a cubic of the time since the last loss:
+`W_cubic(t) = C·(t − K)³ + W_max`, concave back toward `W_max` then convex past it — which is why
+the trait threads `now`. A gentler `β = 0.7` multiplicative decrease (vs Reno's 0.5), fast
+convergence, and a **TCP-friendly region** that floors growth at a Reno-with-β AIMD so CUBIC never
+loses to standard TCP on a low-BDP path. Kept sans-IO/Miri-clean: the curve is `f64` in segments
+(cwnd stays bytes) and the cube root is a hand-rolled Newton iteration — **no `cbrt`/`powf`
+intrinsics**. One documented simplification: the window is evaluated at `t`, not the RFC's `t+RTT`
+(the TCP-friendly floor covers the growth). Unit tests pin the curve through the post-loss window
+at `t=0` and `W_max` at `t=K`, the β cut, fast convergence, and the friendly floor.
+
+**BBR** v1 (`bbr`), model-based. It estimates **bottleneck bandwidth** (a windowed-max of the
+delivery rate over ~10 round trips, Nichols' `win_minmax`) and **RTprop** (decaying min-RTT) and
+**paces** to `pacing_gain · BtlBw`, holding `cwnd = cwnd_gain · BDP` as a cap. Three testable
+pieces — a Cheng/Cardwell delivery-rate sampler (a FIFO of per-segment send records turned into a
+rate sample on each ACK), the windowed-max filter, and the STARTUP→DRAIN→PROBE_BW→PROBE_RTT state
+machine — each a deterministic function of the model. The trait grew three no-op-default hooks
+(`pacing_rate`, `on_transmit`, `on_ack_sample`) so Reno/CUBIC stay byte-identical, and the tx path
+gained a **token-bucket pacing gate** (with `pace_deadline` in `poll_at`) that is inert unless
+`pacing_rate()` is `Some`. An adversarial review caught one real bug here — PROBE_RTT was
+unreachable on a steady path because the min-RTT refresh consumed the same staleness signal the
+trigger needed (fixed Linux-style: compute the expiry once, use it for both).
+
+**Measured comparison** (two-instance bench, 8 MiB, 20 ms RTT, MB/s medians): at 0% loss BBR leads
+(**10.5** vs Reno 7.6, CUBIC 7.2) — pacing to the BDP fills a short high-RTT flow faster than
+slow-start. Under random loss Reno collapses and CUBIC's gentler cut holds marginally better.
+**BBR under random loss is a known limitation:** v1 is loss-agnostic and should excel, but the
+from-scratch delivery-rate estimator under-measures bandwidth under random loss — the rate samples
+across recovery have inflated intervals, the windowed-max BtlBw decays as the clean samples age
+out, pacing drops, in-flight falls below the dup-ACK threshold for fast retransmit, and the flow
+spirals into RTO-based recovery (≈200 RTOs on an 8 MiB transfer at 0.5% loss). This is the
+documented BBRv1 random-loss weakness amplified by the estimator; the fix (loss-robust BtlBw +
+the BBRv1 recovery/restart cwnd states, of which packet conservation is the first piece) is the
+active congestion-control task.
 
 ### 5.6 Async runtime (`runtime`) — M4
 
