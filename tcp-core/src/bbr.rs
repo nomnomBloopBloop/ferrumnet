@@ -23,6 +23,21 @@
 //! path is a token bucket rather than a per-packet timer. Everything is **std-only** — the rates
 //! and gains use `f64` arithmetic with no transcendental intrinsics, so the controller stays
 //! deterministic and clean under Miri.
+//!
+//! **Under-loss throughput (the BBRv2 inflight bounds).** Pure BBRv1 is loss-agnostic, so on a path
+//! with steady random (non-congestive) loss it kept refilling its whole send buffer (≈ the BDP) and
+//! piled up more simultaneous holes than the 4-block SACK option can report; the unreported holes
+//! were invisible to the sender, so RFC 6675 `NextSeg` returned `None` and recovery degraded to
+//! one-segment-per-RTO go-back-N — a death spiral. The first fix held the recovery window at a fixed
+//! `pipe + 3·MSS`: robust (it always completes) but slow, because it throttles *new* data to three
+//! segments however light the loss. This module now closes that gap with the BBRv2 **inflight
+//! bounds** ([`Bbr::inflight_hi`] / [`Bbr::inflight_lo`]): an AIMD pair that caps total inflight and
+//! adapts the recovery headroom to the path. A loss signal cuts them multiplicatively; clean rounds
+//! probe them back up one segment at a time. So on a lightly-lossy path BBR re-opens the window and
+//! reclaims throughput, while on a heavily-lossy one the bounds stay tight and it does not out-run
+//! the SACK budget — without ever violating the hard invariant that `cwnd > pipe` during recovery
+//! (the floor stays `pipe + 3·MSS`). An **ACK-aggregation** estimate ([`Bbr::extra_acked`]) adds
+//! the window slack a stretch/aggregated ACK train needs to keep the pipe full.
 
 use std::collections::VecDeque;
 
@@ -53,6 +68,25 @@ const PROBE_RTT_DURATION_US: u64 = 200_000;
 const BTLBW_WINDOW_ROUNDS: u64 = 10;
 /// Floor on cwnd and on the PROBE_RTT window, in segments.
 const MIN_CWND_SEGS: u32 = 4;
+/// Robust recovery headroom above the RFC 6675 `pipe`, in segments — the floor that keeps
+/// `cwnd > pipe` so the selective retransmit always fires while a loss is repaired. (Measured
+/// tuning: 3·MSS completes at every loss level; 8·/16·MSS re-accumulate holes and time out — see
+/// the module docs on the inflight bounds.) Above this floor the headroom grows *adaptively* via
+/// the BBRv2 [`Bbr::inflight_lo`]/[`Bbr::inflight_hi`] bounds.
+const RECOVERY_HEADROOM_SEGS: u32 = 3;
+/// Multiplicative-decrease factor applied to [`Bbr::inflight_lo`] on each loss episode: the
+/// short-term inflight bound drops to `(1 − BETA)` of its prior value. Set to a **reno-like 0.5**
+/// (a halving) on purpose. A gentler cut lets the window climb to ≈½·BDP between losses, where —
+/// with only a 4-block SACK option — a single unlucky burst piles up >4 simultaneous holes, SACK
+/// goes blind, and recovery wedges into one-segment-per-RTO go-back-N for the rest of the transfer
+/// (a *sticky* collapse to ~0.2 MB/s). Reno/CUBIC avoid that by keeping a small window; halving on
+/// every loss makes BBR's bound converge to the same small reno-style operating point (~14 segments
+/// at 1 % loss, ~20 at 0.5 %), so it stays SACK-visible and tracks reno/CUBIC instead of wedging.
+const INFLIGHT_LO_BETA: f64 = 0.5;
+/// The survivor fraction of peak inflight used when a bound is first activated, and when an RTO
+/// re-cuts it: a reno-like halving — the proven-robust operating point — the same fraction the
+/// per-episode decrease uses.
+const INFLIGHT_HARD_KEEP: f64 = 0.5;
 
 // ── delivery-rate estimator ───────────────────────────────────────────────────────────────────
 
@@ -298,6 +332,38 @@ pub struct Bbr {
     probe_rtt_done_stamp: Option<Instant>,
     prior_cwnd: u32,
 
+    // ── BBRv2 inflight bounds (under-loss throughput) ───────────────────────────────────────────
+    /// Long-term inflight ceiling (bytes): the largest inflight the path has sustained without
+    /// excessive loss. `u32::MAX` until the first loss bounds it. Cut (gently) on a loss round,
+    /// raised one segment per clean round; caps cwnd in *all* phases, so after a loss BBR rebuilds
+    /// toward — not straight past — the level the path was last shown to hold.
+    inflight_hi: u32,
+    /// Short-term inflight bound (bytes): the AIMD reaction to recent loss, and the knob that sets
+    /// the adaptive recovery headroom. `u32::MAX` while cruising clean (inactive). Cut
+    /// multiplicatively the instant a loss episode starts and on RTO, raised one segment per clean
+    /// (non-recovery) round, released back to `MAX` once it overtakes `inflight_hi`.
+    inflight_lo: u32,
+    /// A loss has been signalled (recovery entry / 3rd dup-ACK / RTO) since the current round began.
+    loss_in_round: bool,
+    /// Whether the previous `on_ack_sample` observed recovery in progress — for detecting the rising
+    /// edge of a loss episode (the immediate-cut trigger).
+    was_in_recovery: bool,
+    /// Maximum raw inflight (bytes) seen during the current round — the level the loss cut shrinks
+    /// from when the bounds are first activated.
+    inflight_latest: u32,
+
+    // ── ACK aggregation (extra_acked) ───────────────────────────────────────────────────────────
+    /// Windowed-max of the per-epoch ACK-aggregation excess, over the BtlBw round window.
+    extra_acked_filter: WindowedMax,
+    /// Cached `extra_acked_filter` value (bytes): how much more than the bottleneck rate predicts a
+    /// burst of ACKs has delivered, added to the cwnd target so a stretch/aggregated ACK train does
+    /// not starve the pipe.
+    extra_acked: u32,
+    /// Start of the current ACK-aggregation measurement epoch.
+    ack_epoch_stamp: Instant,
+    /// Bytes cumulatively acknowledged since `ack_epoch_stamp`.
+    ack_epoch_acked: u64,
+
     /// Duplicate-ACK count, for triggering fast retransmit only — BBR never cuts its model on loss.
     dup_acks: u8,
 }
@@ -327,6 +393,15 @@ impl Bbr {
             cycle_stamp: Instant::ZERO,
             probe_rtt_done_stamp: None,
             prior_cwnd: 0,
+            inflight_hi: u32::MAX,
+            inflight_lo: u32::MAX,
+            loss_in_round: false,
+            was_in_recovery: false,
+            inflight_latest: 0,
+            extra_acked_filter: WindowedMax::new(BTLBW_WINDOW_ROUNDS),
+            extra_acked: 0,
+            ack_epoch_stamp: Instant::ZERO,
+            ack_epoch_acked: 0,
             dup_acks: 0,
         }
     }
@@ -440,6 +515,67 @@ impl Bbr {
         }
     }
 
+    /// Halve the short-term inflight bound on a loss episode (the reno-like multiplicative decrease,
+    /// `INFLIGHT_LO_BETA`). The first activation drops to half the peak inflight; thereafter each loss
+    /// halves the current bound, so under sustained loss it converges to the same small,
+    /// SACK-visible window reno/CUBIC use (rather than climbing to the wedge-prone ≈½·BDP). The
+    /// long-term ceiling `inflight_hi` is touched only by an RTO (the severe signal), so on a path
+    /// whose losses are all SACK-repaired it stays inactive and `inflight_lo` alone binds.
+    fn cut_inflight_bounds(&mut self) {
+        let floor = self.min_cwnd();
+        let latest = self.inflight_latest.max(floor);
+        self.inflight_lo = if self.inflight_lo == u32::MAX {
+            ((latest as f64 * INFLIGHT_HARD_KEEP) as u32).max(floor)
+        } else {
+            ((self.inflight_lo as f64 * (1.0 - INFLIGHT_LO_BETA)) as u32).max(floor)
+        };
+    }
+
+    /// Probe the inflight bounds back up one segment per round (the AIMD additive increase), like
+    /// reno's congestion avoidance. Run once per round BETWEEN loss episodes (the caller gates it on
+    /// `!in_recovery`); never during a repair, where the extra in-flight data would feed the wedge.
+    /// The long-term ceiling (activated only by an RTO) climbs the same way; the short-term bound is
+    /// released to `MAX` once it overtakes the ceiling, so cwnd reverts to the model target after loss
+    /// subsides.
+    fn raise_inflight_bounds(&mut self) {
+        if self.inflight_hi != u32::MAX {
+            self.inflight_hi = self.inflight_hi.saturating_add(self.mss);
+        }
+        if self.inflight_lo != u32::MAX {
+            self.inflight_lo = self.inflight_lo.saturating_add(self.mss);
+            if self.inflight_lo >= self.inflight_hi {
+                self.inflight_lo = u32::MAX;
+            }
+        }
+    }
+
+    /// ACK-aggregation estimator (draft-cardwell-iccrg-bbr, `bbr_update_ack_aggregation`). Over a
+    /// measurement epoch it compares the bytes actually acknowledged against what the bottleneck
+    /// rate predicts; the windowed-max of the excess across the BtlBw round window is `extra_acked`,
+    /// added to the cwnd target. This compensates for stretched/aggregated ACKs (delayed-ACK trains,
+    /// bursty arrival): without it the window would size to the smooth rate and starve the pipe each
+    /// time several ACKs land together. The epoch restarts whenever the ACK rate falls back to the
+    /// bottleneck rate, so the excess is measured per burst rather than accumulated forever.
+    fn update_ack_aggregation(&mut self, now: Instant, acked: u32) {
+        if self.btlbw == 0 || acked == 0 {
+            return;
+        }
+        let epoch_us = now.saturating_micros_since(self.ack_epoch_stamp);
+        let mut expected = self.btlbw.saturating_mul(epoch_us) / 1_000_000;
+        if self.ack_epoch_acked <= expected {
+            self.ack_epoch_acked = 0;
+            self.ack_epoch_stamp = now;
+            expected = 0;
+        }
+        self.ack_epoch_acked = self.ack_epoch_acked.saturating_add(acked as u64);
+        // Cap the excess at the BDP so a stale epoch can't inflate the window without bound.
+        let extra = self
+            .ack_epoch_acked
+            .saturating_sub(expected)
+            .min(self.bdp().max(self.min_cwnd() as u64));
+        self.extra_acked = self.extra_acked_filter.update(self.round_count, extra).min(u32::MAX as u64) as u32;
+    }
+
     fn set_pacing_and_cwnd(&mut self, acked: u32, pipe: u32, in_recovery: bool) {
         if self.btlbw == 0 || self.min_rtt_us == u32::MAX {
             // Not enough model yet: stay at the initial window and send unpaced (cwnd-limited).
@@ -448,24 +584,38 @@ impl Bbr {
         }
         self.pacing_rate = (self.btlbw as f64 * self.pacing_gain) as u64;
         let min_cwnd = self.min_cwnd() as u64;
-        let target = ((self.bdp() as f64 * self.cwnd_gain) as u64).max(min_cwnd);
+        // The model target: ~cwnd_gain·BDP, plus the ACK-aggregation slack so a burst of ACKs does
+        // not starve the pipe. The aggregation slack is only applied once the pipe is full (as
+        // upstream BBR does): during STARTUP the doubling delivery rate registers as "aggregation",
+        // and adding it there would inflate an already-aggressive ramp.
+        let extra = if self.filled_pipe { self.extra_acked as u64 } else { 0 };
+        let target = ((self.bdp() as f64 * self.cwnd_gain) as u64 + extra).max(min_cwnd);
+        // The BBRv2 inflight bounds cap total inflight so a lossy path settles at a tolerable
+        // headroom instead of re-bursting the whole BDP into the loss. Inactive (`MAX`) on a clean
+        // path, so this is a no-op there and the 0 %-loss behaviour is unchanged.
+        let bound = (self.inflight_hi as u64).min(self.inflight_lo as u64);
         let cwnd = if in_recovery {
             // BBRv2-style loss response. BBR v1 ignores loss and would refill its whole window,
             // burying SND.UNA behind more simultaneous holes than the 4-block SACK option can report
-            // — recovery then wedges into one-segment-per-RTO go-back-N. Instead, while a loss is
-            // being repaired hold cwnd just ABOVE the RFC 6675 `pipe` estimate (by a few segments):
-            // that keeps `cwnd > pipe` so the selective retransmit still fires, while throttling
-            // *new* data to a trickle (the send gate is `cwnd − pipe`), so recovery drains the holes
-            // instead of adding to them. This tracks `pipe`, NOT the BDP `target`: clamping down to
-            // target would let cwnd fall to/below pipe whenever pipe ≥ target (reachable at recovery
-            // entry under bursty loss, or after a BtlBw re-measure shrank target), closing both send
-            // gates and re-wedging into the very RTO death-spiral this response removes.
-            (pipe as u64 + 3 * self.mss as u64).max(min_cwnd)
+            // — recovery then wedges into one-segment-per-RTO go-back-N. Instead BBR operates at the
+            // adaptive inflight bound `min(inflight_lo, inflight_hi)`: a PERSISTENT, reno-like window
+            // (gently trimmed per SACK-recovered episode, probed back up every round, cut hard only on
+            // an RTO) — NOT a per-episode reset to the floor, which is what pinned throughput at the
+            // crawl. The send gate `cwnd − pipe` for new data is therefore as wide as that bound minus
+            // the in-flight estimate, so a 1 %-loss flow can keep the pipe reasonably full instead of
+            // trickling three segments. Floored at `pipe + 3·MSS`: that floor is the hard invariant —
+            // `cwnd > pipe` so the selective retransmit always fires — and it is what makes the bound
+            // safe to keep high, since at recovery entry (pipe ≈ full inflight) the floor dominates
+            // and the bound only opens up as holes get SACKed and `pipe` drops. We never clamp DOWN to
+            // the `target`/bound when it is ≤ pipe — that would close both send gates and re-wedge.
+            let floor = pipe as u64 + RECOVERY_HEADROOM_SEGS as u64 * self.mss as u64;
+            target.min(bound).max(floor).max(min_cwnd)
         } else {
-            // GROW toward the model target by what this ACK delivered — never JUMP to it. After a
+            // GROW toward the bounded target by what this ACK delivered — never JUMP to it. After a
             // collapse (an RTO sets cwnd to one segment) this rebuilds gradually instead of
-            // re-bursting the whole BDP straight into the next loss.
-            (self.cwnd as u64 + acked as u64).min(target).max(min_cwnd)
+            // re-bursting the whole BDP straight into the next loss; the inflight bound keeps the
+            // rebuild from overshooting the level the path was last shown to hold.
+            (self.cwnd as u64 + acked as u64).min(target.min(bound)).max(min_cwnd)
         };
         // PROBE_RTT drains to a minimal window to re-read RTprop — but NOT while a loss is being
         // repaired: forcing cwnd to min_cwnd there would drop it below `pipe` and wedge recovery (the
@@ -497,23 +647,40 @@ impl CongestionControl for Bbr {
     }
 
     fn on_dup_ack(&mut self, _now: Instant, _flight_size: u32) -> bool {
-        // Count duplicates to trigger fast retransmit (reliability), but — unlike Reno/CUBIC — do
-        // NOT reduce the window: BBR's send rate is set by the bandwidth model, not by loss.
+        // Count duplicates to trigger fast retransmit (reliability). BBR does NOT cut its bandwidth
+        // model or window here, but it does *record* the loss so the inflight bounds pull in on the
+        // next sample (the BBRv2 lower-bound response) — the round is marked lost on the 3rd dup-ACK,
+        // the same point a non-SACK loss episode begins.
         self.dup_acks = self.dup_acks.saturating_add(1);
-        self.dup_acks == 3
+        if self.dup_acks == 3 {
+            self.loss_in_round = true;
+            true
+        } else {
+            false
+        }
     }
 
     fn enter_recovery(&mut self, _now: Instant, _flight_size: u32) {
-        // SACK declared loss early; BBR keeps its model. The TCB still repairs the hole.
+        // SACK declared loss early (RFC 6675 IsLost). BBR keeps its bandwidth model, but records the
+        // loss so the inflight bounds pull in (the rising-edge cut is applied in `on_ack_sample`).
+        self.loss_in_round = true;
     }
 
     fn on_rto(&mut self, _now: Instant, _flight_size: u32) {
-        // A timeout is the one loss signal BBR heeds: the in-flight timing is now meaningless, so
-        // drop the rate-sample records and restart from a minimal window. The bandwidth/RTT model
-        // is kept, so pacing recovers quickly once ACKs resume.
+        // A timeout is the strongest loss signal BBR heeds — a hole SACK could not repair in time, the
+        // wedge precursor. The in-flight timing is now meaningless, so drop the rate-sample records and
+        // restart from a minimal window. The bandwidth/RTT model is kept, so pacing recovers quickly
+        // once ACKs resume. Pull BOTH inflight bounds down hard (to a reno-like half of the peak in
+        // flight) and ACTIVATE the long-term ceiling, so the rebuild from one segment does not climb
+        // straight back into the loss that just timed out.
         self.sampler.reset_in_flight();
         self.cwnd = self.mss;
         self.dup_acks = 0;
+        self.loss_in_round = true;
+        let floor = self.min_cwnd();
+        let half = ((self.inflight_latest.max(floor) as f64 * INFLIGHT_HARD_KEEP) as u32).max(floor);
+        self.inflight_hi = if self.inflight_hi == u32::MAX { half } else { (self.inflight_hi / 2).max(floor) };
+        self.inflight_lo = if self.inflight_lo == u32::MAX { half } else { (self.inflight_lo / 2).max(floor) };
     }
 
     fn set_mss(&mut self, mss: u16) {
@@ -567,6 +734,38 @@ impl CongestionControl for Bbr {
         {
             self.btlbw = self.btlbw_filter.update(self.round_count, sample.delivery_rate);
         }
+
+        self.update_ack_aggregation(now, acked);
+
+        // BBRv2 inflight bounds. Track the round's peak inflight (the level a cut shrinks from).
+        self.inflight_latest = self.inflight_latest.max(inflight);
+        // First SND.UNA-advancing ACK of a fresh loss episode. (Recovery is armed on a possibly
+        // non-advancing dup-ACK / SACK-IsLost, but `on_ack_sample` only runs on advancing ACKs, so
+        // this is the earliest sample that observes it — within a fraction of an RTT, since the
+        // selective retransmit of the first hole produces an advancing ACK right away.) Trim the
+        // short-term bound here and now, so the episode operates below the level that just lost. Mark
+        // the round lossy so the round boundary below does not probe the bounds back up this round.
+        // (The other cut sites are immediate too: `on_rto` cuts directly. So the round boundary never
+        // needs to cut — it only decides whether to probe up.)
+        let entered_recovery = in_recovery && !self.was_in_recovery;
+        if entered_recovery {
+            self.cut_inflight_bounds();
+            self.loss_in_round = true;
+        }
+        if self.round_start {
+            if !self.loss_in_round && !in_recovery {
+                // Between loss episodes (not currently repairing): probe the bounds back up — the AIMD
+                // additive increase, exactly like reno's congestion avoidance. NOT during recovery:
+                // growing the window while a hole is being repaired injects fresh data on top of the
+                // existing holes, and that extra in-flight data is what tips a lightly-lossy flow over
+                // the 4-block SACK limit into the sticky one-segment-per-RTO wedge. Freezing the bound
+                // during recovery (like reno freezes cwnd at ssthresh) is what keeps BBR SACK-visible.
+                self.raise_inflight_bounds();
+            }
+            self.loss_in_round = false;
+            self.inflight_latest = inflight; // reset the round's peak
+        }
+        self.was_in_recovery = in_recovery;
 
         self.update_mode(now, inflight, min_rtt_expired);
         self.set_pacing_and_cwnd(acked, pipe, in_recovery);
@@ -745,26 +944,165 @@ mod tests {
     }
 
     #[test]
-    fn bbr_recovery_window_tracks_pipe() {
-        // BBRv2-style loss response: while a loss is being repaired (`in_recovery`), BBR holds cwnd
-        // just above the RFC 6675 `pipe` estimate instead of jumping back to the full BDP target —
-        // that is what stops it overshooting into the loss. Crucially cwnd must stay > pipe (so the
-        // selective retransmit still fires) even when pipe is large, which is why the recovery
-        // window tracks pipe and is NOT clamped down to the (possibly smaller) BDP target.
+    fn bbr_recovery_window_is_pipe_floored_and_inflight_bounded() {
+        // BBRv2-style loss response, with the adaptive inflight bound. While a loss is being repaired
+        // (`in_recovery`), BBR caps total inflight by `inflight_lo`/`inflight_hi` instead of refilling
+        // the whole BDP — but the window is FLOORED at `pipe + 3·MSS`, the hard invariant: cwnd must
+        // stay > pipe so the selective retransmit always fires, even when pipe is large.
         let mut b = pump_startup(); // an established model (btlbw > 0, min-RTT set)
         let full = b.cwnd();
+        let mss = b.mss;
         assert!(full > 40_000, "post-startup cwnd is well above one segment, got {full}");
-        // A small pipe (most outstanding data already SACKed): cwnd tracks pipe + a few segments.
+        // Recovery entry with 40 KiB in flight: the rising-edge cut sets inflight_lo ≈ 0.7·40 KiB,
+        // so cwnd is bounded near there — well ABOVE the old fixed `pipe + 3·MSS`, the throughput win,
+        // yet still far below the un-throttled BDP target.
         b.on_transmit(Instant::from_millis(500), seq(2_000_000), 1000, 40_000, false);
         b.on_ack_sample(Instant::from_millis(520), seq(2_000_000), 40_000, 1000, 10_000, true);
         assert!(b.cwnd() > 10_000, "cwnd stays ABOVE pipe so the retransmit can fire");
-        assert!(b.cwnd() <= 10_000 + 4 * 1000, "but only by a few MSS, got {}", b.cwnd());
-        assert!(b.cwnd() < full, "and far below the un-throttled BDP target ({full})");
+        assert!(
+            b.cwnd() > 10_000 + RECOVERY_HEADROOM_SEGS * mss,
+            "the adaptive headroom now exceeds the old fixed 3·MSS floor, got {}",
+            b.cwnd()
+        );
+        assert!(b.cwnd() <= 40_000, "but capped by the inflight bound (≈0.7·40 KiB), got {}", b.cwnd());
+        assert!(b.cwnd() < full, "and below the un-throttled BDP target ({full})");
         // A LARGE pipe (recovery entry, little SACKed): cwnd must STILL exceed pipe, not collapse to
-        // the BDP target below it (the wedge bug the review caught).
+        // the BDP target or the inflight bound below it (the wedge bug the review caught twice).
         b.on_transmit(Instant::from_millis(540), seq(3_000_000), 1000, 40_000, false);
         b.on_ack_sample(Instant::from_millis(560), seq(3_000_000), 40_000, 1000, 200_000, true);
         assert!(b.cwnd() > 200_000, "cwnd > pipe even when pipe exceeds the BDP target, got {}", b.cwnd());
+    }
+
+    #[test]
+    fn bbr_inflight_bounds_inactive_without_loss() {
+        // The whole inflight-bound machinery must stay dormant on a clean path: with no loss signal
+        // ever, both bounds stay at MAX (the `bound` is then non-binding), so the 0 %-loss window
+        // computation is the pure model target — unchanged from before this feature.
+        let b = pump_startup();
+        assert_eq!(b.inflight_hi, u32::MAX, "no loss ⇒ the long-term ceiling never activates");
+        assert_eq!(b.inflight_lo, u32::MAX, "no loss ⇒ the short-term bound never activates");
+        assert!(!b.was_in_recovery, "no recovery was ever entered");
+    }
+
+    #[test]
+    fn bbr_inflight_bounds_aimd_cut_then_probe_up() {
+        // The AIMD dynamics in isolation: the FIRST loss activates inflight_lo at a reno-like half of
+        // the peak inflight; subsequent non-loss rounds probe it back up additively. This is the
+        // equilibrium-finder that lets a lightly-lossy path reclaim headroom while loss keeps it tight.
+        let mut b = pump_startup();
+        // Force the inflight peak this round, then signal a loss episode (rising edge of recovery).
+        b.inflight_latest = 60_000;
+        b.on_transmit(Instant::from_millis(600), seq(4_000_000), 1000, 60_000, false);
+        b.on_ack_sample(Instant::from_millis(620), seq(4_000_000), 60_000, 1000, 30_000, true);
+        let after_cut = b.inflight_lo;
+        assert!(after_cut != u32::MAX, "the loss activated the short-term bound");
+        assert_eq!(after_cut, 30_000, "first activation drops to a reno-like half of the 60 KiB peak");
+        // Now feed clean, non-recovery rounds; each round boundary probes inflight_lo up by one MSS.
+        let mut t = 700u64;
+        let mut nxt = 4_000_000u32;
+        let mut una = 4_000_000u32;
+        let mut raised = false;
+        for _ in 0..40 {
+            let burst = 8000u32;
+            let inflight_before = nxt.wrapping_sub(una);
+            let mut sent = 0u32;
+            while sent < burst {
+                let n = 1000u32.min(burst - sent);
+                b.on_transmit(Instant::from_millis(t), seq(nxt + n), n, inflight_before + sent, false);
+                nxt = nxt.wrapping_add(n);
+                sent += n;
+            }
+            t += 20;
+            una = nxt;
+            b.on_ack_sample(Instant::from_millis(t), seq(una), 0, burst, 0, false);
+            if b.inflight_lo == u32::MAX || b.inflight_lo > after_cut {
+                raised = true; // grew back (or was released once it overtook the ceiling)
+                break;
+            }
+        }
+        assert!(raised, "clean rounds probe the short-term bound back up (additive increase)");
+    }
+
+    #[test]
+    fn bbr_under_steady_loss_holds_invariant_and_keeps_headroom() {
+        // The end-to-end property the VPS bench measures, at the controller level: under a stream of
+        // loss episodes BBR must (a) NEVER drop cwnd to or below pipe (the invariant — else recovery
+        // wedges into one-seg-per-RTO go-back-N), and (b) keep meaningful headroom for new data
+        // (more than the old fixed 3·MSS once the path proves it can hold it), while the bounds stay
+        // bounded (no runaway). We simulate a 1 %-ish loss path: each episode repairs a small pipe
+        // (most data SACKed) then briefly cruises clean.
+        let mut b = pump_startup();
+        let mss = b.mss;
+        let mut t = 1000u64;
+        let mut seqn = 5_000_000u32;
+        let mut headroom_seen_above_floor = false;
+        for episode in 0..30 {
+            // A handful of in-recovery ACKs (pipe well below inflight: the holes are being drained).
+            for k in 0..4 {
+                let pipe = 12_000u32; // small pipe: most outstanding data already SACKed
+                let inflight = 80_000u32; // a near-BDP window outstanding
+                b.on_transmit(Instant::from_millis(t), seq(seqn + 1000), 1000, inflight, false);
+                seqn = seqn.wrapping_add(1000);
+                t += 5;
+                b.on_ack_sample(Instant::from_millis(t), seq(seqn), inflight, 1000, pipe, true);
+                assert!(
+                    b.cwnd() > pipe,
+                    "invariant: cwnd ({}) must stay > pipe ({pipe}) [episode {episode}, ack {k}]",
+                    b.cwnd()
+                );
+                if b.cwnd() > pipe + RECOVERY_HEADROOM_SEGS * mss {
+                    headroom_seen_above_floor = true;
+                }
+            }
+            // A short clean stretch (recovery completed), so the bounds probe back up between losses.
+            for _ in 0..3 {
+                b.on_transmit(Instant::from_millis(t), seq(seqn + 1000), 1000, 12_000, false);
+                seqn = seqn.wrapping_add(1000);
+                t += 20;
+                b.on_ack_sample(Instant::from_millis(t), seq(seqn), 12_000, 1000, 12_000, false);
+            }
+            // The bounds never collapse below a sendable window nor run away above the model.
+            if b.inflight_lo != u32::MAX {
+                assert!(b.inflight_lo >= b.min_cwnd(), "inflight_lo never collapses below min_cwnd");
+            }
+            if b.inflight_hi != u32::MAX {
+                assert!(b.inflight_hi >= b.min_cwnd(), "inflight_hi never collapses below min_cwnd");
+            }
+        }
+        assert!(
+            headroom_seen_above_floor,
+            "under light loss the adaptive headroom exceeds the fixed 3·MSS floor (the throughput win)"
+        );
+    }
+
+    #[test]
+    fn bbr_ack_aggregation_credits_extra_acked() {
+        // A burst of ACKs that delivers more than the bottleneck rate predicts within an epoch must
+        // register as `extra_acked` (capped at the BDP), the slack added to the cwnd target so the
+        // pipe is not starved by stretched/aggregated ACKs. Drive the estimator directly with a known
+        // model: 1 MB/s over a 20 ms RTT ⇒ a 20 000-byte BDP.
+        let mut b = Bbr::new(1000);
+        b.btlbw = 1_000_000;
+        b.min_rtt_us = 20_000;
+        // Prime the aggregation epoch (the first ACK of an epoch always credits its own size).
+        b.update_ack_aggregation(Instant::from_millis(0), 1000);
+        let baseline = b.extra_acked;
+        // A large lump within the same epoch (no time elapsed): cumulative acked jumps while the
+        // expected (rate·elapsed) barely moves, so the excess spikes — clamped to the BDP.
+        b.update_ack_aggregation(Instant::from_millis(0), 30_000);
+        assert!(b.extra_acked > baseline, "a super-rate ACK burst raises extra_acked, got {}", b.extra_acked);
+        assert!(b.extra_acked <= 20_000, "but the credit is capped at the BDP, got {}", b.extra_acked);
+    }
+
+    #[test]
+    fn bbr_ack_aggregation_gated_until_pipe_full() {
+        // The measured aggregation must NOT inflate the window during STARTUP (where the doubling
+        // delivery rate itself reads as "aggregation"); upstream BBR applies it only once the pipe is
+        // full. After a short STARTUP pump the estimator has fired but the pipe is not yet declared
+        // full, so the slack stays out of the target.
+        let b = pump_startup();
+        assert!(b.extra_acked > 0, "the STARTUP ramp registers ACK aggregation, got {}", b.extra_acked);
+        assert!(!b.filled_pipe, "the pipe is not declared full yet, so the slack is gated out");
     }
 }
 

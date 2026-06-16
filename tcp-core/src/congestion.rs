@@ -455,6 +455,14 @@ pub enum CcKind {
 /// The congestion controller the TCB holds. An **enum, not `Box<dyn CongestionControl>`**: dispatch
 /// is a `match` with no vtable and no heap allocation, so the send path stays zero-alloc and the
 /// whole engine stays sans-IO.
+///
+/// The `Bbr` variant is much larger than `Reno`/`Cubic` (it carries a delivery-rate sampler, two
+/// windowed-max filters, and the BBRv2 inflight model), which trips `large_enum_variant`. We keep
+/// it inline rather than `Box`-ing it: the controller is constructed once per connection (never on
+/// the per-segment send path), so the variant size is off every hot path, and boxing would
+/// reintroduce exactly the per-connection heap allocation this enum-over-`dyn` design exists to
+/// avoid. The cost is one Bbr-sized slot per TCB — negligible for this single-host stack.
+#[allow(clippy::large_enum_variant)]
 pub enum Cc {
     Reno(Reno),
     Cubic(Cubic),
