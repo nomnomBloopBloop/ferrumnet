@@ -110,18 +110,22 @@ the *window*, not the CPU, is the bottleneck (MB/s, medians of 3):
 |---|---|---|---|---|
 | Reno    | 7.6 | 1.1 | 0.7 | 0.5 |
 | CUBIC   | 7.2 | 1.1 | 0.9 | 0.5 |
-| **BBR** | **10.5** | †  | † | † |
+| **BBR** | **10.5** | 0.2† | 0.2† | 0.2† |
 
 At **0% loss** BBR leads by ~40%: pacing to the BDP fills a short high-RTT flow faster than
 Reno/CUBIC's slow-start ramp. **Under loss**, Reno collapses (multiplicative decrease, costly at
-20 ms RTT) and CUBIC's gentler β = 0.7 cut holds marginally better. † **BBR under random loss is a
-known, precisely-diagnosed limitation:** BBR v1 is loss-*agnostic*, so it keeps filling until its
-whole send buffer (≈ the BDP) is in flight — which accumulates more simultaneous holes than the
-4-block SACK option can report, so the unreported holes wedge `snd_una` and recovery degrades to
-one-segment-per-RTO go-back-N. Reno/CUBIC sidestep it by cutting cwnd on the first loss. The fix is
-a BBRv2-style loss response that bounds the in-flight during a loss episode (so holes stay
-reportable), co-designed with the SACK recovery — the active congestion-control task (see
-`docs/DESIGN.md`). At **sub-millisecond RTT** (no shaping, CPU-bound) the ranking
+20 ms RTT) and CUBIC's gentler β = 0.7 cut holds marginally better. † **BBR under random loss is
+the deep story here.** BBR v1 is loss-*agnostic*, so it kept filling until its whole send buffer
+(≈ the BDP) was in flight — which accumulates more simultaneous holes than the 4-block SACK option
+can report, so the unreported holes wedge `snd_una` and recovery degrades to one-segment-per-RTO
+go-back-N (≈180 RTOs → timeout; traced directly). The fix (`bbr`) is a **BBRv2-style loss
+response**: while a loss is being repaired BBR holds cwnd just above the RFC 6675 `pipe` estimate
+instead of the BDP target, so the selective retransmit still fires while new data is throttled to a
+trickle and recovery drains the holes. That makes BBR **robust — it now completes at every loss
+level instead of timing out** — but slower than the loss-based controllers under loss (~0.2 MB/s,
+occasionally bursting higher). That throughput trade is the documented BBRv1 random-loss weakness,
+and exactly why BBRv2 reacts to loss. Reno/CUBIC are untouched (the loss-response hooks are no-op
+defaults). The full traced diagnosis is in `docs/DESIGN.md`. At **sub-millisecond RTT** (no shaping, CPU-bound) the ranking
 inverts: Reno's aggressive window (~111 MB/s) beats BBR's pacing (~80 MB/s), which carries overhead
 at a tiny BDP. The honest takeaway is the *bottleneck story* — at high BDP the model wins, under
 loss the loss-based controllers are more robust in this build, and at tiny BDP window aggression
@@ -242,11 +246,12 @@ The big milestones are done — active open, SACK loss recovery, MTU-adaptive MS
 RFC 7323 timestamps, delayed ACKs, an io_uring backend, and **pluggable Reno/CUBIC/BBR congestion
 control** measured head-to-head over the two-instance hardware bench. What's left:
 
-- **BBR robustness under random loss** — BBR leads at 0% loss but, being loss-agnostic, fills its
-  whole send buffer and accumulates more holes than the 4-block SACK can report, wedging recovery
-  into one-segment-per-RTO go-back-N. A BBRv2-style loss response that bounds the in-flight during a
-  loss episode (co-designed with the SACK recovery) is the active congestion-control task; the full
-  diagnosis is in `docs/DESIGN.md`.
+- **BBR throughput under random loss** — a BBRv2-style loss response (cwnd tracks the RFC 6675
+  `pipe` during recovery) now makes BBR *robust* under loss: it completes at every loss level
+  instead of timing out. But it is conservative (≈0.2 MB/s under loss, vs Reno/CUBIC ~0.5–1.1), so
+  the remaining work is recovering that throughput — BBRv2's `inflight_hi`/`inflight_lo` bounds and
+  ACK-aggregation handling — without re-entering the SACK-invisible-hole wedge. The full diagnosis
+  is in `docs/DESIGN.md`.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
 - **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, ECN (RFC 3168), TCP Fast
   Open, keepalives, Nagle — the details that separate "a TCP" from "real TCP".

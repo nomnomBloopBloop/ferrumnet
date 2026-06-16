@@ -221,20 +221,29 @@ trigger needed (fixed Linux-style: compute the expiry once, use it for both).
 **Measured comparison** (two-instance bench, 8 MiB, 20 ms RTT, MB/s medians): at 0% loss BBR leads
 (**10.5** vs Reno 7.6, CUBIC 7.2) — pacing to the BDP fills a short high-RTT flow faster than
 slow-start. Under random loss Reno collapses and CUBIC's gentler cut holds marginally better.
-**BBR under random loss is a known, precisely-diagnosed limitation.** BBR v1 is loss-agnostic by
-design, so it keeps sending new data through a loss episode until its whole send buffer (≈ the BDP
-on this path) is in flight. Under random loss that accumulates **more simultaneous holes than our
-4-block SACK option can report**: the unreported holes are invisible to the sender, so the RFC 6675
-scoreboard returns `NextSeg = None` (nothing it can see to retransmit) while `snd_una` is wedged
-*behind* those holes — and recovery degrades to **one-segment-per-RTO go-back-N** (≈180 RTOs to
-drain a 256 KiB window at 0.5% loss; traced directly: `flight == TX_BUFFER`, `next_seg = None`,
-`una` advancing exactly one MSS per RTO). Reno/CUBIC sidestep this by cutting cwnd on the first loss
-— they stop filling and keep the live hole count within SACK's capacity. The fix is a **BBRv2-style
-loss response co-designed with the SACK recovery** — bound the in-flight during a loss episode so
-the hole count stays reportable, and let it drain — carefully tested against the reviewed recovery
-paths; this is the active congestion-control task. Two pieces were prototyped this session (packet
-conservation; BBRv1 incremental cwnd growth) but are insufficient alone, because the sender keeps
-emitting new data past the *invisible* holes — the in-flight bound is the load-bearing part.
+**BBR under random loss — the diagnosis, and the BBRv2-style fix.** Pure BBR v1 is loss-agnostic, so
+it kept sending new data through a loss episode until its whole send buffer (≈ the BDP on this path)
+was in flight. Under random loss that accumulates **more simultaneous holes than our 4-block SACK
+option can report**: the unreported holes are invisible to the sender, so the RFC 6675 scoreboard
+returns `NextSeg = None` (nothing it can see to retransmit) while `snd_una` is wedged *behind* those
+holes — and recovery degrades to **one-segment-per-RTO go-back-N** (≈180 RTOs to drain a 256 KiB
+window at 0.5% loss; traced directly: `flight == TX_BUFFER`, `next_seg = None`, `una` advancing
+exactly one MSS per RTO → timeout). Reno/CUBIC sidestep this by cutting cwnd on the first loss.
+
+The fix is a **BBRv2-style loss response**, plumbed BBR-locally: `on_ack_sample` also receives the
+RFC 6675 `pipe` estimate and an `in_recovery` flag (Reno/CUBIC ignore them via the no-op default).
+While a loss is being repaired BBR holds `cwnd = pipe + 3·MSS` — tracking `pipe`, **never** the BDP
+target — so `cwnd > pipe` keeps the selective retransmit firing while the send gate (`cwnd − pipe`)
+throttles *new* data to a trickle, and recovery drains the holes instead of adding to them. (cwnd
+also now grows toward the model target by `acked` rather than jumping, so a post-RTO collapse
+rebuilds gradually.) An adversarial review caught two wedge bugs in the first cut — clamping the
+recovery window down to `target` let `cwnd ≤ pipe` when `pipe ≥ target`, and the PROBE_RTT drain
+overrode it the same way; both reintroduced the RTO wedge and are fixed (the recovery window stays
+strictly above `pipe`; the PROBE_RTT drain is deferred during recovery). Result: BBR is now **robust
+— it completes at every measured loss level** instead of the death-spiral timeout — at a throughput
+cost (≈0.2 MB/s under loss vs Reno/CUBIC ~0.5–1.1, occasionally bursting higher). That trade is the
+documented BBRv1 random-loss weakness; recovering the throughput (BBRv2's `inflight_hi`/`inflight_lo`
++ ACK-aggregation handling) is the remaining work.
 
 ### 5.6 Async runtime (`runtime`) — M4
 
