@@ -219,8 +219,9 @@ unreachable on a steady path because the min-RTT refresh consumed the same stale
 trigger needed (fixed Linux-style: compute the expiry once, use it for both).
 
 **Measured comparison** (two-instance bench, 8 MiB, 20 ms RTT, MB/s medians): at 0% loss BBR leads
-(**10.5** vs Reno 7.6, CUBIC 7.2) — pacing to the BDP fills a short high-RTT flow faster than
-slow-start. Under random loss Reno collapses and CUBIC's gentler cut holds marginally better.
+(**10.5** vs Reno 7.6, CUBIC 7.4) — pacing to the BDP fills a short high-RTT flow faster than
+slow-start. Under random loss the loss-based controllers stay ahead (Reno/CUBIC ~0.5–1.5 vs BBR
+~0.5–0.7), but BBR is now competitive and robust rather than collapsing — see below.
 **BBR under random loss — the diagnosis, and the BBRv2-style fix.** Pure BBR v1 is loss-agnostic, so
 it kept sending new data through a loss episode until its whole send buffer (≈ the BDP on this path)
 was in flight. Under random loss that accumulates **more simultaneous holes than our 4-block SACK
@@ -230,20 +231,42 @@ holes — and recovery degrades to **one-segment-per-RTO go-back-N** (≈180 RTO
 window at 0.5% loss; traced directly: `flight == TX_BUFFER`, `next_seg = None`, `una` advancing
 exactly one MSS per RTO → timeout). Reno/CUBIC sidestep this by cutting cwnd on the first loss.
 
-The fix is a **BBRv2-style loss response**, plumbed BBR-locally: `on_ack_sample` also receives the
-RFC 6675 `pipe` estimate and an `in_recovery` flag (Reno/CUBIC ignore them via the no-op default).
-While a loss is being repaired BBR holds `cwnd = pipe + 3·MSS` — tracking `pipe`, **never** the BDP
-target — so `cwnd > pipe` keeps the selective retransmit firing while the send gate (`cwnd − pipe`)
-throttles *new* data to a trickle, and recovery drains the holes instead of adding to them. (cwnd
-also now grows toward the model target by `acked` rather than jumping, so a post-RTO collapse
-rebuilds gradually.) An adversarial review caught two wedge bugs in the first cut — clamping the
-recovery window down to `target` let `cwnd ≤ pipe` when `pipe ≥ target`, and the PROBE_RTT drain
-overrode it the same way; both reintroduced the RTO wedge and are fixed (the recovery window stays
-strictly above `pipe`; the PROBE_RTT drain is deferred during recovery). Result: BBR is now **robust
-— it completes at every measured loss level** instead of the death-spiral timeout — at a throughput
-cost (≈0.2 MB/s under loss vs Reno/CUBIC ~0.5–1.1, occasionally bursting higher). That trade is the
-documented BBRv1 random-loss weakness; recovering the throughput (BBRv2's `inflight_hi`/`inflight_lo`
-+ ACK-aggregation handling) is the remaining work.
+The fix came in two parts, and the order they were tried is the interesting part.
+
+**Part 1 — BBR's window (the BBRv2 `inflight_hi`/`inflight_lo` bounds), BBR-local.** `on_ack_sample`
+also receives the RFC 6675 `pipe` estimate and an `in_recovery` flag (Reno/CUBIC ignore them via the
+no-op default). BBR now caps total in-flight data with an AIMD pair: `inflight_lo` (short-term, halved
+on a loss episode, probed back up one segment per round between episodes) and `inflight_hi` (long-term
+ceiling, activated and hard-cut only on an RTO). Under loss BBR therefore runs a persistent, reno-like
+window — floored at `pipe + 3·MSS` so `cwnd > pipe` always (the selective retransmit keeps firing) and
+never clamped down to the BDP target (an early review caught that `pipe ≥ target` then closes the send
+gate and re-wedges; the PROBE_RTT drain is likewise deferred during recovery). An ACK-aggregation
+estimate (`extra_acked`, gated until the pipe fills) feeds the cwnd target. This made BBR **robust** —
+no more collapse — but, measured, it did *not* move the median: still ~0.2 MB/s. Capping the window
+can't help, because the wedge is **sticky**: once a transfer hits the one-segment-per-RTO state, a
+single bad burst pins the *whole* remaining transfer there regardless of what the window does next.
+
+**Part 2 — the shared recovery path (the actual lever).** The real cost is the **RTO clock**: the old
+go-back-N resend fired only when the RTO timer expired, so the wedge drained one hole per *RTO*. The
+fix re-arms the resend on *every cumulative-ACK advance* until `snd_una` reaches the `SND.NXT` captured
+at the RTO (`gbn_recover`): a Swiss-cheese window now drains one hole per **RTT** — O(holes) round
+trips, not O(holes) timeouts. This lives in the shared TCB (`tcb`), so it un-sticks recovery for **all
+three** controllers, and it is what actually lifted BBR off the ~0.2 floor. The adversarial review of
+this change caught a real interaction bug: an RTO keeps the SACKed set (RFC 6675 §5.1), so the first
+hole-filling ACK still carried SACK blocks and re-entered SACK recovery mid-drain — which re-ran
+`enter_recovery` (bouncing Reno/CUBIC's cwnd off the RTO's 1·MSS back to FlightSize/2, undoing the
+slow-start restart) and let the selective retransmit duplicate the hole the go-back-N had just resent.
+Fixed by gating recovery entry on `gbn_recover.is_none()`: the ack-clocked drain owns the post-RTO
+repair until it completes, then SACK recovery re-engages.
+
+Result: BBR is now **robust and competitive** under random loss — it matches Reno at 1–2% loss and
+trails at 0.5% (Reno 1.0 / CUBIC 1.5 / BBR 0.6 MB/s), versus the ~0.2 collapse before. The residual
+gap is BBR v1's documented random-loss weakness: loss depresses the measured delivery rate, so pacing
+throttles below the loss-based controllers; closing it fully needs a loss-aware delivery-rate estimate
+(the direction later BBR versions take). The flip side is the case BBR is *built* for: on a
+finite-buffer bottleneck (`netem` 20 mbit + 20 ms + deep queue) all three saturate the link, but BBR
+paces to the bottleneck and holds the queue near-empty — **~31 ms RTT under load vs ~109 ms** for
+Reno/CUBIC at the same goodput, a ~3.5× latency win.
 
 ### 5.6 Async runtime (`runtime`) — M4
 
@@ -323,10 +346,16 @@ inline). Verified subtleties:
   `enter_recovery` for the early path. Recovery exits when the cumulative ACK reaches the
   `RecoveryPoint` captured at entry. An **RTO** abandons SACK recovery and falls back to
   go-back-N, keeping the SACKed set (RFC 6675 §5.1) so a non-reneging peer's cumulative ACK still
-  jumps past data it already holds. *Review fixes:* the Karn `retransmitted` guard now clears on
-  recovery exit (not only on full drain), and a lost **FIN** that is the only outstanding octet
-  is now retransmitted at its own sequence slot (the go-back-N path peeked an empty `tx` and
-  emitted an empty segment — a pre-existing bug).
+  jumps past data it already holds. That go-back-N is now **ACK-clocked**: an RTO opens a drain to
+  the captured `SND.NXT` (`gbn_recover`), and every cumulative-ACK advance re-arms the resend, so a
+  window with more SACK-invisible holes than the option can report drains one hole per **RTT** rather
+  than per RTO (the un-stuck wedge — §5.5). To keep the two repair engines from colliding, SACK
+  recovery re-entry is suppressed while a drain is active (else the first hole-filling ACK, still
+  carrying SACK blocks, re-entered recovery and both re-inflated cwnd off the RTO collapse *and*
+  double-sent the hole — a review finding). *Review fixes:* the Karn `retransmitted` guard now clears
+  on recovery exit (not only on full drain), and a lost **FIN** that is the only outstanding octet is
+  now retransmitted at its own sequence slot (the go-back-N path peeked an empty `tx` and emitted an
+  empty segment — a pre-existing bug).
 
 - **The no-rewind invariant holds.** Selective retransmit resends a hole from inside
   `[SND.UNA, SND.NXT)` and **never** assigns `SND.NXT` — so in-flight ACKs are never mistaken for

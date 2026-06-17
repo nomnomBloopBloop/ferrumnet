@@ -31,7 +31,7 @@ $ curl -v http://10.0.0.2:8080/
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **pluggable congestion control** (Reno / CUBIC / BBR), and a **two-stack
-  userspace loopback** (two instances connecting to each other entirely in memory). **160 tests**,
+  userspace loopback** (two instances connecting to each other entirely in memory). **168 tests**,
   green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
@@ -108,28 +108,53 @@ the *window*, not the CPU, is the bottleneck (MB/s, medians of 3):
 
 | 20 ms RTT | 0% loss | 0.5% | 1% | 2% |
 |---|---|---|---|---|
-| Reno    | 7.6 | 1.1 | 0.7 | 0.5 |
-| CUBIC   | 7.2 | 1.1 | 0.9 | 0.5 |
-| **BBR** | **10.5** | 0.2† | 0.2† | 0.2† |
+| Reno    | 7.6 | 1.0 | 0.8 | 0.5 |
+| CUBIC   | 7.4 | 1.5 | 0.9 | 0.6 |
+| **BBR** | **10.5** | 0.6 | 0.7 | 0.5 |
 
 At **0% loss** BBR leads by ~40%: pacing to the BDP fills a short high-RTT flow faster than
-Reno/CUBIC's slow-start ramp. **Under loss**, Reno collapses (multiplicative decrease, costly at
-20 ms RTT) and CUBIC's gentler β = 0.7 cut holds marginally better. † **BBR under random loss is
-the deep story here.** BBR v1 is loss-*agnostic*, so it kept filling until its whole send buffer
-(≈ the BDP) was in flight — which accumulates more simultaneous holes than the 4-block SACK option
-can report, so the unreported holes wedge `snd_una` and recovery degrades to one-segment-per-RTO
-go-back-N (≈180 RTOs → timeout; traced directly). The fix (`bbr`) is a **BBRv2-style loss
-response**: while a loss is being repaired BBR holds cwnd just above the RFC 6675 `pipe` estimate
-instead of the BDP target, so the selective retransmit still fires while new data is throttled to a
-trickle and recovery drains the holes. That makes BBR **robust — it now completes at every loss
-level instead of timing out** — but slower than the loss-based controllers under loss (~0.2 MB/s,
-occasionally bursting higher). That throughput trade is the documented BBRv1 random-loss weakness,
-and exactly why BBRv2 reacts to loss. Reno/CUBIC are untouched (the loss-response hooks are no-op
-defaults). The full traced diagnosis is in `docs/DESIGN.md`. At **sub-millisecond RTT** (no shaping, CPU-bound) the ranking
-inverts: Reno's aggressive window (~111 MB/s) beats BBR's pacing (~80 MB/s), which carries overhead
-at a tiny BDP. The honest takeaway is the *bottleneck story* — at high BDP the model wins, under
-loss the loss-based controllers are more robust in this build, and at tiny BDP window aggression
-wins.
+Reno/CUBIC's slow-start ramp. **Under loss** the story has two halves, both worth telling.
+
+*BBR's window — the BBRv2 `inflight_hi`/`inflight_lo` bounds.* BBR v1 is loss-agnostic, so it kept
+filling until its whole send buffer was in flight — which piles up more simultaneous holes than the
+3–4-block SACK option can report, so the unreported holes wedge `snd_una` and recovery falls to
+one-segment-per-RTO go-back-N (≈180 RTOs → a de-facto timeout; traced directly). The BBRv2-style fix
+caps in-flight data with an AIMD pair (`inflight_lo`/`inflight_hi` — halved on loss, probed back up
+between losses, hard-cut on RTO) plus ACK-aggregation, so under loss BBR runs a persistent, reno-like
+window instead of over-filling. That made BBR **robust** (no more collapse) — but on its own it did
+**not** move the median: it was still ~0.2 MB/s.
+
+*The real lever — the shared recovery path.* Window control couldn't help because the wedge is
+*sticky*: once `NextSeg` returns `None` the old recovery advanced `snd_una` one segment per **RTO**,
+so a single bad burst pinned the whole transfer at ~0.2. The fix re-arms the go-back-N resend on every
+cumulative-ACK advance, so a Swiss-cheese window drains one hole per **RTT** instead of per RTO
+(O(holes) round trips, not timeouts). It lives in the shared TCB, so it lifts under-loss recovery for
+**all three** controllers — and it is what actually moved BBR from a ~0.2 collapse to the table above.
+
+The result: BBR is now **robust and competitive under random loss** — it matches Reno at 1–2% and
+trails at 0.5% — while still **winning 0% loss outright**. The residual gap is BBR v1's documented
+random-loss weakness: loss drags down the measured delivery rate, so pacing throttles below the
+loss-based controllers. (That trade-off is exactly why later BBR versions react to loss.) Reno/CUBIC's
+congestion control is untouched — the BBR loss-response hooks are no-op trait defaults; only the
+shared go-back-N drain, a correctness/efficiency fix, changed for them.
+
+**Where BBR is *supposed* to win — a bottleneck queue.** Uniform random loss is BBR v1's worst case,
+not its design target. On a finite-buffer bottleneck (`netem` 20 mbit rate + 20 ms delay + a deep
+queue) — the realistic congestion case — all three saturate the link, but BBR paces to the bottleneck
+and keeps the queue near-empty while Reno/CUBIC fill it (bufferbloat), so the latency under load
+diverges sharply at the same goodput:
+
+| 20 mbit bottleneck | throughput | RTT under load |
+|---|---|---|
+| Reno / CUBIC | ~2.4 MB/s | ~109 ms |
+| **BBR** | ~2.3 MB/s | **~31 ms** |
+
+Same goodput, **~3.5× lower latency** — the model-based design doing exactly what it exists to do.
+The full traced diagnosis is in `docs/DESIGN.md`. At **sub-millisecond RTT** (no shaping, CPU-bound)
+the ranking inverts again: Reno's aggressive window (~111 MB/s) beats BBR's pacing (~80 MB/s), which
+carries overhead at a tiny BDP. The honest takeaway is the *bottleneck story* — at high BDP the model
+wins, on a real bottleneck queue it wins on latency, under pure random loss the loss-based controllers
+stay ahead, and at tiny BDP window aggression wins.
 
 **Kernel baseline** (Python `http.server` over `lo`, kernel TCP, 16 MiB): median **~800 MB/s**
 (556–893). *Not* apples-to-apples — `lo`'s MTU is 65536 and it is fully in-kernel (no per-packet
@@ -166,20 +191,24 @@ and wakes the async tasks.
 > sampling under loss, the `ack_of_fin` teardown subtlety, the async lost-wakeup race. Every one
 > was pinned down by an adversarial design review *before* a line was written, then re-checked by
 > a multi-agent adversarial review of the finished code before each commit (the initial review
-> found and fixed 11 real bugs; later reviews of active open and delayed ACKs caught 5 more). If
-> you read one file, read that one.
+> found and fixed 11 real bugs; later reviews of active open, delayed ACKs, and the congestion /
+> recovery work caught several more — including the post-RTO go-back-N drain re-entering SACK
+> recovery and double-sending a hole). If you read one file, read that one.
 
 ## The five hard problems
 
 1. **TCP state machine** — 11 RFC 793 states, the three-way handshake, **active open (`connect`)**
    as well as passive, simultaneous open and close, and TIME-WAIT (2·MSL). (`state`, `tcb`)
-2. **Retransmission & selective repair** — a send ring with go-back-N retransmission, Jacobson/
-   Karn RTO estimation (RFC 6298), SACK-based selective loss recovery with out-of-order
-   reassembly (RFC 2018 + RFC 6675), RFC 7323 **timestamps** (Karn-free RTT + PAWS), and **delayed
-   ACKs** (RFC 1122). (`tcb`, `rtt`, `sack`, `reasm`)
+2. **Retransmission & selective repair** — a send ring with go-back-N retransmission (drained at
+   **RTT** pace after an RTO, not RTO pace, so a SACK-invisible Swiss-cheese window recovers in
+   O(holes) round trips instead of timing out), Jacobson/Karn RTO estimation (RFC 6298), SACK-based
+   selective loss recovery with out-of-order reassembly (RFC 2018 + RFC 6675), RFC 7323
+   **timestamps** (Karn-free RTT + PAWS), and **delayed ACKs** (RFC 1122). (`tcb`, `rtt`, `sack`,
+   `reasm`)
 3. **Congestion control** — **pluggable** behind a `CongestionControl` trait + match-dispatched
-   `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312), and **BBR** v1
-   (model-based, paced to the BDP). Selectable with `FERRUM_CC`. (`congestion`, `bbr`)
+   `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312), and **BBR** (v1
+   model paced to the BDP, plus BBRv2 `inflight_hi`/`inflight_lo` bounds + ACK-aggregation for
+   under-loss throughput). Selectable with `FERRUM_CC`. (`congestion`, `bbr`)
 4. **Zero-copy parsing** — header views over `&[u8]` and the one's-complement Internet checksum
    (RFC 1071), with a clean RX/TX borrow split. (`wire`)
 5. **Async integration** — the `Waker` lifecycle over the sans-IO core, built on the safe
@@ -220,9 +249,10 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 160 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 168 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
-                            #            + CUBIC + BBR (rate sampler, windowed filter, phases)
+                            #            + CUBIC + BBR (rate sampler, windowed filter, phases,
+                            #            inflight bounds) + the ack-clocked go-back-N drain
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -246,12 +276,17 @@ The big milestones are done — active open, SACK loss recovery, MTU-adaptive MS
 RFC 7323 timestamps, delayed ACKs, an io_uring backend, and **pluggable Reno/CUBIC/BBR congestion
 control** measured head-to-head over the two-instance hardware bench. What's left:
 
-- **BBR throughput under random loss** — a BBRv2-style loss response (cwnd tracks the RFC 6675
-  `pipe` during recovery) now makes BBR *robust* under loss: it completes at every loss level
-  instead of timing out. But it is conservative (≈0.2 MB/s under loss, vs Reno/CUBIC ~0.5–1.1), so
-  the remaining work is recovering that throughput — BBRv2's `inflight_hi`/`inflight_lo` bounds and
-  ACK-aggregation handling — without re-entering the SACK-invisible-hole wedge. The full diagnosis
-  is in `docs/DESIGN.md`.
+- **BBR under random loss — done, with a known residual.** BBRv2 `inflight_hi`/`inflight_lo` bounds
+  + ACK-aggregation, plus an ACK-clocked go-back-N drain that un-sticks the post-RTO wedge, took BBR
+  from a ~0.2 MB/s collapse to robust-and-competitive (matches Reno at 1–2% loss, table above). The
+  residual gap at light loss is BBR v1's documented weakness — loss depresses the measured delivery
+  rate, so pacing throttles. Closing it fully needs a **loss-aware delivery-rate estimate** (the
+  direction later BBR versions take). Full traced diagnosis in `docs/DESIGN.md`.
+- **A deterministic congestion-control testbed** — the sans-IO core can drive two stacks through an
+  in-process virtual bottleneck (rate + delay + AQM + seeded loss), turning the noisy `netem` sweep
+  into bit-reproducible experiments (fairness, convergence, RTT-unfairness, bufferbloat). The
+  bottleneck-queue result above is a first taste; the core's determinism is what makes the rest
+  possible, and is the most novel thing to build on next.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
 - **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, ECN (RFC 3168), TCP Fast
   Open, keepalives, Nagle — the details that separate "a TCP" from "real TCP".
@@ -259,7 +294,7 @@ control** measured head-to-head over the two-instance hardware bench. What's lef
 Deliberately *not* on the roadmap: AF_XDP / DPDK / RDMA (a different kind of project — RDMA replaces
 the TCP stack rather than speeding it) and multi-threading (single-threaded by design; an
 `Arc<Mutex>` variant is the documented extension). Nothing in the codebase is stubbed — every code
-path that exists is complete and tested; BBR's random-loss behaviour is a measured limitation of a
+path that exists is complete and tested; BBR's residual random-loss gap is a measured limitation of a
 complete implementation, not a stub.
 
 ## References
