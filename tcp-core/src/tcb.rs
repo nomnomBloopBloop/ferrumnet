@@ -121,6 +121,13 @@ pub struct Tcb {
     retransmitted: bool,
     /// A retransmission of the oldest unacked segment is pending (set by RTO / fast retransmit).
     retransmit: bool,
+    /// Post-RTO go-back-N drain target. `Some(high)` from an RTO until the cumulative ACK reaches
+    /// `high` (= `SND.NXT` captured at the RTO). While set, every cumulative-ACK advance re-arms the
+    /// go-back-N retransmit (step 0), so the oldest hole is resent once per **RTT** (ACK-clocked)
+    /// instead of once per **RTO**. This is what drains a Swiss-cheese window — where >`DupThresh`
+    /// holes have gone SACK-invisible and `NextSeg` returns `None` — in O(holes) round trips rather
+    /// than O(holes) timeouts (the sticky one-segment-per-RTO collapse). Helps every controller.
+    gbn_recover: Option<SeqNumber>,
 
     // Timers.
     rtx_deadline: Option<Instant>,
@@ -232,6 +239,7 @@ impl Tcb {
             rtt_sample: None,
             retransmitted: false,
             retransmit: false,
+            gbn_recover: None,
             rtx_deadline: None,
             persist_deadline: None,
             persist_backoff: PERSIST_MIN_MILLIS,
@@ -301,6 +309,7 @@ impl Tcb {
             rtt_sample: None,
             retransmitted: false,
             retransmit: false,
+            gbn_recover: None,
             rtx_deadline: None,
             persist_deadline: None,
             persist_backoff: PERSIST_MIN_MILLIS,
@@ -794,6 +803,19 @@ impl Tcb {
                 }
             }
 
+            // Post-RTO go-back-N drain (see `gbn_recover`). While the cumulative ACK is still below
+            // the drain's high-water, this advance means the previous hole was filled, so re-arm the
+            // retransmit to resend the *new* oldest hole on the next pass — repairing one hole per RTT
+            // (ACK-clocked) rather than one per RTO. Cleared once SND.UNA reaches the high-water, so
+            // normal sending resumes. Only meaningful with data still outstanding below the mark.
+            if let Some(high) = self.gbn_recover {
+                if self.snd_una.lt(high) && self.snd_una != self.snd_nxt {
+                    self.retransmit = true;
+                } else {
+                    self.gbn_recover = None;
+                }
+            }
+
             // RTT measurement. With timestamps (RFC 7323) the ACK's TSecr echoes our TSval from
             // when the now-acked data was sent, so RTT = now − TSecr on EVERY ack — free of Karn's
             // restriction, since a retransmit carries a fresh TSval and its ACK therefore times the
@@ -1152,6 +1174,10 @@ impl Tcb {
                 self.retransmit = true; // resend the oldest unacked segment (no SND.NXT rewind)
                 self.retransmitted = true;
                 self.rtt_sample = None;
+                // Open an ACK-clocked go-back-N drain up to the current SND.NXT: every cumulative-ACK
+                // advance below this point re-arms the resend (see `process_ack`), so a window full of
+                // SACK-invisible holes drains one hole per RTT instead of one per RTO.
+                self.gbn_recover = Some(self.snd_nxt);
                 self.restart_rtx(now);
             }
         }
@@ -1453,6 +1479,10 @@ impl Tcb {
     #[cfg(test)]
     fn in_sack_recovery_dbg(&self) -> bool {
         self.scoreboard.in_recovery()
+    }
+    #[cfg(test)]
+    fn gbn_draining_dbg(&self) -> bool {
+        self.gbn_recover.is_some()
     }
     #[cfg(test)]
     fn cwnd_dbg(&self) -> u32 {
@@ -2062,6 +2092,43 @@ mod tests {
         let out = drain_raw(&mut tcb, later);
         assert!(!out.is_empty());
         assert_eq!(parse(&out[0]).seq, iss + 1, "go-back-N resends from SND.UNA");
+    }
+
+    #[test]
+    fn rto_goback_n_drain_is_ack_clocked_not_rto_clocked() {
+        // The sticky-wedge fix. After an RTO falls back to go-back-N, each cumulative-ACK advance must
+        // re-arm the retransmit so the NEXT hole is repaired this round trip — not only when the RTO
+        // timer fires again. Without it, a window with >DupThresh SACK-invisible holes drains one
+        // segment per RTO (the collapse to ~0.2 MB/s); with it, it drains one hole per RTT.
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established_sack(now, 600, 64000);
+        let data: Vec<u8> = (0..6000).map(|i| i as u8).collect();
+        tcb.send(&data);
+        drain_raw(&mut tcb, now); // segments [iss+1 .. iss+6001) go out
+        // Peer holds segments 2..4 ([iss+1461, iss+5841)) but lost segment 1 and segment 5 — two
+        // holes. IsLost flags segment 1 (3*MSS+ SACKed above it) → SACK recovery.
+        deliver(&mut tcb, now, &inbound_with_sack(cnxt, iss + 1, 64000, &[(iss + 1461, iss + 5841)]));
+        assert!(tcb.in_sack_recovery_dbg(), "SACK IsLost enters recovery");
+        drain_raw(&mut tcb, now); // selective retransmit of segment 1 — assume it is lost too
+
+        // RTO: abandon SACK recovery, open the go-back-N drain, resend segment 1 from SND.UNA.
+        let later = tcb.poll_at().expect("rtx armed").plus_millis(1);
+        tcb.on_timer(later);
+        assert!(tcb.gbn_draining_dbg(), "the RTO opened a go-back-N drain");
+        let out = drain_raw(&mut tcb, later);
+        assert_eq!(parse(&out[0]).seq, iss + 1, "drain resends the oldest hole (SND.UNA)");
+        assert!(drain_raw(&mut tcb, later).is_empty(), "only one resend until an ACK or a new RTO");
+
+        // Segment 1 lands; the cumulative ACK jumps past the SACKed block 2..4 to the next hole at
+        // iss+5841. This advance alone — NO new RTO, the clock has not moved — must re-arm the drain.
+        deliver(&mut tcb, later, &inbound(cnxt, iss + 5841, TcpFlags::ACK, 64000, None, b""));
+        let out = drain_raw(&mut tcb, later);
+        assert_eq!(out.len(), 1, "the cumulative-ACK advance re-armed the drain with no RTO");
+        assert_eq!(parse(&out[0]).seq, iss + 5841, "and it resends the NEW oldest hole, ack-clocked");
+
+        // The last hole lands; SND.UNA reaches the drain high-water → the drain closes.
+        deliver(&mut tcb, later, &inbound(cnxt, iss + 6001, TcpFlags::ACK, 64000, None, b""));
+        assert!(!tcb.gbn_draining_dbg(), "drain closes once SND.UNA reaches the RTO high-water");
     }
 
     #[test]
