@@ -12,5 +12,5 @@ pub mod tcp;
 
 pub use checksum::{IPPROTO_ICMP, IPPROTO_TCP};
 pub use icmp::echo_reply;
-pub use ipv4::{Ipv4Packet, Ipv4Repr};
+pub use ipv4::{set_ecn, Ipv4Packet, Ipv4Repr, ECN_CE, ECN_ECT0, ECN_ECT1, ECN_NOT_ECT};
 pub use tcp::{SackBlocks, TcpFlags, TcpPacket, TcpRepr, MAX_SACK_BLOCKS};

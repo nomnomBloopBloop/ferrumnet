@@ -45,6 +45,7 @@ pub(crate) fn build_segment(
         protocol: IPPROTO_TCP,
         payload_len: seg_len as u16,
         ttl: 64,
+        ecn: 0, // Not-ECT by default; the TCB marks ECT on ECN-enabled data after building.
     };
     let mut buf = vec![0u8; ip.total_len()];
     ip.emit(&mut buf);

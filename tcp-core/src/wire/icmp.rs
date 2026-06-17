@@ -41,6 +41,7 @@ pub fn echo_reply(ip: &Ipv4Packet<'_>, out: &mut [u8]) -> Option<usize> {
         protocol: IPPROTO_ICMP,
         payload_len: icmp_len as u16,
         ttl: 64,
+        ecn: 0,
     }
     .emit(out);
 
@@ -70,6 +71,7 @@ mod tests {
             protocol: IPPROTO_ICMP,
             payload_len: icmp_len as u16,
             ttl: 64,
+            ecn: 0,
         };
         let mut pkt = vec![0u8; repr.total_len()];
         repr.emit(&mut pkt);

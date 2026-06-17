@@ -13,6 +13,27 @@ use super::checksum;
 pub const IPV4_MIN_HEADER_LEN: usize = 20;
 pub const IPV4_MAX_HEADER_LEN: usize = 60;
 
+/// ECN codepoints (RFC 3168), carried in the low 2 bits of the IPv4 DSCP/ECN byte.
+pub const ECN_NOT_ECT: u8 = 0b00;
+pub const ECN_ECT1: u8 = 0b01;
+pub const ECN_ECT0: u8 = 0b10;
+pub const ECN_CE: u8 = 0b11;
+
+/// Overwrite the 2-bit ECN codepoint in an already-emitted IPv4 datagram and fix the header
+/// checksum. Used by a congested bottleneck to mark ECT data as CE, and by the TCB to set ECT on
+/// ECN-capable data after the segment is built. The **TCP** checksum is unaffected — the pseudo-
+/// header it covers (src/dst/proto/length) does not include the DSCP/ECN byte.
+pub fn set_ecn(frame: &mut [u8], ecn: u8) {
+    if frame.len() < IPV4_MIN_HEADER_LEN {
+        return;
+    }
+    frame[1] = (frame[1] & 0xFC) | (ecn & 0x03);
+    frame[10] = 0;
+    frame[11] = 0;
+    let csum = checksum::checksum(&frame[..IPV4_MIN_HEADER_LEN]);
+    frame[10..12].copy_from_slice(&csum.to_be_bytes());
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
     /// Buffer shorter than the header, or shorter than the declared `total_len`.
@@ -83,6 +104,13 @@ impl<'a> Ipv4Packet<'a> {
         self.buf[9]
     }
 
+    /// The 2-bit ECN codepoint (RFC 3168) carried in the low bits of the DSCP/ECN byte:
+    /// `0b00` Not-ECT, `0b10` ECT(0), `0b01` ECT(1), `0b11` CE (congestion experienced).
+    #[inline]
+    pub fn ecn(&self) -> u8 {
+        self.buf[1] & 0x03
+    }
+
     #[inline]
     pub fn checksum(&self) -> u16 {
         u16::from_be_bytes([self.buf[10], self.buf[11]])
@@ -129,6 +157,10 @@ pub struct Ipv4Repr {
     /// Length of the L4 payload that will follow the 20-byte header.
     pub payload_len: u16,
     pub ttl: u8,
+    /// The 2-bit ECN codepoint (RFC 3168) to emit in the DSCP/ECN byte (0 = Not-ECT). An
+    /// ECN-capable sender marks data ECT so a bottleneck can signal congestion by setting CE
+    /// instead of dropping. DSCP is always 0 here.
+    pub ecn: u8,
 }
 
 impl Ipv4Repr {
@@ -148,7 +180,7 @@ impl Ipv4Repr {
     pub fn emit(&self, buf: &mut [u8]) -> usize {
         let total = self.total_len() as u16;
         buf[0] = (4 << 4) | 5; // version 4, IHL 5 (20 bytes, no options)
-        buf[1] = 0; // DSCP / ECN
+        buf[1] = self.ecn & 0x03; // DSCP 0 + the 2-bit ECN codepoint
         buf[2..4].copy_from_slice(&total.to_be_bytes());
         buf[4..6].copy_from_slice(&[0, 0]); // identification (0; we never fragment)
         buf[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Don't Fragment
@@ -174,6 +206,7 @@ mod tests {
             protocol,
             payload_len: payload.len() as u16,
             ttl: 64,
+            ecn: 0,
         };
         let mut buf = vec![0u8; repr.total_len()];
         repr.emit(&mut buf);
