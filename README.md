@@ -31,8 +31,17 @@ $ curl -v http://10.0.0.2:8080/
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **pluggable congestion control** (Reno / CUBIC / BBR), and a **two-stack
-  userspace loopback** (two instances connecting to each other entirely in memory). **168 tests**,
+  userspace loopback** (two instances connecting to each other entirely in memory). **174 tests**,
   green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no leaks, no suppression).
+- **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
+  whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
+  reordering, bit-corruption — driven by an event scheduler over the injected clock. The same seed
+  replays bit-for-bit, so a failing seed *is* the bug report. The headline test runs **1080
+  adversarial scenarios** (Reno/CUBIC/BBR × loss × seeds) and every one delivers all bytes intact and
+  terminates — and it has teeth (disabling the TCP checksum makes it flag an integrity violation on
+  seed 0 at once). This is TigerBeetle/FoundationDB-style **deterministic simulation testing**,
+  applied to a real TCP implementation — which production stacks can't do, being entangled with the
+  kernel clock and NIC. (`sim`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -249,10 +258,11 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 168 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 174 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + the ack-clocked go-back-N drain
+                            #            + deterministic simulation testing (1080 adversarial seeds)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -282,11 +292,14 @@ control** measured head-to-head over the two-instance hardware bench. What's lef
   residual gap at light loss is BBR v1's documented weakness — loss depresses the measured delivery
   rate, so pacing throttles. Closing it fully needs a **loss-aware delivery-rate estimate** (the
   direction later BBR versions take). Full traced diagnosis in `docs/DESIGN.md`.
-- **A deterministic congestion-control testbed** — the sans-IO core can drive two stacks through an
-  in-process virtual bottleneck (rate + delay + AQM + seeded loss), turning the noisy `netem` sweep
-  into bit-reproducible experiments (fairness, convergence, RTT-unfairness, bufferbloat). The
-  bottleneck-queue result above is a first taste; the core's determinism is what makes the rest
-  possible, and is the most novel thing to build on next.
+- **Deterministic simulation testing — done (the `sim` module), and the foundation for more.** Two
+  stacks over a seeded, fault-injecting virtual link, replayable from the seed. The natural next
+  layer is a **bit-reproducible congestion-control testbed**: swap the lossy link for a virtual
+  *bottleneck* (rate + finite buffer + AQM) and the noisy `netem` sweep becomes exact experiments —
+  fairness, convergence, RTT-unfairness, bufferbloat (the bottleneck-queue result above was a first,
+  hardware taste). On top of that, **L4S** (RFC 9330–9332: ECN + a scalable controller like Prague
+  + dualPI2) is the bleeding-edge transport to evaluate next — it slots into the same
+  `CongestionControl` trait and would extend the latency ladder below sub-millisecond.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
 - **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, ECN (RFC 3168), TCP Fast
   Open, keepalives, Nagle — the details that separate "a TCP" from "real TCP".

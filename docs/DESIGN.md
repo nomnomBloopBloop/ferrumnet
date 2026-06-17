@@ -421,6 +421,37 @@ finished code (which caught 5 real bugs across active open and delayed ACKs). Ve
   same system time, since io_uring removes the per-packet syscall *overhead* while the TUN copy
   itself stays irreducible kernel work.
 
+### 5.10 Deterministic simulation testing (`sim`) — M14
+
+The sans-IO design pays its biggest dividend here. Because the engine reads no clock and does no I/O,
+two whole `Runtime`s can be wired together **in memory** through a virtual link and driven by an
+event scheduler that advances the injected clock to the next event (the earlier of either stack's
+`poll_at()` and the link's next scheduled delivery). The link applies a **seeded** fault model — drop
+(`loss_ppm`), duplicate (`dup_ppm`), reorder (via jittered delay), and bit-corruption (`corrupt_ppm`,
+flipping a byte in the TCP-checksum-covered region) — all drawn from a hand-rolled SplitMix64 PRNG.
+The whole of `run(scenario)` is therefore a **pure function of `(seed, config)`**: the same seed
+replays bit-for-bit, so a failing seed *is* a complete, minimal-by-construction repro. This is the
+[TigerBeetle]/[FoundationDB] deterministic-simulation-testing discipline applied to a real TCP, which
+a kernel stack cannot do.
+
+It asserts the three invariants a correct stack can never violate under *any* fault sequence: **byte
+integrity** (the receiver's stream equals the sender's, exactly, in order), **eventual completion**
+(no wedge — a quiesced state with data still owed is a bug), and **no panic** (the engine survives
+arbitrary garbage on its input). The headline test runs **1080 adversarial scenarios** (Reno/CUBIC/
+BBR × {1,5,10}% loss × 120 seeds), exercising retransmission, SACK recovery, out-of-order reassembly,
+and the ack-clocked go-back-N drain under conditions no hand-written test would think to construct;
+every one delivers all bytes intact and terminates. The harness has *teeth*, verified two ways: an
+external check (disabling the TCP checksum makes it flag an integrity violation on seed 0
+immediately), and an *executed* one (the link tallies the faults it injects and a test asserts they
+fired > 0 — so a regression that silently zeroed the fault model can't make the suite pass over a
+secretly-clean link, the standard DST anti-pattern guard). Determinism is exact for this
+single-connection workload (each `Runtime`'s waker maps hold ≤ 1 entry, so their iteration order is
+irrelevant); a concurrent-flow harness would first switch those to ordered maps. Everything is
+`std`-only and Miri-clean.
+
+[TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
+[FoundationDB]: https://apple.github.io/foundationdb/testing.html
+
 ## 6. End-to-end data flow (one `curl` request)
 
 1. `curl` → kernel routes `10.0.0.2` to `tun0` → the IP datagram appears on our fd.
