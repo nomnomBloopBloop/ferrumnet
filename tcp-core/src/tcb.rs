@@ -29,7 +29,7 @@ use crate::sack::Scoreboard;
 use crate::seq::SeqNumber;
 use crate::state::State;
 use crate::time::Instant;
-use crate::wire::{SackBlocks, TcpFlags, TcpPacket, TcpRepr, MAX_SACK_BLOCKS};
+use crate::wire::{set_ecn, SackBlocks, TcpFlags, TcpPacket, TcpRepr, ECN_ECT1, MAX_SACK_BLOCKS};
 
 const MSS_DEFAULT: u16 = 536; // RFC 9293 default when the peer sends no MSS option
 /// Largest MSS a single IPv4 datagram can carry: 65535 (IP total-length max) − 20 (IPv4) − 20 (TCP).
@@ -102,6 +102,14 @@ pub struct Tcb {
     /// Our TSval to stamp on outgoing segments: the microsecond clock captured at the top of each
     /// `poll_transmit` (every `build` runs inside `poll_transmit`, so it is always fresh).
     cur_tsval: u32,
+    /// DCTCP/L4S (RFC 8257) congestion echo. A receiver sets this from the IPv4 CE codepoint of the
+    /// most recent data segment it accepted; [`Tcb::build`] then mirrors it as the TCP ECE flag on
+    /// our ACKs, so the sender learns the marked fraction. Active only on a DCTCP connection
+    /// ([`Tcb::ecn_enabled`]); inert (never read, never set) for every other controller, which keeps
+    /// the wire byte-identical for Reno/CUBIC/BBR. We deliberately echo the latest segment's mark
+    /// rather than run the full RFC 8257 §3.2 receiver state machine — a documented simplification
+    /// (both ends are configured DCTCP, so there is no ECN handshake either; see `ecn_enabled`).
+    ece_echo: bool,
 
     // Receive sequence space.
     irs: SeqNumber,
@@ -228,6 +236,7 @@ impl Tcb {
             ts_enabled,
             ts_recent,
             cur_tsval: 0,
+            ece_echo: false,
             irs,
             rcv_nxt,
             rcv_adv: rcv_nxt + rcv_wnd as u32,
@@ -298,6 +307,7 @@ impl Tcb {
             ts_enabled: false, // negotiated on the SYN-ACK
             ts_recent: 0,
             cur_tsval: 0,
+            ece_echo: false,
             irs: SeqNumber::new(0), // unknown until the SYN/SYN-ACK carries IRS
             rcv_nxt: SeqNumber::new(0),
             rcv_adv: SeqNumber::new(0),
@@ -347,6 +357,17 @@ impl Tcb {
             self.cc_kind = kind;
             self.cc = Cc::new(kind, self.snd_mss);
         }
+    }
+
+    /// Whether this connection runs ECN end-to-end (DCTCP/L4S). True iff the controller is DCTCP:
+    /// we then mark our data ECT(1) on egress and echo CE back as ECE, and the controller reacts to
+    /// the marked fraction. There is **no** SYN ECN negotiation (RFC 3168 §6.1.1) — both ends are
+    /// configured DCTCP, a deliberate simplification that keeps the handshake untouched while still
+    /// exercising the full marking/echo/response loop. For every other controller this is false, so
+    /// no ECT is ever set, no ECE is ever echoed, and the wire stays byte-identical.
+    #[inline]
+    fn ecn_enabled(&self) -> bool {
+        self.cc_kind == CcKind::Dctcp
     }
 
     // ── application interface ─────────────────────────────────────────────────────────────
@@ -407,7 +428,7 @@ impl Tcb {
 
     // ── inbound ───────────────────────────────────────────────────────────────────────────
 
-    pub fn on_segment(&mut self, now: Instant, tcp: &TcpPacket<'_>) {
+    pub fn on_segment(&mut self, now: Instant, tcp: &TcpPacket<'_>, ce: bool) {
         // SYN-SENT (active open) has its own RFC 793 §3.9 processing order: the receive window is
         // not yet established (IRS is unknown), so the four-case acceptability test below does not
         // apply. Handle it separately, then return.
@@ -515,7 +536,7 @@ impl Tcb {
                 && !flags.syn()
                 && seg_ack == self.snd_una
                 && self.snd_una != self.snd_nxt;
-            if !self.process_ack(seg_seq, seg_ack, tcp.window(), seg_ts.map(|(_, e)| e), now) {
+            if !self.process_ack(seg_seq, seg_ack, tcp.window(), seg_ts.map(|(_, e)| e), flags.ece(), now) {
                 return; // SEG.ACK > SND.NXT: ACK already owed, drop the segment
             }
             if self.sack_enabled {
@@ -571,6 +592,11 @@ impl Tcb {
         // out-of-order runs contiguous, which are then drained in). Out-of-order data — a gap
         // below it — is buffered for reassembly when SACK is enabled, instead of being dropped.
         if !payload.is_empty() {
+            // DCTCP/L4S receiver: record whether this accepted data carried a CE mark, to echo as
+            // ECE on our next ACK (see `build`). Inert unless this is a DCTCP connection.
+            if self.ecn_enabled() {
+                self.ece_echo = ce;
+            }
             // Left-trim a segment overlapping the left window edge (seg_seq < RCV.NXT) so its
             // fresh in-order tail is delivered rather than dropped; an already-delivered prefix
             // (or a wholly-duplicate segment) trims to empty.
@@ -766,7 +792,7 @@ impl Tcb {
     /// Advance over acked data/FIN, sample RTT, manage the rtx timer and send window. `seg_tsecr`
     /// is the ACK's echoed timestamp (RFC 7323), used for RTT when timestamps are negotiated.
     /// Returns `false` if the ACK is for unsent data (caller drops the segment).
-    fn process_ack(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16, seg_tsecr: Option<u32>, now: Instant) -> bool {
+    fn process_ack(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16, seg_tsecr: Option<u32>, ece: bool, now: Instant) -> bool {
         if seg_ack.gt(self.snd_nxt) {
             self.needs_ack = true; // acks data we never sent: ACK and drop (RFC 793)
             return false;
@@ -798,6 +824,22 @@ impl Tcb {
                 cc_inflight
             };
             self.cc.on_ack_sample(now, self.snd_una, cc_inflight, data_acked as u32, cc_pipe, in_recovery);
+            // DCTCP/L4S: feed the ECN signal. The receiver echoes ECE on an ACK whose data was
+            // CE-marked, so `marked` is the acked data bytes the peer flagged congested (all-or-
+            // nothing per ACK at this granularity). The DCTCP controller turns the marked *fraction*
+            // over a window into a proportional `cwnd ×= 1 − α/2` cut; every other controller's
+            // `on_ecn` is the no-op trait default, so this is byte-identical for Reno/CUBIC/BBR.
+            //
+            // Gated out of SACK recovery, exactly like `on_ack` above: there the window is managed by
+            // the loss-recovery algorithm, which (RFC 6675) requires `cwnd > pipe` to keep the
+            // selective retransmit flowing — an ECN cut mid-recovery could drop `cwnd` below `pipe`
+            // and stall repair. The loss response already cut the window; DCTCP resumes ECN accounting
+            // once recovery exits. (A path that both drops *and* CE-marks is the only case this gate
+            // affects; with the shallow queue DCTCP holds, the buffer never fills, so it cannot drop.)
+            if !in_recovery {
+                let marked = if ece && self.ecn_enabled() { data_acked as u32 } else { 0 };
+                self.cc.on_ecn(now, data_acked as u32, marked);
+            }
             if self.sack_enabled {
                 self.scoreboard.trim(self.snd_una);
                 if self.scoreboard.recovery_reached(self.snd_una) {
@@ -1325,7 +1367,14 @@ impl Tcb {
         // delayed ACK — clear it so the delayed-ACK timer does not later fire a redundant one.
         self.delayed_ack_deadline = None;
         self.unacked_segs = 0;
-        let flags = TcpFlags(extra_flags | TcpFlags::ACK);
+        // DCTCP/L4S: a receiver echoes congestion by setting ECE on its ACKs whenever the most
+        // recent data it accepted was CE-marked (RFC 3168 §6.1.2 / RFC 8257). `ece_echo` is only
+        // ever set on a DCTCP connection, so this OR is inert for every other controller.
+        let mut flag_bits = extra_flags | TcpFlags::ACK;
+        if self.ecn_enabled() && self.ece_echo {
+            flag_bits |= TcpFlags::ECE;
+        }
+        let flags = TcpFlags(flag_bits);
         // Encode the advertised window into the 16-bit field. The SYN-ACK's window is never
         // scaled (RFC 7323); every later segment is right-shifted by rcv_wscale.
         let window_true = self.advertised_window();
@@ -1372,7 +1421,16 @@ impl Tcb {
             sack,
             timestamps,
         };
-        build_segment(self.local, self.remote, &repr, payload)
+        let mut frame = build_segment(self.local, self.remote, &repr, payload);
+        // DCTCP/L4S: mark our own ECN-capable *data* ECT(1) so a bottleneck can signal congestion by
+        // flipping it to CE instead of dropping. Only data segments (non-empty payload) on a DCTCP
+        // connection are ECT; pure ACKs, the SYN-ACK, and every non-DCTCP segment stay Not-ECT.
+        // `set_ecn` rewrites the IP ECN codepoint and fixes the IP checksum only — the TCP checksum
+        // is unaffected (its pseudo-header excludes the ToS/ECN byte), so the segment still validates.
+        if self.ecn_enabled() && !payload.is_empty() {
+            set_ecn(&mut frame, ECN_ECT1);
+        }
+        frame
     }
 
     /// Compute the window to advertise: free receive space, clamped so the right edge never
@@ -1642,7 +1700,8 @@ mod tests {
     fn deliver(tcb: &mut Tcb, now: Instant, frame: &[u8]) {
         let ip = Ipv4Packet::new_checked(frame).unwrap();
         let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-        tcb.on_segment(now, &tcp);
+        let ce = ip.ecn() == crate::wire::ECN_CE;
+        tcb.on_segment(now, &tcp, ce);
     }
 
     fn drain(tcb: &mut Tcb, now: Instant) -> Vec<Out> {

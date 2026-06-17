@@ -127,6 +127,16 @@ pub trait CongestionControl {
     /// and, while `in_recovery`, holding the window near `pipe` (a BBRv2-style loss response) so it
     /// stops overshooting into the loss. Runs on every advancing ACK, including during recovery.
     fn on_ack_sample(&mut self, _now: Instant, _snd_una: SeqNumber, _inflight: u32, _acked: u32, _pipe: u32, _in_recovery: bool) {}
+
+    // ── ECN / L4S (DCTCP) ─────────────────────────────────────────────────────────────────────────
+
+    /// An ACK delivered `acked` bytes, of which `marked` (≤ `acked`) were ECN-CE-marked — the
+    /// receiver echoed them via the TCP ECE flag (RFC 3168/8257). DCTCP accumulates the marked
+    /// *fraction* over a window into a smoothed estimate `α` and gently cuts `cwnd ×= 1 − α/2` once
+    /// per window that saw any mark, holding a far shallower queue than a loss-based controller. The
+    /// no-op default means Reno/CUBIC/BBR ignore the ECN signal and stay byte-identical — exactly as
+    /// they do today, since the TCB only ever passes `marked > 0` on a DCTCP (ECN-enabled) connection.
+    fn on_ecn(&mut self, _now: Instant, _acked: u32, _marked: u32) {}
 }
 
 pub struct Reno {
@@ -442,6 +452,166 @@ impl CongestionControl for Cubic {
     }
 }
 
+/// DCTCP smoothing weight `g` for the marked-fraction EWMA (RFC 8257 §3.3 recommends `1/16`). A
+/// small `g` means `α` reacts slowly, filtering per-window noise so the window cut tracks the
+/// *persistent* level of congestion rather than a single marked round.
+const DCTCP_G: f64 = 1.0 / 16.0;
+
+/// Data Center TCP (RFC 8257) — the L4S-style controller. It behaves like Reno for additive
+/// increase and for genuine packet loss (3 dup-ACKs / RTO), but reacts to **ECN** completely
+/// differently: instead of a one-bit "congested?" signal that forces a halving, it reads the
+/// *fraction* of bytes a CE-marking bottleneck flagged and cuts the window in proportion to it.
+///
+/// The receiver echoes each CE mark as TCP ECE; the TCB feeds those marks in via [`CongestionControl
+/// ::on_ecn`]. DCTCP accumulates `marked / acked` over roughly one window of data (≈ one RTT — the
+/// trait carries no sequence space, so a byte counter snapshotting `cwnd` stands in for the round),
+/// folds it into a smoothed estimate `α ∈ [0, 1]` (`α ← (1−g)·α + g·fraction`), and, on any window
+/// that saw a mark, applies `cwnd ← max(MSS, cwnd·(1 − α/2))` once. Lightly-marked traffic (small
+/// `α`) is barely cut, so the flow holds a high window at a **sub-millisecond** standing queue;
+/// heavy marking (`α → 1`) degrades to a Reno-style halving. `α` starts at 1.0 so the first reaction
+/// is conservative until the EWMA learns the true marking level (RFC 8257 §3.3).
+///
+/// Everything is in **bytes** at the boundary; `α` is the only `f64`, updated with `+ − × ÷` alone
+/// (no transcendental intrinsics), so the controller is deterministic and Miri-clean like CUBIC/BBR.
+pub struct Dctcp {
+    cwnd: u32,
+    ssthresh: u32,
+    mss: u32,
+    /// Bytes-acked accumulator for the Reno `+1 MSS / RTT` additive increase.
+    ca_acc: u32,
+    dup_acks: u8,
+    /// Smoothed fraction of bytes marked CE, in `[0, 1]` (RFC 8257 `α`).
+    alpha: f64,
+    /// Bytes acked / bytes acked-and-marked since the current observation window opened.
+    acked_in_window: u32,
+    marked_in_window: u32,
+    /// Bytes that must be acknowledged to close the window and refresh `α` — a snapshot of `cwnd`
+    /// taken when the window opened, so one window ≈ one round-trip of data on a bulk flow.
+    window_bytes: u32,
+}
+
+impl Dctcp {
+    pub fn new(mss: u16) -> Self {
+        let mss = mss as u32;
+        Dctcp {
+            cwnd: initial_window(mss),
+            ssthresh: u32::MAX, // slow start until the first loss (identical to Reno)
+            mss,
+            ca_acc: 0,
+            dup_acks: 0,
+            alpha: 1.0, // conservative until the EWMA learns the real marking level (RFC 8257 §3.3)
+            acked_in_window: 0,
+            marked_in_window: 0,
+            window_bytes: initial_window(mss),
+        }
+    }
+
+    #[inline]
+    fn in_slow_start(&self) -> bool {
+        self.cwnd < self.ssthresh
+    }
+}
+
+impl CongestionControl for Dctcp {
+    #[inline]
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+
+    #[inline]
+    fn ssthresh(&self) -> u32 {
+        self.ssthresh
+    }
+
+    /// Additive increase, identical to Reno: exponential in slow start (capped at +1 MSS/ACK),
+    /// then +1 MSS per cwnd worth of acked bytes in congestion avoidance. The ECN reaction is
+    /// separate ([`Dctcp::on_ecn`]); here DCTCP simply grows.
+    fn on_ack(&mut self, _now: Instant, acked: u32) {
+        self.dup_acks = 0;
+        if acked == 0 {
+            return;
+        }
+        if self.in_slow_start() {
+            self.cwnd = self.cwnd.saturating_add(acked.min(self.mss));
+        } else {
+            self.ca_acc = self.ca_acc.saturating_add(acked);
+            while self.ca_acc >= self.cwnd {
+                self.ca_acc -= self.cwnd;
+                self.cwnd = self.cwnd.saturating_add(self.mss);
+            }
+        }
+    }
+
+    /// Genuine loss — three duplicate ACKs — is handled exactly like Reno (halve from FlightSize,
+    /// stay in fast recovery). DCTCP only *replaces* the ECN reaction, not the loss reaction.
+    fn on_dup_ack(&mut self, _now: Instant, flight_size: u32) -> bool {
+        self.dup_acks = self.dup_acks.saturating_add(1);
+        if self.dup_acks == 3 {
+            self.ssthresh = (flight_size / 2).max(2 * self.mss);
+            self.cwnd = self.ssthresh;
+            self.ca_acc = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn enter_recovery(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.cwnd = self.ssthresh;
+        self.ca_acc = 0;
+        self.dup_acks = 0;
+    }
+
+    fn on_rto(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.cwnd = self.mss;
+        self.ca_acc = 0;
+    }
+
+    fn set_mss(&mut self, mss: u16) {
+        self.mss = mss as u32;
+        self.cwnd = self.cwnd.max(self.mss);
+        self.ca_acc = 0;
+    }
+
+    /// The DCTCP heart: accumulate the marked fraction over a window, refresh `α`, and cut `cwnd`
+    /// proportionally — at most **once per window**, and only if the window saw a mark. Reno's
+    /// additive increase ([`Dctcp::on_ack`]) keeps running alongside; the balance of the two is
+    /// what parks the queue near the marking threshold instead of filling the buffer.
+    fn on_ecn(&mut self, _now: Instant, acked: u32, marked: u32) {
+        if acked == 0 {
+            return;
+        }
+        self.acked_in_window = self.acked_in_window.saturating_add(acked);
+        self.marked_in_window = self.marked_in_window.saturating_add(marked.min(acked));
+        if self.acked_in_window < self.window_bytes {
+            return; // window still open — keep accumulating
+        }
+        // Window closed: update the EWMA toward this window's marked fraction (RFC 8257 §3.3).
+        let fraction = self.marked_in_window as f64 / self.acked_in_window as f64;
+        self.alpha = (1.0 - DCTCP_G) * self.alpha + DCTCP_G * fraction;
+        let cwnd_before = self.cwnd;
+        if self.marked_in_window > 0 {
+            // Proportional multiplicative decrease, once for the whole window. `α` small → a gentle
+            // trim (a shallow queue); `α → 1` → a Reno-style halving. Never below one segment, and
+            // drop into congestion avoidance (ssthresh = cwnd) so growth resumes linearly.
+            let reduced = (self.cwnd as f64 * (1.0 - self.alpha / 2.0)) as u32;
+            self.cwnd = reduced.max(self.mss);
+            self.ssthresh = self.cwnd;
+            self.ca_acc = 0;
+        }
+        self.acked_in_window = 0;
+        self.marked_in_window = 0;
+        // The next window spans roughly one RTT of the data that was in flight *this* window (the
+        // pre-cut window), not the post-cut window. This is what makes the reduction fire at most
+        // once per RTT: the marks still arriving from before a cut keep accumulating but cannot
+        // trigger a second cut until that whole window has been acked — by which time the cut has
+        // had an RTT to drain the queue and marking subsides (RFC 8257 §3.3, "once per RTT").
+        self.window_bytes = cwnd_before.max(self.mss);
+    }
+}
+
 /// Which controller a connection runs. The TCB defaults to [`CcKind::Reno`]; a backend can select
 /// another (e.g. from `FERRUM_CC`) before connections form. Drives [`Cc::new`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -450,6 +620,8 @@ pub enum CcKind {
     Reno,
     Cubic,
     Bbr,
+    /// Data Center TCP (RFC 8257) — the L4S/ECN controller; see [`Dctcp`].
+    Dctcp,
 }
 
 /// The congestion controller the TCB holds. An **enum, not `Box<dyn CongestionControl>`**: dispatch
@@ -467,6 +639,7 @@ pub enum Cc {
     Reno(Reno),
     Cubic(Cubic),
     Bbr(Bbr),
+    Dctcp(Dctcp),
 }
 
 impl Cc {
@@ -476,6 +649,7 @@ impl Cc {
             CcKind::Reno => Cc::Reno(Reno::new(mss)),
             CcKind::Cubic => Cc::Cubic(Cubic::new(mss)),
             CcKind::Bbr => Cc::Bbr(Bbr::new(mss)),
+            CcKind::Dctcp => Cc::Dctcp(Dctcp::new(mss)),
         }
     }
 }
@@ -487,6 +661,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.cwnd(),
             Cc::Cubic(c) => c.cwnd(),
             Cc::Bbr(c) => c.cwnd(),
+            Cc::Dctcp(c) => c.cwnd(),
         }
     }
 
@@ -496,6 +671,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.ssthresh(),
             Cc::Cubic(c) => c.ssthresh(),
             Cc::Bbr(c) => c.ssthresh(),
+            Cc::Dctcp(c) => c.ssthresh(),
         }
     }
 
@@ -504,6 +680,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.on_ack(now, acked),
             Cc::Cubic(c) => c.on_ack(now, acked),
             Cc::Bbr(c) => c.on_ack(now, acked),
+            Cc::Dctcp(c) => c.on_ack(now, acked),
         }
     }
 
@@ -512,6 +689,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.on_dup_ack(now, flight_size),
             Cc::Cubic(c) => c.on_dup_ack(now, flight_size),
             Cc::Bbr(c) => c.on_dup_ack(now, flight_size),
+            Cc::Dctcp(c) => c.on_dup_ack(now, flight_size),
         }
     }
 
@@ -520,6 +698,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.enter_recovery(now, flight_size),
             Cc::Cubic(c) => c.enter_recovery(now, flight_size),
             Cc::Bbr(c) => c.enter_recovery(now, flight_size),
+            Cc::Dctcp(c) => c.enter_recovery(now, flight_size),
         }
     }
 
@@ -528,6 +707,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.on_rto(now, flight_size),
             Cc::Cubic(c) => c.on_rto(now, flight_size),
             Cc::Bbr(c) => c.on_rto(now, flight_size),
+            Cc::Dctcp(c) => c.on_rto(now, flight_size),
         }
     }
 
@@ -536,6 +716,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.set_mss(mss),
             Cc::Cubic(c) => c.set_mss(mss),
             Cc::Bbr(c) => c.set_mss(mss),
+            Cc::Dctcp(c) => c.set_mss(mss),
         }
     }
 
@@ -544,6 +725,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.pacing_rate(),
             Cc::Cubic(c) => c.pacing_rate(),
             Cc::Bbr(c) => c.pacing_rate(),
+            Cc::Dctcp(c) => c.pacing_rate(),
         }
     }
 
@@ -552,6 +734,7 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Cubic(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Bbr(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
+            Cc::Dctcp(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
         }
     }
 
@@ -560,6 +743,16 @@ impl CongestionControl for Cc {
             Cc::Reno(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Cubic(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Bbr(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
+            Cc::Dctcp(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
+        }
+    }
+
+    fn on_ecn(&mut self, now: Instant, acked: u32, marked: u32) {
+        match self {
+            Cc::Reno(c) => c.on_ecn(now, acked, marked),
+            Cc::Cubic(c) => c.on_ecn(now, acked, marked),
+            Cc::Bbr(c) => c.on_ecn(now, acked, marked),
+            Cc::Dctcp(c) => c.on_ecn(now, acked, marked),
         }
     }
 }
@@ -799,5 +992,112 @@ mod tests {
         assert!(!cc.on_dup_ack(NOW, 14600));
         assert!(cc.on_dup_ack(NOW, 14600)); // 3rd dup-ACK fires through the enum
         assert_eq!(cc.cwnd(), cc.ssthresh()); // cut to β·cwnd
+    }
+
+    // ── DCTCP (RFC 8257) ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dctcp_slow_starts_and_grows_exactly_like_reno() {
+        // Additive increase / slow start is byte-for-byte Reno (the ECN reaction is separate), so
+        // an unmarked DCTCP flow is indistinguishable from Reno on the window.
+        let mut d = Dctcp::new(1460);
+        let mut r = Reno::new(1460);
+        assert_eq!(d.cwnd(), r.cwnd()); // same RFC 6928 initial window
+        for acked in [1460u32, 5000, 1460, 1460, 9999] {
+            d.on_ack(NOW, acked);
+            r.on_ack(NOW, acked);
+            assert_eq!(d.cwnd(), r.cwnd(), "DCTCP additive increase must equal Reno's");
+        }
+    }
+
+    #[test]
+    fn dctcp_loss_response_is_reno_like() {
+        // Genuine loss (3 dup-ACKs, then an RTO) is handled exactly as Reno — DCTCP only replaces
+        // the *ECN* reaction, never the loss reaction.
+        let mut d = Dctcp::new(1000);
+        for _ in 0..20 {
+            d.on_ack(NOW, 1000);
+        }
+        assert!(!d.on_dup_ack(NOW, 8000));
+        assert!(!d.on_dup_ack(NOW, 8000));
+        assert!(d.on_dup_ack(NOW, 8000)); // third dup-ACK
+        assert_eq!(d.ssthresh(), 4000); // FlightSize/2, like Reno
+        assert_eq!(d.cwnd(), 4000); // fast recovery: cwnd = ssthresh
+        d.on_rto(NOW, 6000);
+        assert_eq!(d.cwnd(), 1000); // RTO collapses to one MSS
+        assert_eq!(d.ssthresh(), 3000);
+    }
+
+    #[test]
+    fn dctcp_unmarked_window_never_cuts_and_decays_alpha() {
+        let mut d = Dctcp::new(1000); // cwnd = 10000, window_bytes = 10000, alpha = 1.0
+        // Two full windows of acks with zero marks: cwnd is untouched (on_ecn never grows it; only
+        // on_ack does), and alpha decays toward 0 since no congestion is observed.
+        for _ in 0..20 {
+            d.on_ecn(NOW, 1000, 0);
+        }
+        assert_eq!(d.cwnd(), 10000, "an unmarked window must not cut cwnd");
+        assert!(d.alpha < 1.0, "alpha decays without marks, got {}", d.alpha);
+    }
+
+    #[test]
+    fn dctcp_fully_marked_window_halves() {
+        let mut d = Dctcp::new(1000); // cwnd = 10000, window_bytes = 10000, alpha = 1.0
+        // A whole window marked CE: fraction = 1, alpha stays 1, so the cut degrades to a Reno-style
+        // halving — heavy marking earns a heavy response.
+        for _ in 0..10 {
+            d.on_ecn(NOW, 1000, 1000);
+        }
+        assert!((d.alpha - 1.0).abs() < 1e-9, "alpha stays 1 under full marking, got {}", d.alpha);
+        assert_eq!(d.cwnd(), 5000, "cwnd ×= 1 − α/2 = 0.5 under full marking");
+        assert_eq!(d.ssthresh(), 5000, "the cut drops into congestion avoidance");
+    }
+
+    #[test]
+    fn dctcp_holds_a_high_window_under_light_marking() {
+        // The defining DCTCP property: under a steady *light* marking level (~1/16 of bytes), alpha
+        // converges near that fraction and the per-window cut is tiny, so the flow holds a high
+        // window — where a loss-based controller halving on every marked round would collapse.
+        let mut d = Dctcp::new(1000);
+        d.on_rto(NOW, 20_000); // drop into congestion avoidance (ssthresh = 10000, cwnd = 1000)
+        for _ in 0..3_000 {
+            d.on_ack(NOW, 1000);
+            d.on_ecn(NOW, 1000, 1000 / 16); // ~6% of bytes marked, every ack
+        }
+        // Converged: alpha near the ~1/16 marked fraction, and the window parked high — the additive
+        // increase balances the gentle proportional cut at a large cwnd, not near one MSS.
+        assert!(d.alpha < 0.2, "alpha converges near the ~1/16 marked fraction, got {}", d.alpha);
+        assert!(d.cwnd() > 12_000, "DCTCP holds a high window under light marking; cwnd {}", d.cwnd());
+    }
+
+    #[test]
+    fn on_ecn_is_a_noop_for_non_dctcp_controllers() {
+        // The byte-identical guarantee: feeding ECN marks to Reno/CUBIC/BBR must not move their
+        // windows at all (the TCB only ever passes marks on a DCTCP connection, but the trait
+        // default must still be inert if it ever did).
+        for kind in [CcKind::Reno, CcKind::Cubic, CcKind::Bbr] {
+            let mut cc = Cc::new(kind, 1460);
+            let before = cc.cwnd();
+            for _ in 0..100 {
+                cc.on_ecn(NOW, 1460, 1460);
+            }
+            assert_eq!(cc.cwnd(), before, "{kind:?} must ignore ECN marks");
+        }
+    }
+
+    #[test]
+    fn cc_enum_dispatches_to_dctcp() {
+        let mut bare = Dctcp::new(1460);
+        let mut cc = Cc::new(CcKind::Dctcp, 1460);
+        assert!(matches!(cc, Cc::Dctcp(_)));
+        assert_eq!(cc.cwnd(), bare.cwnd());
+        // A full window of marked acks routed through the enum must match the bare controller —
+        // the on_ecn dispatch arm adds no behavior, it only routes.
+        for _ in 0..10 {
+            cc.on_ecn(NOW, 1460, 1460);
+            bare.on_ecn(NOW, 1460, 1460);
+        }
+        assert_eq!(cc.cwnd(), bare.cwnd());
+        assert!(cc.cwnd() < initial_window(1460), "the marked window cut fired through the enum");
     }
 }

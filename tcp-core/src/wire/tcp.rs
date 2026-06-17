@@ -69,6 +69,12 @@ impl TcpFlags {
     pub fn psh(self) -> bool {
         self.has(Self::PSH)
     }
+    /// ECN-Echo (RFC 3168 §6.1.2): set by a receiver to tell the sender its data was CE-marked.
+    /// DCTCP (RFC 8257) reads it per-ACK to estimate the marked fraction.
+    #[inline]
+    pub fn ece(self) -> bool {
+        self.has(Self::ECE)
+    }
 }
 
 impl core::fmt::Debug for TcpFlags {

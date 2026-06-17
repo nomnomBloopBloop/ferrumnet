@@ -16,7 +16,7 @@ use crate::seq::SeqNumber;
 use crate::state::State;
 use crate::tcb::Tcb;
 use crate::time::Instant;
-use crate::wire::{checksum, Ipv4Packet, Ipv4Repr, SackBlocks, TcpFlags, TcpPacket, TcpRepr, IPPROTO_TCP};
+use crate::wire::{checksum, Ipv4Packet, Ipv4Repr, SackBlocks, TcpFlags, TcpPacket, TcpRepr, ECN_CE, IPPROTO_TCP};
 
 /// An IPv4 address + TCP port. The connection table is keyed by the *remote* endpoint.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -205,7 +205,8 @@ impl Stack {
         // its ephemeral port, would be dropped.)
         if let Some(tcb) = self.conns.get_mut(&remote) {
             if tcp.dst_port() == tcb.local().port {
-                tcb.on_segment(now, &tcp);
+                // Carry the IPv4 CE codepoint in: a DCTCP receiver echoes it (ECE) on its ACKs.
+                tcb.on_segment(now, &tcp, ip.ecn() == ECN_CE);
             }
             return;
         }

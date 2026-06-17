@@ -46,17 +46,22 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(Ipv4Addr::new(10, 0, 0, 2));
-    // Congestion controller: `FERRUM_CC=cubic` runs CUBIC (RFC 8312), `=bbr` runs BBR; anything
-    // else (default) is Reno. The swappable knob for the Reno-vs-CUBIC-vs-BBR comparison.
+    // Congestion controller: `FERRUM_CC=cubic` runs CUBIC (RFC 8312), `=bbr` runs BBR, `=dctcp`
+    // runs DCTCP (RFC 8257, L4S/ECN); anything else (default) is Reno. The swappable knob for the
+    // Reno-vs-CUBIC-vs-BBR-vs-DCTCP comparison. (DCTCP only reacts to congestion if the path marks
+    // CE — over a plain TUN with no ECN AQM it behaves like Reno; the marking demo is the in-process
+    // bottleneck sim.)
     let cc_kind = match std::env::var("FERRUM_CC").as_deref() {
         Ok("cubic") => CcKind::Cubic,
         Ok("bbr") => CcKind::Bbr,
+        Ok("dctcp") => CcKind::Dctcp,
         _ => CcKind::Reno,
     };
     let cc_name = match cc_kind {
         CcKind::Reno => "reno",
         CcKind::Cubic => "cubic",
         CcKind::Bbr => "bbr",
+        CcKind::Dctcp => "dctcp",
     };
 
     // `tcp-tun <dev> connect <server-ip> [path]` is the download client; otherwise serve.

@@ -37,6 +37,7 @@ use crate::congestion::CcKind;
 use crate::iface::Endpoint;
 use crate::runtime::{MockDevice, Runtime};
 use crate::time::Instant;
+use crate::wire::{set_ecn, ECN_CE, ECN_ECT0, ECN_ECT1};
 use std::net::Ipv4Addr;
 
 /// SplitMix64 — a tiny, fast, well-distributed deterministic PRNG (Vigna). Seeded once per scenario;
@@ -286,6 +287,20 @@ pub enum Aqm {
     /// Classic tail-drop: drop a frame that would overflow the buffer. This is what produces
     /// bufferbloat — a loss-based controller only learns of congestion once the buffer is *full*.
     TailDrop,
+    /// L4S-style CE marking (RFC 9331 / DCTCP RFC 8257): an ECN-capable (ECT) frame whose standing-
+    /// queue delay exceeds `threshold_us` is marked CE — *congestion experienced* — instead of
+    /// waiting for the buffer to fill, so an ECN-aware controller (DCTCP) reacts to a **shallow**
+    /// queue and holds it sub-millisecond. A Not-ECT frame (Reno/CUBIC/BBR) is never marked, and a
+    /// genuinely full buffer still tail-drops as the backstop. This is the AQM that makes the
+    /// latency leap visible: same bottleneck, the marking turns a 24–74 ms queue into a sub-ms one.
+    CeMark { threshold_us: u64 },
+}
+
+/// True if a frame's IPv4 ECN codepoint is ECT(0) or ECT(1) — i.e. the sender marked it ECN-capable,
+/// so a congested AQM may set CE on it instead of dropping. Frames shorter than an IPv4 header (none
+/// reach here) and Not-ECT/CE frames are not ECT.
+fn frame_is_ect(frame: &[u8]) -> bool {
+    frame.len() >= 20 && matches!(frame[1] & 0x03, ECN_ECT0 | ECN_ECT1)
 }
 
 /// A rate-limited, finite-buffer bottleneck — the *realistic* congestion case (vs the DST link's
@@ -310,6 +325,9 @@ pub struct QueueStats {
     pub mean_queue_us: u64,
     pub delivered: u64,
     pub dropped: u64,
+    /// Frames the AQM marked CE (only an [`Aqm::CeMark`] bottleneck ever marks; an ECN test asserts
+    /// this fired, so a regression that stopped marking can't pass over a silently-unmarked link).
+    pub marked: u64,
 }
 
 struct BottleneckLink {
@@ -322,6 +340,7 @@ struct BottleneckLink {
     max_queue_us: [u64; 2],
     delivered: [u64; 2],
     dropped: [u64; 2],
+    marked: [u64; 2],
 }
 
 impl BottleneckLink {
@@ -335,21 +354,32 @@ impl BottleneckLink {
             max_queue_us: [0; 2],
             delivered: [0; 2],
             dropped: [0; 2],
+            marked: [0; 2],
         }
     }
 
-    fn enqueue(&mut self, now: Instant, side: Side, frame: Vec<u8>) {
+    fn enqueue(&mut self, now: Instant, side: Side, mut frame: Vec<u8>) {
         let i = side as usize;
         let rate = self.cfg.rate_bytes_per_sec.max(1);
         // Standing backlog (bytes still queued ahead of `now`) = rate × time-until-link-free.
         let backlog_bytes = self.next_free[i].saturating_micros_since(now).saturating_mul(rate) / 1_000_000;
         if backlog_bytes + frame.len() as u64 > self.cfg.buffer_bytes {
-            self.dropped[i] += 1; // tail-drop on a full buffer
+            self.dropped[i] += 1; // tail-drop on a full buffer (the backstop, under any AQM)
             return;
         }
         let serialize_us = (frame.len() as u64).saturating_mul(1_000_000) / rate;
         let start = if self.next_free[i] > now { self.next_free[i] } else { now };
         let queue_us = start.saturating_micros_since(now); // waiting time = the standing-queue delay
+        // L4S CE marking: an ECN-capable frame meeting a standing queue deeper than the threshold is
+        // marked CE rather than dropped, so a DCTCP sender reacts to a shallow queue. `set_ecn` fixes
+        // the IP checksum; the TCP checksum is untouched (its pseudo-header excludes the ECN byte),
+        // so the marked frame still validates at the receiver.
+        if let Aqm::CeMark { threshold_us } = self.cfg.aqm {
+            if queue_us > threshold_us && frame_is_ect(&frame) {
+                set_ecn(&mut frame, ECN_CE);
+                self.marked[i] += 1;
+            }
+        }
         let depart = start.plus_micros(serialize_us);
         self.next_free[i] = depart;
         self.sum_queue_us[i] += queue_us;
@@ -375,6 +405,7 @@ impl BottleneckLink {
             mean_queue_us: if self.delivered[i] > 0 { self.sum_queue_us[i] / self.delivered[i] } else { 0 },
             delivered: self.delivered[i],
             dropped: self.dropped[i],
+            marked: self.marked[i],
         }
     }
 }
@@ -708,6 +739,75 @@ mod tests {
             bbr.data_queue.mean_queue_us,
             reno.data_queue.mean_queue_us
         );
+    }
+
+    /// THE LATENCY LEAP (L4S/DCTCP). On one finite-buffer bottleneck fronted by an L4S CE-marking
+    /// AQM, three controllers paint the full latency ladder: loss-based Reno fills the buffer (deep
+    /// bufferbloat), BBR paces to ~1 BDP, and DCTCP — reacting to the *shallow-queue* CE marks the
+    /// AQM sets on its ECT data — holds a **sub-millisecond** standing queue at comparable goodput.
+    /// Deterministic and in-process: the rung the hardware netem story pointed at, with zero variance.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn bottleneck_dctcp_holds_a_sub_millisecond_queue() {
+        // A datacenter-like path (DCTCP's design point): 2.5 MB/s, a deep 512 KiB buffer, a 4 ms base
+        // RTT (BDP ≈ 10 KiB), and an L4S AQM that marks CE once a frame's standing-queue delay tops
+        // 1 ms. Reno/BBR send Not-ECT, so the AQM cannot mark them — they bloat exactly as they would
+        // under tail-drop; only DCTCP's ECT data is marked, and only DCTCP reacts to it.
+        let bn = Bottleneck { rate_bytes_per_sec: 2_500_000, buffer_bytes: 512 * 1024, base_delay_us: 2_000, aqm: Aqm::CeMark { threshold_us: 1_000 } };
+        let bytes = 2 * 1024 * 1024;
+        let reno = run_bottleneck(7, bn, bytes, CcKind::Reno);
+        let bbr = run_bottleneck(7, bn, bytes, CcKind::Bbr);
+        let dctcp = run_bottleneck(7, bn, bytes, CcKind::Dctcp);
+        assert!(reno.completed && bbr.completed && dctcp.completed, "all deliver intact: reno {reno:?} bbr {bbr:?} dctcp {dctcp:?}");
+
+        // Teeth: the AQM actually CE-marked DCTCP's ECT data (without marks DCTCP would behave like
+        // Reno here), and it never marked the Not-ECT loss-based controllers.
+        assert!(dctcp.data_queue.marked > 0, "the CE-marking AQM must mark DCTCP's ECT frames: {dctcp:?}");
+        assert_eq!(reno.data_queue.marked, 0, "Not-ECT Reno is never CE-marked: {reno:?}");
+        assert_eq!(bbr.data_queue.marked, 0, "Not-ECT BBR is never CE-marked: {bbr:?}");
+        // Pure marking, no drops — DCTCP keeps the buffer far from full.
+        assert_eq!(dctcp.data_queue.dropped, 0, "DCTCP holds the queue shallow — nothing tail-drops: {dctcp:?}");
+
+        // The ladder: DCTCP ≪ BBR ≪ Reno standing queue.
+        assert!(dctcp.data_queue.mean_queue_us < 1_000, "DCTCP holds a sub-millisecond queue: {} µs", dctcp.data_queue.mean_queue_us);
+        assert!(
+            dctcp.data_queue.mean_queue_us * 4 < bbr.data_queue.mean_queue_us,
+            "DCTCP ≪ BBR: dctcp {} µs vs bbr {} µs",
+            dctcp.data_queue.mean_queue_us,
+            bbr.data_queue.mean_queue_us
+        );
+        assert!(
+            bbr.data_queue.mean_queue_us < reno.data_queue.mean_queue_us,
+            "BBR < Reno: bbr {} µs vs reno {} µs",
+            bbr.data_queue.mean_queue_us,
+            reno.data_queue.mean_queue_us
+        );
+
+        // ...at comparable goodput: DCTCP doesn't buy its low latency by going slow — a clear
+        // majority of the 2.5 MB/s line, and ≥ 80 % of what loss-based Reno (which floods the buffer)
+        // manages on the same path.
+        assert!(dctcp.throughput_bytes_per_sec() > 1_800_000, "DCTCP stays near the line: {} B/s", dctcp.throughput_bytes_per_sec());
+        assert!(
+            dctcp.throughput_bytes_per_sec() * 5 > reno.throughput_bytes_per_sec() * 4,
+            "DCTCP goodput comparable to Reno: dctcp {} B/s vs reno {} B/s",
+            dctcp.throughput_bytes_per_sec(),
+            reno.throughput_bytes_per_sec()
+        );
+    }
+
+    /// DCTCP's L4S ECN reaction is *additive* to the loss machinery, never a replacement for it: on
+    /// the fault link (which never CE-marks), DCTCP sees no marks and must be exactly as robust as any
+    /// other controller — delivering every byte intact under heavy loss, duplication and reordering.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dst_dctcp_is_robust_under_loss() {
+        for loss in [1u32, 5, 10] {
+            for seed in 0..40u64 {
+                let scn = Scenario { seed, link: LinkConfig::lossy(loss), bytes: 32_000, cc: CcKind::Dctcp };
+                let outcome = run(&scn);
+                assert!(outcome.is_completed(), "DCTCP must survive loss: {scn:?} -> {outcome:?}");
+            }
+        }
     }
 
     /// Determinism + a sanity floor: a small transfer over a fast bottleneck completes with integrity,
