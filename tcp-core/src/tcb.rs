@@ -530,7 +530,16 @@ impl Tcb {
                 // later 3rd dup-ACK can neither re-enter nor double-halve cwnd after an early
                 // IsLost entry. The selective retransmit itself is driven by poll_transmit
                 // (step 0.5); we only arm recovery + the RTO timer here.
-                if !self.scoreboard.in_recovery() {
+                //
+                // Also suppressed while a post-RTO go-back-N drain is in progress (`gbn_recover`):
+                // an RTO keeps the SACKed set (RFC 6675 §5.1), so the first hole-filling cumulative
+                // ACK would still see ≥`DupThresh` blocks above the new SND.UNA and re-enter recovery
+                // — which (a) re-`enter_recovery`s, bouncing cwnd from the RTO's 1·MSS back up to
+                // FlightSize/2 and defeating the slow-start restart, and (b) lets step 0.5 re-send the
+                // very hole step 0 just resent (it was not `mark_rexmit`ed), a redundant copy. The
+                // ack-clocked drain owns the repair until SND.UNA reaches the high-water; SACK
+                // recovery re-engages afterwards if loss persists.
+                if !self.scoreboard.in_recovery() && self.gbn_recover.is_none() {
                     let flight = self.snd_nxt.offset_from(self.snd_una);
                     let three_dups = is_dup && self.cc.on_dup_ack(now, flight);
                     let lost = self.is_lost(self.snd_una);
@@ -2129,6 +2138,42 @@ mod tests {
         // The last hole lands; SND.UNA reaches the drain high-water → the drain closes.
         deliver(&mut tcb, later, &inbound(cnxt, iss + 6001, TcpFlags::ACK, 64000, None, b""));
         assert!(!tcb.gbn_draining_dbg(), "drain closes once SND.UNA reaches the RTO high-water");
+    }
+
+    #[test]
+    fn rto_drain_does_not_re_enter_sack_recovery_or_double_send() {
+        // Regression for the recovery review. After an RTO opens the go-back-N drain, a hole-filling
+        // cumulative ACK that STILL carries SACK blocks above the new SND.UNA must NOT re-enter SACK
+        // recovery (the RTO retained the SACKed set, so IsLost would still fire). If it did: (a)
+        // enter_recovery bounces cwnd off the RTO's 1·MSS back toward FlightSize/2 (defeating the
+        // slow-start restart), and (b) step 0.5 resends the very hole step 0 just resent (a redundant
+        // duplicate). The ack-clocked drain owns the post-RTO repair until SND.UNA reaches its mark.
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established_sack(now, 700, 64000);
+        let data: Vec<u8> = (0..13140).map(|i| i as u8).collect(); // 9 segments, [iss+1 .. iss+13141)
+        tcb.send(&data);
+        drain_raw(&mut tcb, now);
+        // Two holes — seg 1 ([iss+1, iss+1461)) and seg 6 ([iss+7301, iss+8761)) — with SACK for segs
+        // 2..5 and segs 7..9. IsLost flags seg 1 (far more than 2·MSS SACKed above it) → recovery.
+        deliver(&mut tcb, now, &inbound_with_sack(cnxt, iss + 1, 64000,
+            &[(iss + 1461, iss + 7301), (iss + 8761, iss + 13141)]));
+        assert!(tcb.in_sack_recovery_dbg(), "IsLost enters SACK recovery");
+        drain_raw(&mut tcb, now); // selective retransmits of the holes — assume lost
+
+        // RTO: leave SACK recovery, open the go-back-N drain, resend seg 1.
+        let later = tcb.poll_at().expect("rtx armed").plus_millis(1);
+        tcb.on_timer(later);
+        assert!(tcb.gbn_draining_dbg() && !tcb.in_sack_recovery_dbg());
+        assert_eq!(parse(&drain_raw(&mut tcb, later)[0]).seq, iss + 1, "drain resends seg 1");
+
+        // Seg 1 lands; the cumulative ACK jumps to iss+7301 (segs 1..5) but STILL SACKs segs 7..9,
+        // which sit above the new SND.UNA (the seg-6 hole) and would re-trigger IsLost. The gate must
+        // keep us OUT of SACK recovery so step 0.5 doesn't duplicate the go-back-N resend.
+        deliver(&mut tcb, later, &inbound_with_sack(cnxt, iss + 7301, 64000, &[(iss + 8761, iss + 13141)]));
+        assert!(!tcb.in_sack_recovery_dbg(), "the active drain suppresses SACK-recovery re-entry");
+        let out = drain_raw(&mut tcb, later);
+        assert_eq!(out.len(), 1, "the new oldest hole is resent ONCE (no step-0 + step-0.5 double-send)");
+        assert_eq!(parse(&out[0]).seq, iss + 7301, "and it is seg 6, the new SND.UNA");
     }
 
     #[test]
