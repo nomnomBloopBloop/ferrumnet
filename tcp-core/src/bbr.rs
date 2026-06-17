@@ -74,18 +74,17 @@ const MIN_CWND_SEGS: u32 = 4;
 /// the module docs on the inflight bounds.) Above this floor the headroom grows *adaptively* via
 /// the BBRv2 [`Bbr::inflight_lo`]/[`Bbr::inflight_hi`] bounds.
 const RECOVERY_HEADROOM_SEGS: u32 = 3;
-/// Multiplicative-decrease factor applied to [`Bbr::inflight_lo`] on each loss episode: the
-/// short-term inflight bound drops to `(1 − BETA)` of its prior value. Set to a **reno-like 0.5**
-/// (a halving) on purpose. A gentler cut lets the window climb to ≈½·BDP between losses, where —
-/// with only a 4-block SACK option — a single unlucky burst piles up >4 simultaneous holes, SACK
-/// goes blind, and recovery wedges into one-segment-per-RTO go-back-N for the rest of the transfer
-/// (a *sticky* collapse to ~0.2 MB/s). Reno/CUBIC avoid that by keeping a small window; halving on
-/// every loss makes BBR's bound converge to the same small reno-style operating point (~14 segments
-/// at 1 % loss, ~20 at 0.5 %), so it stays SACK-visible and tracks reno/CUBIC instead of wedging.
-const INFLIGHT_LO_BETA: f64 = 0.5;
+/// Multiplicative-decrease factor applied to [`Bbr::inflight_lo`] on each subsequent loss episode:
+/// the short-term inflight bound drops to `(1 − BETA)` of its prior value. A **gentle 0.3** (keep
+/// 70 %, the BBRv2 default), so BBR holds a fuller window than a reno-style halving would and beats
+/// loss-based control when the path can actually carry it. This is only safe because the shared
+/// go-back-N recovery now drains an over-large window's occasional >4-hole burst in O(holes) *round
+/// trips* (ack-clocked, see `Tcb::gbn_recover`) instead of collapsing into one-segment-per-RTO; with
+/// that sticky wedge removed, BBR no longer has to stay reno-small to avoid it.
+const INFLIGHT_LO_BETA: f64 = 0.3;
 /// The survivor fraction of peak inflight used when a bound is first activated, and when an RTO
-/// re-cuts it: a reno-like halving — the proven-robust operating point — the same fraction the
-/// per-episode decrease uses.
+/// re-cuts it: a reno-like halving — the proven-robust operating point for the initial drop and the
+/// severe RTO signal — from which the gentler per-episode trims take over.
 const INFLIGHT_HARD_KEEP: f64 = 0.5;
 
 // ── delivery-rate estimator ───────────────────────────────────────────────────────────────────
@@ -515,12 +514,13 @@ impl Bbr {
         }
     }
 
-    /// Halve the short-term inflight bound on a loss episode (the reno-like multiplicative decrease,
-    /// `INFLIGHT_LO_BETA`). The first activation drops to half the peak inflight; thereafter each loss
-    /// halves the current bound, so under sustained loss it converges to the same small,
-    /// SACK-visible window reno/CUBIC use (rather than climbing to the wedge-prone ≈½·BDP). The
-    /// long-term ceiling `inflight_hi` is touched only by an RTO (the severe signal), so on a path
-    /// whose losses are all SACK-repaired it stays inactive and `inflight_lo` alone binds.
+    /// Cut the short-term inflight bound on a loss episode (the multiplicative decrease). The first
+    /// activation drops to half the peak inflight (`INFLIGHT_HARD_KEEP`, a reno-like halving);
+    /// thereafter each loss trims the current bound more gently (×`(1 − INFLIGHT_LO_BETA)` = ×0.7,
+    /// the BBRv2 default), so BBR settles at a fuller window than a reno halving would — relying on
+    /// the now-fast go-back-N drain to absorb the occasional over-shoot. The long-term ceiling
+    /// `inflight_hi` is touched only by an RTO (the severe signal), so on a path whose losses are all
+    /// SACK-repaired it stays inactive and `inflight_lo` alone binds.
     fn cut_inflight_bounds(&mut self) {
         let floor = self.min_cwnd();
         let latest = self.inflight_latest.max(floor);
