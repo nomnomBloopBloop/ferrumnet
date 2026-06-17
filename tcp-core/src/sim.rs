@@ -20,6 +20,13 @@
 //! link is plain `Vec`s, and there is no real clock — so the harness itself is `Miri`-clean and the
 //! whole run is a pure function of `(seed, config)`.
 //!
+//! *Determinism scope.* The run is exactly reproducible for the **single-connection** workload here:
+//! each [`Runtime`]'s only unordered state is its waker maps, which hold at most one entry at a time
+//! for one flow, so their iteration order can never influence the delivered byte stream, the event
+//! schedule, or the [`Outcome`]. Extending the harness to *concurrent* flows would put several
+//! entries in those maps and so would first need them switched to an ordered map to keep the
+//! cross-process reproducibility that makes a failing seed a complete repro.
+//!
 //! [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 //! [FoundationDB]: https://apple.github.io/foundationdb/testing.html
 
@@ -128,29 +135,38 @@ struct InFlight {
 }
 
 /// The virtual link: a single seeded RNG and a queue of in-flight frames. Each direction applies the
-/// same [`LinkConfig`]; faults are drawn from the RNG, so the entire path is reproducible.
+/// same [`LinkConfig`]; faults are drawn from the RNG, so the entire path is reproducible. It also
+/// tallies the faults it injects (`dropped`/`duplicated`/`corrupted`) — surfaced on a [`Outcome::
+/// Completed`] so a test can *assert the adversary actually acted*, turning "teeth" from a
+/// statistical hope into an executed invariant (a regression that silently disabled injection would
+/// then fail the count assertion instead of passing 1080 scenarios over a secretly-clean link).
 struct Link {
     rng: Rng,
     cfg: LinkConfig,
     inflight: Vec<InFlight>,
     order: u64,
+    dropped: u64,
+    duplicated: u64,
+    corrupted: u64,
 }
 
 impl Link {
     fn new(seed: u64, cfg: LinkConfig) -> Self {
-        Link { rng: Rng::new(seed), cfg, inflight: Vec::new(), order: 0 }
+        Link { rng: Rng::new(seed), cfg, inflight: Vec::new(), order: 0, dropped: 0, duplicated: 0, corrupted: 0 }
     }
 
     /// A frame left a stack at `now`, heading to `side`. Apply the fault model and (unless dropped)
     /// schedule it — plus a duplicate, if drawn.
     fn enqueue(&mut self, now: Instant, side: Side, frame: Vec<u8>) {
         if self.rng.chance_ppm(self.cfg.loss_ppm) {
+            self.dropped += 1;
             return; // dropped on the wire
         }
         let corrupt = self.rng.chance_ppm(self.cfg.corrupt_ppm);
         self.schedule(now, side, frame.clone(), corrupt);
         if self.rng.chance_ppm(self.cfg.dup_ppm) {
             // A duplicate with an independent delay (so it may arrive before or after the original).
+            self.duplicated += 1;
             self.schedule(now, side, frame, false);
         }
     }
@@ -161,6 +177,7 @@ impl Link {
             // — which covers the TCP header, payload, and IP pseudo-header — must reject it.
             let off = 20 + self.rng.below((frame.len() - 20) as u64) as usize;
             frame[off] ^= 1 << (self.rng.below(8) as u8);
+            self.corrupted += 1;
         }
         let delay = self.cfg.min_delay_us + self.rng.below(self.cfg.jitter_us + 1);
         let order = self.order;
@@ -210,8 +227,10 @@ pub struct Scenario {
 /// link; the others are findings (and the `seed` that produced them replays exactly).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// Every byte arrived, in order, intact — after `steps` events and `sim_time_us` of sim time.
-    Completed { steps: u64, sim_time_us: u64 },
+    /// Every byte arrived, in order, intact — after `steps` events and `sim_time_us` of sim time,
+    /// having survived `dropped` losses, `duplicated` duplications, and `corrupted` bit-flips on the
+    /// wire (the tally lets a test prove the fault model actually fired).
+    Completed { steps: u64, sim_time_us: u64, dropped: u64, duplicated: u64, corrupted: u64 },
     /// Bytes arrived but the stream is wrong — a data-integrity bug (the stack delivered corrupt or
     /// reordered data to the application).
     IntegrityViolation { received: usize },
@@ -276,15 +295,21 @@ pub fn run(scn: &Scenario) -> Outcome {
     });
 
     // Client: dial the server and stream the payload. A connect failure (extreme loss exhausting the
-    // SYN retries) just ends the task — the scenario then never completes and surfaces as a Timeout,
-    // which the caller chooses survivable link parameters to avoid.
+    // SYN retries) just ends the task; the scenario then never establishes, so completion never fires
+    // and the run surfaces as `Stuck` (the system quiesces with data still owed) — callers choose
+    // survivable link parameters to avoid it. `connected` records that the handshake completed, so an
+    // empty (`bytes == 0`) transfer is only reported `Completed` after a real connection, never
+    // vacuously at step 0.
     let connector = client.connector();
     let to_send = payload.clone();
+    let connected = Rc::new(std::cell::Cell::new(false));
+    let conn_flag = connected.clone();
     client.spawn(async move {
         let stream = match connector.connect(server_ep).await {
             Ok(s) => s,
             Err(_) => return,
         };
+        conn_flag.set(true);
         let _ = stream.write_all(&to_send).await;
         stream.close();
     });
@@ -308,11 +333,18 @@ pub fn run(scn: &Scenario) -> Outcome {
             link.enqueue(now, Side::ToClient, f);
         }
 
-        // 3. Done the instant the whole payload has arrived — check integrity then.
+        // 3. Done once the connection is up and the whole payload has arrived — check integrity then.
+        //    Gating on `connected` keeps an empty transfer from reporting success before it handshakes.
         let got = received.borrow().len();
-        if got >= scn.bytes {
+        if connected.get() && got >= scn.bytes {
             return if *received.borrow() == *payload {
-                Outcome::Completed { steps, sim_time_us: now.micros() }
+                Outcome::Completed {
+                    steps,
+                    sim_time_us: now.micros(),
+                    dropped: link.dropped,
+                    duplicated: link.duplicated,
+                    corrupted: link.corrupted,
+                }
             } else {
                 Outcome::IntegrityViolation { received: got }
             };
@@ -418,6 +450,33 @@ mod tests {
             let scn = Scenario { seed, link: LinkConfig::lossy(20), bytes: 16_000, cc: CcKind::Bbr };
             let outcome = run(&scn);
             assert!(outcome.is_completed(), "heavy loss must not wedge: {scn:?} -> {outcome:?}");
+        }
+    }
+
+    /// Teeth as an *executed* invariant: the adversary must really act. If a regression silently
+    /// disabled fault injection, the 1080-scenario suite above would pass over a secretly-clean link
+    /// and test nothing — so here we count the injected faults and assert they fired. (The standard
+    /// DST guard; without it, "we ran many scenarios" can quietly degrade to "we ran a clean link
+    /// many times".)
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dst_fault_model_actually_fires() {
+        let (mut drops, mut dups) = (0u64, 0u64);
+        for seed in 0..20u64 {
+            match run(&Scenario { seed, link: LinkConfig::lossy(20), bytes: 16_000, cc: CcKind::Reno }) {
+                Outcome::Completed { dropped, duplicated, .. } => {
+                    drops += dropped;
+                    dups += duplicated;
+                }
+                o => panic!("expected Completed, got {o:?}"),
+            }
+        }
+        assert!(drops > 0, "a 20% lossy link must actually drop frames");
+        assert!(dups > 0, "...and duplicate some");
+        // A corrupting link must actually mangle frames (which the checksum then rejects).
+        match run(&Scenario { seed: 3, link: LinkConfig { corrupt_ppm: 80_000, ..LinkConfig::lossy(2) }, bytes: 20_000, cc: CcKind::Reno }) {
+            Outcome::Completed { corrupted, .. } => assert!(corrupted > 0, "the corrupting link must corrupt frames"),
+            o => panic!("expected Completed, got {o:?}"),
         }
     }
 }
