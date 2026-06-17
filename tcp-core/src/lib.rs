@@ -32,6 +32,7 @@ pub mod rtt;
 pub mod runtime;
 pub mod sack;
 pub mod seq;
+pub mod sim;
 pub mod state;
 pub mod tcb;
 pub mod time;
