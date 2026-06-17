@@ -187,28 +187,260 @@ impl Link {
 
     /// The earliest scheduled delivery, if any (drives the event scheduler's clock).
     fn next_deliver_at(&self) -> Option<Instant> {
-        self.inflight.iter().map(|f| f.deliver_at).min()
+        min_deliver_at(&self.inflight)
     }
 
-    /// Inject every frame now due (`deliver_at ≤ now`) into its destination stack, in
-    /// `(deliver_at, order)` order so delivery is deterministic.
+    /// Inject every frame now due into its destination stack (see [`flush_due`]).
     fn deliver_due(&mut self, now: Instant, client: &mut Runtime<MockDevice>, server: &mut Runtime<MockDevice>) {
-        let mut due: Vec<InFlight> = Vec::new();
-        let mut keep: Vec<InFlight> = Vec::new();
-        for f in std::mem::take(&mut self.inflight) {
-            if f.deliver_at <= now {
-                due.push(f);
-            } else {
-                keep.push(f);
+        flush_due(&mut self.inflight, now, client, server);
+    }
+}
+
+/// The earliest scheduled delivery across a set of in-flight frames.
+fn min_deliver_at(inflight: &[InFlight]) -> Option<Instant> {
+    inflight.iter().map(|f| f.deliver_at).min()
+}
+
+/// Inject every frame now due (`deliver_at ≤ now`) into its destination stack, in `(deliver_at,
+/// order)` order so delivery is deterministic regardless of `Vec` layout.
+fn flush_due(inflight: &mut Vec<InFlight>, now: Instant, client: &mut Runtime<MockDevice>, server: &mut Runtime<MockDevice>) {
+    let mut due: Vec<InFlight> = Vec::new();
+    let mut keep: Vec<InFlight> = Vec::new();
+    for f in std::mem::take(inflight) {
+        if f.deliver_at <= now {
+            due.push(f);
+        } else {
+            keep.push(f);
+        }
+    }
+    *inflight = keep;
+    due.sort_by_key(|f| (f.deliver_at, f.order));
+    for f in due {
+        match f.side {
+            Side::ToClient => client.device_mut().inject(f.frame),
+            Side::ToServer => server.device_mut().inject(f.frame),
+        }
+    }
+}
+
+/// The two wired stacks plus the shared workload state — built once, then driven through either the
+/// fault link ([`run`]) or the bottleneck link ([`run_bottleneck`]).
+struct Pair {
+    client: Runtime<MockDevice>,
+    server: Runtime<MockDevice>,
+    payload: Rc<Vec<u8>>,
+    received: Rc<RefCell<Vec<u8>>>,
+    connected: Rc<std::cell::Cell<bool>>,
+}
+
+/// Build a client→server bulk transfer of `bytes` over a fresh pair of stacks running `cc`. The
+/// server drains into `received`; the client dials, marks `connected` on success, streams the
+/// payload, and closes. Read errors / a connect failure end the relevant task cleanly (never panic).
+fn build_pair(seed: u64, bytes: usize, cc: CcKind) -> Pair {
+    let server_ep = Endpoint::new(SERVER_IP, 8080);
+    // `set_congestion_control` / `listener` / `connector` / `spawn` are all `&self`; the runtimes
+    // only need `&mut` once the caller drives them with `turn`, so they are bound mutable there.
+    let server = Runtime::new(MockDevice::new(), server_ep, secret_from(seed, 0xA5A5));
+    let client = Runtime::new(MockDevice::new(), Endpoint::new(CLIENT_IP, 40_000), secret_from(seed, 0x5A5A));
+    server.set_congestion_control(cc);
+    client.set_congestion_control(cc);
+
+    let payload: Rc<Vec<u8>> = Rc::new(payload_of(bytes));
+    let received: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::with_capacity(bytes)));
+
+    let listener = server.listener();
+    let rv = received.clone();
+    server.spawn(async move {
+        let stream = listener.accept().await;
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => rv.borrow_mut().extend_from_slice(&buf[..n]),
             }
         }
-        self.inflight = keep;
-        due.sort_by_key(|f| (f.deliver_at, f.order));
-        for f in due {
-            match f.side {
-                Side::ToClient => client.device_mut().inject(f.frame),
-                Side::ToServer => server.device_mut().inject(f.frame),
-            }
+    });
+
+    let connector = client.connector();
+    let to_send = payload.clone();
+    let connected = Rc::new(std::cell::Cell::new(false));
+    let conn_flag = connected.clone();
+    client.spawn(async move {
+        let stream = match connector.connect(server_ep).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        conn_flag.set(true);
+        let _ = stream.write_all(&to_send).await;
+        stream.close();
+    });
+
+    Pair { client, server, payload, received, connected }
+}
+
+// ── bottleneck link (the reproducible congestion-control testbed) ────────────────────────────────
+
+/// Active-queue management at the bottleneck.
+#[derive(Clone, Copy, Debug)]
+pub enum Aqm {
+    /// Classic tail-drop: drop a frame that would overflow the buffer. This is what produces
+    /// bufferbloat — a loss-based controller only learns of congestion once the buffer is *full*.
+    TailDrop,
+}
+
+/// A rate-limited, finite-buffer bottleneck — the *realistic* congestion case (vs the DST link's
+/// independent per-packet loss). A greedy loss-based sender fills the buffer (bufferbloat → high
+/// queuing latency); a sender that paces to the bottleneck (BBR) keeps the standing queue near
+/// empty. Each direction is an independent FIFO served at `rate_bytes_per_sec`; the bulk-data
+/// direction develops the standing queue while the ACK direction stays near empty.
+#[derive(Clone, Copy, Debug)]
+pub struct Bottleneck {
+    pub rate_bytes_per_sec: u64,
+    pub buffer_bytes: u64,
+    pub base_delay_us: u64,
+    pub aqm: Aqm,
+}
+
+/// Queue + loss statistics for one direction of a bottleneck run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueStats {
+    /// Largest standing-queue delay any frame waited (µs).
+    pub max_queue_us: u64,
+    /// Mean standing-queue delay across delivered frames (µs) — the bufferbloat metric.
+    pub mean_queue_us: u64,
+    pub delivered: u64,
+    pub dropped: u64,
+}
+
+struct BottleneckLink {
+    cfg: Bottleneck,
+    inflight: Vec<InFlight>,
+    order: u64,
+    /// Serialization clock per `Side`: when the link next becomes free to start sending a frame.
+    next_free: [Instant; 2],
+    sum_queue_us: [u64; 2],
+    max_queue_us: [u64; 2],
+    delivered: [u64; 2],
+    dropped: [u64; 2],
+}
+
+impl BottleneckLink {
+    fn new(cfg: Bottleneck) -> Self {
+        BottleneckLink {
+            cfg,
+            inflight: Vec::new(),
+            order: 0,
+            next_free: [Instant::ZERO; 2],
+            sum_queue_us: [0; 2],
+            max_queue_us: [0; 2],
+            delivered: [0; 2],
+            dropped: [0; 2],
+        }
+    }
+
+    fn enqueue(&mut self, now: Instant, side: Side, frame: Vec<u8>) {
+        let i = side as usize;
+        let rate = self.cfg.rate_bytes_per_sec.max(1);
+        // Standing backlog (bytes still queued ahead of `now`) = rate × time-until-link-free.
+        let backlog_bytes = self.next_free[i].saturating_micros_since(now).saturating_mul(rate) / 1_000_000;
+        if backlog_bytes + frame.len() as u64 > self.cfg.buffer_bytes {
+            self.dropped[i] += 1; // tail-drop on a full buffer
+            return;
+        }
+        let serialize_us = (frame.len() as u64).saturating_mul(1_000_000) / rate;
+        let start = if self.next_free[i] > now { self.next_free[i] } else { now };
+        let queue_us = start.saturating_micros_since(now); // waiting time = the standing-queue delay
+        let depart = start.plus_micros(serialize_us);
+        self.next_free[i] = depart;
+        self.sum_queue_us[i] += queue_us;
+        self.max_queue_us[i] = self.max_queue_us[i].max(queue_us);
+        self.delivered[i] += 1;
+        let order = self.order;
+        self.order += 1;
+        self.inflight.push(InFlight { deliver_at: depart.plus_micros(self.cfg.base_delay_us), side, order, frame });
+    }
+
+    fn next_deliver_at(&self) -> Option<Instant> {
+        min_deliver_at(&self.inflight)
+    }
+
+    fn deliver_due(&mut self, now: Instant, client: &mut Runtime<MockDevice>, server: &mut Runtime<MockDevice>) {
+        flush_due(&mut self.inflight, now, client, server);
+    }
+
+    fn stats(&self, side: Side) -> QueueStats {
+        let i = side as usize;
+        QueueStats {
+            max_queue_us: self.max_queue_us[i],
+            mean_queue_us: if self.delivered[i] > 0 { self.sum_queue_us[i] / self.delivered[i] } else { 0 },
+            delivered: self.delivered[i],
+            dropped: self.dropped[i],
+        }
+    }
+}
+
+/// The result of a bottleneck transfer: whether it completed with integrity, how long it took, and
+/// the bulk-data-direction queue statistics (the bufferbloat metric).
+#[derive(Clone, Copy, Debug)]
+pub struct BottleneckResult {
+    pub completed: bool,
+    pub sim_time_us: u64,
+    pub bytes: usize,
+    pub data_queue: QueueStats,
+}
+
+impl BottleneckResult {
+    /// Goodput in bytes/second over the transfer.
+    pub fn throughput_bytes_per_sec(&self) -> u64 {
+        if self.sim_time_us > 0 {
+            (self.bytes as u64).saturating_mul(1_000_000) / self.sim_time_us
+        } else {
+            0
+        }
+    }
+}
+
+/// Run a bulk transfer over a finite-buffer bottleneck and measure throughput + queuing latency.
+/// **Deterministic.** The data direction is client→server ([`Side::ToServer`]); its standing queue
+/// is the bufferbloat metric — a loss-based controller fills it, a paced one (BBR) keeps it small.
+pub fn run_bottleneck(seed: u64, cfg: Bottleneck, bytes: usize, cc: CcKind) -> BottleneckResult {
+    let Pair { mut client, mut server, payload, received, connected } = build_pair(seed, bytes, cc);
+    let mut link = BottleneckLink::new(cfg);
+    let mut now = Instant::from_micros(0);
+    let mut steps: u64 = 0;
+    let result = |completed, now: Instant, link: &BottleneckLink| BottleneckResult {
+        completed,
+        sim_time_us: now.micros(),
+        bytes,
+        data_queue: link.stats(Side::ToServer),
+    };
+
+    loop {
+        link.deliver_due(now, &mut client, &mut server);
+        client.turn(now).expect("mock device never errors");
+        server.turn(now).expect("mock device never errors");
+        for f in client.device_mut().take_outbound() {
+            link.enqueue(now, Side::ToServer, f);
+        }
+        for f in server.device_mut().take_outbound() {
+            link.enqueue(now, Side::ToClient, f);
+        }
+
+        let got = received.borrow().len();
+        if connected.get() && got >= bytes {
+            return result(*received.borrow() == *payload, now, &link);
+        }
+
+        steps += 1;
+        if steps > MAX_STEPS || now.micros() > MAX_SIM_US {
+            return result(false, now, &link);
+        }
+
+        let next = [client.poll_at(), server.poll_at(), link.next_deliver_at()].into_iter().flatten().min();
+        match next {
+            Some(t) if t > now => now = t,
+            Some(_) => now = now.plus_micros(1),
+            None => return result(false, now, &link),
         }
     }
 }
@@ -269,50 +501,11 @@ fn secret_from(seed: u64, salt: u64) -> [u8; 16] {
 /// Run one scenario to completion (or to a finding). **Deterministic**: the same [`Scenario`]
 /// always returns the same [`Outcome`], so a failing seed is a complete, replayable repro.
 pub fn run(scn: &Scenario) -> Outcome {
-    let server_ep = Endpoint::new(SERVER_IP, 8080);
-
-    let mut server = Runtime::new(MockDevice::new(), server_ep, secret_from(scn.seed, 0xA5A5));
-    let mut client = Runtime::new(MockDevice::new(), Endpoint::new(CLIENT_IP, 40_000), secret_from(scn.seed, 0x5A5A));
-    server.set_congestion_control(scn.cc);
-    client.set_congestion_control(scn.cc);
-
-    let payload: Rc<Vec<u8>> = Rc::new(payload_of(scn.bytes));
-    let received: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::with_capacity(scn.bytes)));
-
-    // Server: accept one connection and drain it into `received`. Errors (e.g. a peer RST) just end
-    // the read loop — a correct stack must never *panic*, which is itself one of the invariants.
-    let listener = server.listener();
-    let rv = received.clone();
-    server.spawn(async move {
-        let stream = listener.accept().await;
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => rv.borrow_mut().extend_from_slice(&buf[..n]),
-            }
-        }
-    });
-
-    // Client: dial the server and stream the payload. A connect failure (extreme loss exhausting the
-    // SYN retries) just ends the task; the scenario then never establishes, so completion never fires
-    // and the run surfaces as `Stuck` (the system quiesces with data still owed) — callers choose
-    // survivable link parameters to avoid it. `connected` records that the handshake completed, so an
-    // empty (`bytes == 0`) transfer is only reported `Completed` after a real connection, never
-    // vacuously at step 0.
-    let connector = client.connector();
-    let to_send = payload.clone();
-    let connected = Rc::new(std::cell::Cell::new(false));
-    let conn_flag = connected.clone();
-    client.spawn(async move {
-        let stream = match connector.connect(server_ep).await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        conn_flag.set(true);
-        let _ = stream.write_all(&to_send).await;
-        stream.close();
-    });
+    // Two stacks + the bulk-transfer workload (server drains into `received`; client dials, sets
+    // `connected`, streams the payload). `connected` gates completion so an empty (`bytes == 0`)
+    // transfer is only reported `Completed` after a real handshake, never vacuously at step 0; a
+    // connect failure under extreme loss leaves it false, so the run quiesces to `Stuck`.
+    let Pair { mut client, mut server, payload, received, connected } = build_pair(scn.seed, scn.bytes, scn.cc);
 
     let mut link = Link::new(scn.seed, scn.link);
     let mut now = Instant::from_micros(0);
@@ -478,5 +671,54 @@ mod tests {
             Outcome::Completed { corrupted, .. } => assert!(corrupted > 0, "the corrupting link must corrupt frames"),
             o => panic!("expected Completed, got {o:?}"),
         }
+    }
+
+    // ── bottleneck testbed ────────────────────────────────────────────────────────────────────────
+
+    /// The reproducible bufferbloat result, in-process and deterministic (the same story the hardware
+    /// netem bench told, but with zero variance). On a 20 mbit bottleneck with a deep 256 KiB buffer
+    /// (BDP ≈ 50 KiB at the 20 ms base RTT), Reno grows its window until the buffer overflows — a
+    /// standing queue, i.e. bufferbloat — while BBR paces to the bottleneck and keeps the queue near
+    /// empty. Same goodput, dramatically different latency under load.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn bottleneck_paced_bbr_avoids_the_bufferbloat_loss_based_cc_causes() {
+        // Buffer (512 KiB) > the 256 KiB receive window, so Reno is window-limited at ~256 KiB in
+        // flight and parks a steady ~200 KiB standing queue (deep bufferbloat); the 2 MiB transfer is
+        // long enough for that steady state to dominate the ramp. BBR paces to the line and holds the
+        // queue near a BDP.
+        let bn = Bottleneck { rate_bytes_per_sec: 2_500_000, buffer_bytes: 512 * 1024, base_delay_us: 10_000, aqm: Aqm::TailDrop };
+        let reno = run_bottleneck(7, bn, 2 * 1024 * 1024, CcKind::Reno);
+        let bbr = run_bottleneck(7, bn, 2 * 1024 * 1024, CcKind::Bbr);
+        // Measured: Reno parks a ~74 ms mean standing queue; BBR holds ~24 ms (≈1 BDP) — ~3× lower at
+        // near-equal goodput, and no drops (window-limited, pure bufferbloat). The BBR residual is the
+        // rung L4S/DCTCP pushes to sub-millisecond.
+        assert!(reno.completed && bbr.completed, "both deliver intact: reno {reno:?} bbr {bbr:?}");
+        // Both roughly saturate the 2.5 MB/s line...
+        assert!(
+            reno.throughput_bytes_per_sec() > 1_500_000 && bbr.throughput_bytes_per_sec() > 1_500_000,
+            "both near the line: reno {} bbr {}",
+            reno.throughput_bytes_per_sec(),
+            bbr.throughput_bytes_per_sec()
+        );
+        // ...but BBR holds a far smaller standing queue (it keeps the bottleneck busy, not bloated).
+        assert!(
+            bbr.data_queue.mean_queue_us * 2 < reno.data_queue.mean_queue_us,
+            "BBR keeps the queue far smaller: bbr {} µs vs reno {} µs",
+            bbr.data_queue.mean_queue_us,
+            reno.data_queue.mean_queue_us
+        );
+    }
+
+    /// Determinism + a sanity floor: a small transfer over a fast bottleneck completes with integrity,
+    /// and the same seed reproduces the same queue stats. Light enough for Miri's memory-safety check.
+    #[test]
+    fn bottleneck_is_deterministic_and_lossless_when_unloaded() {
+        let bn = Bottleneck { rate_bytes_per_sec: 10_000_000, buffer_bytes: 128 * 1024, base_delay_us: 2_000, aqm: Aqm::TailDrop };
+        let a = run_bottleneck(1, bn, 4_000, CcKind::Reno);
+        let b = run_bottleneck(1, bn, 4_000, CcKind::Reno);
+        assert!(a.completed, "{a:?}");
+        assert_eq!(a.data_queue, b.data_queue, "same seed → same queue stats");
+        assert_eq!(a.data_queue.dropped, 0, "an under-filled fast bottleneck drops nothing");
     }
 }
