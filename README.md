@@ -30,8 +30,8 @@ $ curl -v http://10.0.0.2:8080/
   received bytes and emits bytes to send, with time injected as a parameter. So the whole
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
-  selective recovery, **pluggable congestion control** (Reno / CUBIC / BBR), and a **two-stack
-  userspace loopback** (two instances connecting to each other entirely in memory). **174 tests**,
+  selective recovery, **pluggable congestion control** (Reno / CUBIC / BBR / DCTCP), and a **two-stack
+  userspace loopback** (two instances connecting to each other entirely in memory). **187 tests**,
   green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -106,7 +106,8 @@ splitting between ~6–14 and ~70–78 MB/s depending on where losses fall.)
 
 **Congestion control — Reno vs CUBIC vs BBR.** The controller is **pluggable**: a
 `CongestionControl` trait behind a match-dispatched `Cc` enum (no `Box<dyn>`, zero-alloc, sans-IO),
-selectable at runtime with `FERRUM_CC={reno,cubic,bbr}`. All three are hand-written from the RFCs —
+selectable at runtime with `FERRUM_CC={reno,cubic,bbr,dctcp}`. All four are hand-written from the RFCs
+(DCTCP is detailed in the latency-leap section below) — the first three being
 **Reno** (RFC 5681), **CUBIC** (RFC 8312, the Linux default: cubic window growth + the TCP-friendly
 region), and **BBR** v1 (model-based — it estimates bottleneck bandwidth and min-RTT and *paces* to
 the bandwidth-delay product instead of reacting to loss, with a full STARTUP→DRAIN→PROBE_BW→PROBE_RTT
@@ -165,6 +166,41 @@ carries overhead at a tiny BDP. The honest takeaway is the *bottleneck story* �
 wins, on a real bottleneck queue it wins on latency, under pure random loss the loss-based controllers
 stay ahead, and at tiny BDP window aggression wins.
 
+**The latency leap — L4S/DCTCP holds a sub-millisecond queue.** BBR's residual queue on the
+bottleneck above is the next rung down, and **DCTCP** (RFC 8257, the L4S controller) takes it: it
+reacts to *explicit congestion marks* instead of loss, so it parks a far shallower queue. The whole
+loop is hand-built — the sender marks its data **ECT(1)** (RFC 3168), a CE-marking AQM flips it to
+**CE** the moment the standing queue crosses a threshold (instead of waiting for the buffer to
+overflow), the receiver echoes the marks back as **ECE**, and DCTCP cuts its window in proportion to
+the *fraction* of marked bytes (`cwnd ×= 1 − α/2`, with α an EWMA of that fraction). That proportional
+response parks the queue near the threshold instead of sawtoothing through it. DCTCP is a 4th `Cc`
+variant behind the same trait; the ECN reaction is a no-op default for the others, so Reno/CUBIC/BBR
+stay byte-identical. In the deterministic `sim`, a finite-buffer bottleneck (2.5 MB/s, 4 ms RTT) gains
+a CE-marking AQM (`Aqm::CeMark`) at a 1 ms threshold — and an 8 MiB transfer paints the full ladder
+with **zero variance**:
+
+| same CE-marking bottleneck (sim) | goodput | mean standing queue |
+|---|---|---|
+| Reno  | ~2.4 MB/s | ~102 ms |
+| BBR   | ~2.2 MB/s | ~6.7 ms |
+| **DCTCP** | ~2.2 MB/s | **~0.5 ms** |
+
+And it reproduces **on real hardware** — the two-instance bench through a `codel ce_threshold 1ms ecn`
+bottleneck at 50 mbit (so the Linux qdisc does the CE marking), latency measured as RTT-under-load via
+`ping`:
+
+| 50 mbit CE-marking bottleneck (hardware) | goodput | RTT under load |
+|---|---|---|
+| Reno  | 6.0 MB/s | 42 ms |
+| BBR   | 6.0 MB/s | 1.0 ms |
+| **DCTCP** | 6.0 MB/s | **0.95 ms** |
+
+Same goodput across the board; DCTCP holds the lowest queue — **sub-millisecond**, below even BBR's
+paced queue — a **~44× latency reduction** over loss-based Reno at identical throughput. The
+deterministic sim result carries through the real Linux forwarding path and qdisc, CE marks and ECE
+echoes and all (verified on the wire with `tcpdump`). Both ends run DCTCP: there is no SYN ECN
+negotiation, a documented simplification since the two stacks are configured together.
+
 **Kernel baseline** (Python `http.server` over `lo`, kernel TCP, 16 MiB): median **~800 MB/s**
 (556–893). *Not* apples-to-apples — `lo`'s MTU is 65536 and it is fully in-kernel (no per-packet
 syscall or user/kernel copy), so it is structurally faster on this path. Matching the MTU closes
@@ -185,7 +221,7 @@ neither beats in-kernel loopback, which has neither a per-packet syscall nor a u
   │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream / TcpConnector│
   │    Stack  →  TCB per connection (active + passive open)                            │
   │      wire (parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)            │
-  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR (pluggable) · sack+reasm (2018/6675)│
+  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR/DCTCP · sack+reasm (2018/6675)    │
   │      timestamps (RFC 7323) · delayed ACKs (RFC 1122) · buffers · timers            │
   └────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -215,9 +251,11 @@ and wakes the async tasks.
    **timestamps** (Karn-free RTT + PAWS), and **delayed ACKs** (RFC 1122). (`tcb`, `rtt`, `sack`,
    `reasm`)
 3. **Congestion control** — **pluggable** behind a `CongestionControl` trait + match-dispatched
-   `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312), and **BBR** (v1
+   `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312), **BBR** (v1
    model paced to the BDP, plus BBRv2 `inflight_hi`/`inflight_lo` bounds + ACK-aggregation for
-   under-loss throughput). Selectable with `FERRUM_CC`. (`congestion`, `bbr`)
+   under-loss throughput), and **DCTCP** (RFC 8257, the L4S/ECN controller — ECT marking, CE→ECE
+   echo, and a proportional `cwnd ×= 1 − α/2` cut that holds a sub-millisecond queue). Selectable
+   with `FERRUM_CC`. (`congestion`, `bbr`)
 4. **Zero-copy parsing** — header views over `&[u8]` and the one's-complement Internet checksum
    (RFC 1071), with a clean RX/TX borrow split. (`wire`)
 5. **Async integration** — the `Waker` lifecycle over the sans-IO core, built on the safe
@@ -258,10 +296,11 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 174 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 187 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
-                            #            inflight bounds) + the ack-clocked go-back-N drain
+                            #            inflight bounds) + DCTCP/L4S (ECN echo, alpha, CeMark AQM,
+                            #            the sub-ms latency ladder) + the ack-clocked go-back-N drain
                             #            + deterministic simulation testing (1080 adversarial seeds)
 ```
 
@@ -293,16 +332,21 @@ control** measured head-to-head over the two-instance hardware bench. What's lef
   rate, so pacing throttles. Closing it fully needs a **loss-aware delivery-rate estimate** (the
   direction later BBR versions take). Full traced diagnosis in `docs/DESIGN.md`.
 - **Deterministic simulation testing — done (the `sim` module), and the foundation for more.** Two
-  stacks over a seeded, fault-injecting virtual link, replayable from the seed. The natural next
-  layer is a **bit-reproducible congestion-control testbed**: swap the lossy link for a virtual
-  *bottleneck* (rate + finite buffer + AQM) and the noisy `netem` sweep becomes exact experiments —
-  fairness, convergence, RTT-unfairness, bufferbloat (the bottleneck-queue result above was a first,
-  hardware taste). On top of that, **L4S** (RFC 9330–9332: ECN + a scalable controller like Prague
-  + dualPI2) is the bleeding-edge transport to evaluate next — it slots into the same
-  `CongestionControl` trait and would extend the latency ladder below sub-millisecond.
+  stacks over a seeded, fault-injecting virtual link, replayable from the seed. It already grew the
+  next layer: a **bit-reproducible congestion-control testbed** — a virtual *bottleneck* (rate +
+  finite buffer + AQM) turns the noisy `netem` sweep into exact experiments (bufferbloat, and the
+  CE-marking AQM behind the DCTCP latency ladder above).
+- **L4S — the ECN half is done; the scalable-CC frontier is next.** **DCTCP** (RFC 8257) + ECN
+  marking/echo (RFC 3168) ship now, holding a sub-millisecond queue on a CE-marking bottleneck (sim
+  *and* hardware, table above). The bleeding edge from here is the rest of **L4S** (RFC 9330–9332):
+  **AccECN** (RFC 9768, multi-bit ECN feedback — what would convey the exact per-byte mark count the
+  one-bit ECE echo only approximates), a **TCP Prague**-style scalable + RTT-independent controller,
+  and a **dual-queue coupled AQM** (dualPI2) proving L4S flows coexist fairly with classic traffic.
+  All slot into the same `CongestionControl` trait.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
-- **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, ECN (RFC 3168), TCP Fast
-  Open, keepalives, Nagle — the details that separate "a TCP" from "real TCP".
+- **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, classic ECN negotiation
+  (RFC 3168 — DCTCP here skips the SYN handshake), TCP Fast Open, keepalives, Nagle — the details
+  that separate "a TCP" from "real TCP".
 
 Deliberately *not* on the roadmap: AF_XDP / DPDK / RDMA (a different kind of project — RDMA replaces
 the TCP stack rather than speeding it) and multi-threading (single-threaded by design; an
@@ -314,7 +358,7 @@ complete implementation, not a stub.
 
 RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP + host requirements, incl. delayed ACKs), RFC 1071
 (checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (Reno + initial window), RFC 8312 (CUBIC),
-the BBR congestion-control draft + Cheng/Cardwell delivery-rate estimation, RFC 6298 (RTO),
-RFC 2018 + 6675 (SACK & selective recovery), RFC 7323 (timestamps & window scaling), RFC 5961 +
-6528 (blind-attack hardening); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built milestone by
-milestone; see [`docs/DESIGN.md`](docs/DESIGN.md).
+the BBR congestion-control draft + Cheng/Cardwell delivery-rate estimation, RFC 3168 (ECN) + RFC 8257
+(DCTCP) + RFC 9330–9332 (L4S), RFC 6298 (RTO), RFC 2018 + 6675 (SACK & selective recovery), RFC 7323
+(timestamps & window scaling), RFC 5961 + 6528 (blind-attack hardening); W. R. Stevens, *TCP/IP
+Illustrated, Vol. 1*. Built milestone by milestone; see [`docs/DESIGN.md`](docs/DESIGN.md).

@@ -68,7 +68,7 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
                reliability, flow control, teardown, per-connection timers, SACK recovery,
                active open (SYN-SENT), RFC 7323 timestamps + PAWS, delayed ACKs
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
-  congestion   pluggable CongestionControl trait + Cc enum: Reno, CUBIC  [M3,M13]
+  congestion   pluggable CongestionControl trait + Cc enum: Reno/CUBIC/DCTCP [M3,M13,M14]
   bbr          BBR v1: delivery-rate sampler + windowed-max + state machine [M13]
   buffers      rx/tx ring buffers                                       [M2]
   reasm        receiver out-of-order reassembly (coalesced runs)        [M8]
@@ -76,6 +76,8 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
   runtime/     hand-rolled async: executor, reactor, TcpListener/Stream/ [M4,M9]
                TcpConnector, Device trait + in-memory MockDevice
+  sim          deterministic simulation testing: 2 stacks over a seeded   [M14]
+               fault link + a finite-buffer bottleneck (CeMark/L4S AQM)
 tcp-tun/   (Linux-only backend + demo)
   sys          extern "C" ioctl/poll + repr(C) ifreq/pollfd            [M0]
   tun          TunDevice : Device (IFF_TUN|IFF_NO_PI, O_NONBLOCK)       [M0/M5]
@@ -90,11 +92,12 @@ persist / TIME-WAIT / FIN-WAIT-2 deadlines; the `Stack` takes the min across con
 hashed timer wheel would be the O(1) generalization at thousands of connections, but is
 unnecessary at this scale.
 
-**Deliberately out of scope** (the demo does not need them): delayed-ACK (we ACK immediately),
-TCP timestamps, IP fragmentation/reassembly, and active open (`connect`) — this is a server. None
-are stubbed; the code paths simply don't exist yet. (**SACK**, out-of-order **reassembly**,
-**RFC 6675** selective recovery, and **window scaling** (RFC 7323) were originally out of scope
-and are now implemented — see §5.8.)
+**Originally out of scope, now implemented.** The demo began as a bare server, so delayed ACKs,
+TCP timestamps, active open (`connect`), SACK, out-of-order reassembly, RFC 6675 selective recovery,
+window scaling, the Reno→CUBIC→BBR→DCTCP controllers, and the io_uring backend were all out of the
+first cut — none stubbed, the code paths simply didn't exist. They were added milestone by milestone
+(§5.5, §5.8, §5.9, §5.10). What remains genuinely out of scope: **IP fragmentation/reassembly** (a
+fragmented inbound datagram is dropped) and **IPv6**.
 
 **Async model.** A single-threaded executor and reactor on one thread; shared connection
 state is `Rc<RefCell<ConnectionShared>>` — no hot-path locks (the brief's "mutex on every
@@ -174,10 +177,10 @@ RTO per RFC 6298 with Jacobson's estimator and Karn's amendment. Verified traps:
   contract is mandatory — it is the lost-wakeup guard for delayed-ACK and zero-window probes.
   (`retx/T7,N5,N6,X6`)
 
-### 5.5 Congestion control (`congestion`, `bbr`) — M3, M13
+### 5.5 Congestion control (`congestion`, `bbr`) — M3, M13–M14
 
 Congestion control is **pluggable**: a `CongestionControl` trait, held by the TCB in a
-match-dispatched `Cc` enum (`Reno`/`Cubic`/`Bbr`) — **not `Box<dyn>`**, so the send path stays
+match-dispatched `Cc` enum (`Reno`/`Cubic`/`Bbr`/`Dctcp`) — **not `Box<dyn>`**, so the send path stays
 zero-alloc and the engine stays sans-IO. Every event method takes the current `Instant` (a
 time-based controller needs the clock; Reno ignores it). Selectable with `FERRUM_CC`.
 
@@ -267,6 +270,32 @@ throttles below the loss-based controllers; closing it fully needs a loss-aware 
 finite-buffer bottleneck (`netem` 20 mbit + 20 ms + deep queue) all three saturate the link, but BBR
 paces to the bottleneck and holds the queue near-empty — **~31 ms RTT under load vs ~109 ms** for
 Reno/CUBIC at the same goodput, a ~3.5× latency win.
+
+**DCTCP (RFC 8257) — the L4S controller, the next rung past BBR's bottleneck queue.** Where Reno/CUBIC
+react to *loss* and BBR *paces* to a rate, DCTCP reacts to **explicit congestion marks**, so it holds a
+far shallower standing queue. The whole ECN loop is hand-built across the wire and the TCB —
+`ecn_enabled()` gates all of it on `cc_kind == Dctcp`, so Reno/CUBIC/BBR stay byte-identical: the sender
+marks its data **ECT(1)** in the IPv4 header (`wire::set_ecn`, after `build`, fixing only the IP
+checksum — the TCP pseudo-header excludes the ECN byte, so the segment stays valid); a CE-marking AQM
+flips ECT→**CE** once the queue is deep enough; the receiver detects CE on ingress and echoes it as the
+TCP **ECE** flag on its ACKs; the sender turns the per-ACK ECE into a marked-byte count. The controller
+(`congestion::Dctcp`) keeps Reno's additive increase and Reno's loss response, and *adds* the DCTCP
+reaction: an EWMA `α` of the marked fraction over a window (`α ← (1−g)·α + g·fraction`, `g = 1/16`) and,
+once per marked round, a proportional cut `cwnd ×= 1 − α/2`. Light marking → tiny `α` → a gentle trim
+that parks the window just above the BDP (a sub-millisecond queue); heavy marking → `α → 1` → a
+Reno-style halving. `on_ecn` is a no-op trait default for the other three, and the ECN reaction is gated
+out of SACK recovery so it can never drop `cwnd` below `pipe` (the invariant the BBR work established).
+
+*Two deliberate simplifications, both documented.* There is **no SYN ECN negotiation** (RFC 3168
+§6.1.1) — both ends are configured DCTCP together. And the receiver echo is the simplified "OR the marks
+since the last ACK" rule, not the full RFC 8257 §3.2 receiver state machine: it **ORs** each segment's
+CE into `ece_echo` and clears it when echoed, so a mark on a segment coalesced under a delayed ACK is
+never lost — the adversarial review caught the original *overwrite* dropping ~half the marks (measured
+~46% of the CE signal lost on the demo path), which under-counted `α` and let the queue bloat. The
+residual imprecision — one ACK spanning a marked/un-marked run boundary attributes its whole span as
+marked — is the limit of one-bit ECN feedback and biases the queue *lower*, never dropping a signal;
+**AccECN** (RFC 9768) is what would carry the exact per-byte count. The measured latency ladder (sim and
+hardware) is in §5.10.
 
 ### 5.6 Async runtime (`runtime`) — M4
 
@@ -449,6 +478,20 @@ single-connection workload (each `Runtime`'s waker maps hold ≤ 1 entry, so the
 irrelevant); a concurrent-flow harness would first switch those to ordered maps. Everything is
 `std`-only and Miri-clean.
 
+**The congestion-control testbed — a finite-buffer bottleneck and the L4S latency ladder.** Swapping the
+fault link for a rate-limited, finite-buffer FIFO (`Bottleneck`: `rate_bytes_per_sec` + `buffer_bytes` +
+`base_delay_us`, served by `run_bottleneck`) turns the noisy hardware `netem` sweep into an exact,
+zero-variance experiment. Under plain tail-drop it reproduces **bufferbloat** deterministically (Reno
+fills the buffer; BBR paces and holds ~1 BDP). Adding **`Aqm::CeMark { threshold_us }`** — which CE-marks
+an ECT frame the moment its standing-queue delay crosses the threshold (the L4S marking behaviour, with
+tail-drop kept as the backstop) — makes it the DCTCP testbed (§5.5). On one 2.5 MB/s / 4 ms-RTT
+bottleneck with a 1 ms threshold, an 8 MiB transfer paints the full ladder at the same goodput: **Reno
+~102 ms, BBR ~6.7 ms, DCTCP ~0.5 ms** mean standing queue. The result carries to **real hardware** — the
+two-instance bench through a Linux `codel ce_threshold 1ms ecn` qdisc gives **Reno 42 ms, BBR 1.0 ms,
+DCTCP 0.95 ms** RTT-under-load at ~6 MB/s each (confirmed on the wire with `tcpdump`: the data leaves
+ECT(1), the qdisc rewrites it to CE, and the receiver echoes ECE). The deterministic sim and the real
+Linux forwarding path agree — sub-millisecond, below even BBR's paced queue, at line rate.
+
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
 
@@ -494,6 +537,8 @@ irrelevant); a concurrent-flow harness would first switch those to ordered maps.
 | M10 | io_uring backend (hand-rolled, zero-dependency; batched I/O) | ~1.24× throughput at MTU 1500 (148.6 → 184.3 MB/s, medians of 9) |
 | M11 | RFC 7323 timestamps (Karn-free RTT + PAWS) + delayed ACKs (RFC 1122) | timestamps interoperate with the Linux kernel on the wire; fewer pure-ACK packets |
 | M12 | folded checksum; `tcp-tun` client mode + two-instance-over-TUN benchmark (caught + fixed the run()-ordering and MSS-options bugs) | two userspace stacks: 125→300 MB/s match-MTU; 11.2 MB/s at +20 ms RTT (3.5× the 64 KiB cap) — window scaling on real hardware |
+| M13 | CUBIC (RFC 8312) + BBR v1 (model-paced, BBRv2 `inflight_hi`/`inflight_lo` bounds) + an ack-clocked go-back-N drain that un-sticks the post-RTO wedge for all controllers | Reno↔CUBIC↔BBR head-to-head over the two-instance bench; BBR ~3.5× lower latency on a bottleneck queue at equal goodput |
+| M14 | deterministic simulation testing (`sim`); **L4S/DCTCP** — ECN ECT/CE/ECE wiring + the DCTCP controller (α-EWMA proportional cut) + a `CeMark` AQM | 1080 adversarial DST scenarios all deliver intact; DCTCP holds a **sub-millisecond** queue (sim *and* hardware) where Reno bloats to tens of ms |
 
 ## 9. Environment
 
@@ -507,8 +552,9 @@ via `tun0` or enable system-wide IP forwarding, so the host's own networking is 
 ## 10. References
 
 RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP + host requirements, incl. delayed ACKs), RFC 1071
-(Internet checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (congestion control / initial
-window), RFC 6298 (RTO), RFC 2018 + 6675 (SACK & selective recovery), RFC 7323 (timestamps &
-window scaling), RFC 5961 + 6528 (blind-attack hardening / ISN); the Linux `io_uring` ABI
-(`<linux/io_uring.h>`); W. R. Stevens, *TCP/IP Illustrated, Vol. 1*; the smoltcp source as a
-cross-reference.
+(Internet checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (Reno / initial window), RFC 8312
+(CUBIC), the BBR congestion-control draft + Cheng/Cardwell delivery-rate estimation, RFC 3168 (ECN) +
+RFC 8257 (DCTCP) + RFC 9330–9332 (L4S architecture / dual-queue / id) + RFC 9768 (AccECN), RFC 6298
+(RTO), RFC 2018 + 6675 (SACK & selective recovery), RFC 7323 (timestamps & window scaling), RFC 5961 +
+6528 (blind-attack hardening / ISN); the Linux `io_uring` ABI (`<linux/io_uring.h>`); W. R. Stevens,
+*TCP/IP Illustrated, Vol. 1*; the smoltcp source as a cross-reference.
