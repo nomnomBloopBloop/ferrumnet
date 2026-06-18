@@ -32,7 +32,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **six pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one), and a **two-stack userspace loopback** (two instances connecting to
-  each other entirely in memory). **213 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
+  each other entirely in memory). **214 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
   no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -348,7 +348,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 213 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 214 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -400,13 +400,15 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   layout up to two words (~1.7 M), confirming the scoreboard's structural invariants, the RFC 6675
   `pipe ≤ inflight` bound, and the option walker's panic-freedom. So the stack is one you can *fuzz,
   train against, and prove*.
-- **L4S — ECN, exact feedback, and the scalable controller are done; the dual-queue is next.** **DCTCP**
-  (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE counter for *exact* per-packet
-  CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent** controller) ship now, holding
-  a sub-millisecond queue on a CE-marking bottleneck (sim *and* hardware, table above). The remaining L4S
-  piece (RFC 9330–9332) is the **coupled dual-queue AQM** (dualPI2) proving an L4S flow and a classic flow
-  coexist *fairly* on a shared bottleneck — which needs a multi-flow bottleneck the single-flow sim does
-  not yet model. It slots into the same `sim` testbed alongside the existing `CeMark` AQM.
+- **L4S — ECN, exact feedback, the scalable controller, and the dual-queue all ship; the coupling is the
+  last refinement.** **DCTCP** (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE
+  counter for *exact* per-packet CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent**
+  controller) + a **dual-queue bottleneck** (RFC 9332 dualPI2 structure: a multi-flow shared link, fair
+  per-class scheduler, ECN-classified shallow L4S vs deep Classic queue) all ship now. A Prague + Reno pair
+  over the dual-queue coexist — both complete, the L4S flow holds a **~0.6 ms** queue while the classic
+  flow bloats to **~90 ms** on the same link (latency isolation a single FIFO can't give). The one piece
+  left is dualPI2's **coupled PI-controller marking** (`p_L ≈ √p_C`), which adds robust throughput
+  *fairness* across RTT and config on top of the isolation the dual-queue already demonstrates.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
 - **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, classic ECN negotiation
   (RFC 3168 — DCTCP here skips the SYN handshake), TCP Fast Open, keepalives, Nagle — the details

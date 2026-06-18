@@ -356,9 +356,25 @@ a no-op-default `on_rtt_sample` trait hook, so every other controller stays byte
 loss (three dup-ACKs / RTO) it falls back to the **classic** Reno multiplicative decrease — the "coexist
 safely with classic drop-based traffic" requirement — so behind a coupled dual-queue AQM it shares fairly
 with loss-based flows. Only `α` and the RTT scale are `f64`, updated with `+ − × ÷`/comparisons (no
-transcendental intrinsics), so it is deterministic and Miri-clean. The coupled **dualPI2 dual-queue AQM**
-that proves L4S/classic coexistence on a *shared* bottleneck is the next step (it needs the multi-flow
-bottleneck the current single-flow `run_bottleneck` does not yet model).
+transcendental intrinsics), so it is deterministic and Miri-clean.
+
+**The dual-queue L4S bottleneck (`sim`, M18).** Prague's payoff is *coexistence*, which needs more than
+one flow on a bottleneck — so the `sim` testbed gained a **multi-flow** dual-queue link (`DualQueue` /
+`run_dualqueue`). It is the structure of RFC 9332's **dualPI2**: one shared link rate served by a fair
+per-class round-robin scheduler across two class queues — an **L4S** queue for ECN-capable (ECT) traffic,
+kept shallow and CE-marked the instant its sojourn crosses a sub-ms threshold, and a **Classic** queue for
+Not-ECT traffic, given a deep tail-dropping buffer. Classification is by the IP ECN field exactly as L4S
+specifies (RFC 9331): Prague marks ECT → low-latency queue; Reno is Not-ECT → deep queue. Two flows
+(Prague + Reno) over it show the headline L4S result the demo asserts: the L4S flow holds a **sub-ms**
+queue (~0.6 ms) while the classic flow bloats to **~90 ms** on the *same* link — full latency isolation a
+single shared FIFO cannot give — and both flows complete, neither starved. Multi-flow stays deterministic
+because each flow is an independent pair of *single-connection* runtimes (the waker-map ordering caveat in
+the `sim` module docs applies only to multiple connections in *one* runtime), and the scheduler/propagation
+are ordered by explicit counters. The one honest simplification vs full dualPI2: the marking is each
+class's own native threshold (shallow-step for L4S, tail-drop for Classic), not dualPI2's *coupled*
+PI-controller probability (`p_L ≈ √p_C`) — so the latency isolation and fair scheduling are demonstrated,
+while robust throughput *fairness across RTT and config* (what the coupling law adds) is the remaining
+refinement.
 
 ### 5.6 Async runtime (`runtime`) — M4
 
@@ -662,7 +678,8 @@ drives exactly the code paths the live stack runs.
 | M14 | deterministic simulation testing (`sim`); **L4S/DCTCP** — ECN ECT/CE/ECE wiring + the DCTCP controller (α-EWMA proportional cut) + a `CeMark` AQM | 1080 adversarial DST scenarios all deliver intact; DCTCP holds a **sub-millisecond** queue (sim *and* hardware) where Reno bloats to tens of ms |
 | M15 | a **coverage-guided greybox fuzzer** (off-the-wire coverage, no engine instrumentation); an **evolved** `Learned` controller trained by a from-scratch CEM (zero ML libs); a **bounded model checker** (exhaustive SACK / option proofs, no Kani) | fuzzer is a deterministic correctness oracle (zero findings); the evolved genome beats hand-tuned DCTCP on the held-out frontier; the BMC proves the scoreboard + option-walker invariants over ~400 K + ~1.7 M cases |
 | M16 | **AccECN (RFC 9768)** — exact CE feedback via the 3-bit **ACE counter** (AE·CWR·ECE = `r.cep mod 8`), replacing the one-bit ECE-echo run-boundary approximation; the wire now carries the **AE bit** (byte-12 bit-0, old NS) | the sender recovers the *exact* per-packet CE count from the wrapping ACE delta; a delayed ACK coalescing a CE + non-CE segment conveys exactly one mark (no run-boundary over-count); DCTCP/`Learned` get exact `marked`, holding a 642 µs queue at comparable goodput |
-| M17 | **TCP Prague** (`Cc::Prague`) — the L4S scalable controller: DCTCP's proportional ECN response + an **RTT-independent** additive increase (per-RTT step scaled by `srtt / 25 ms`) + a classic Reno loss fallback; fed RTT via a no-op-default `on_rtt_sample` hook | holds a sub-millisecond queue end-to-end on the CE-marking bottleneck like DCTCP; growth *per second* is constant across RTT (unit-proven), the lever for fair L4S coexistence; the coupled dualPI2 dual-queue (shared-bottleneck coexistence) is next |
+| M17 | **TCP Prague** (`Cc::Prague`) — the L4S scalable controller: DCTCP's proportional ECN response + an **RTT-independent** additive increase (per-RTT step scaled by `srtt / 25 ms`) + a classic Reno loss fallback; fed RTT via a no-op-default `on_rtt_sample` hook | holds a sub-millisecond queue end-to-end on the CE-marking bottleneck like DCTCP; growth *per second* is constant across RTT (unit-proven), the lever for fair L4S coexistence |
+| M18 | **Dual-queue L4S bottleneck** (`DualQueue` / `run_dualqueue`) — the dualPI2 structure: a multi-flow shared link, fair per-class round-robin scheduler, ECN-classified shallow (CE-marked) L4S queue vs deep (tail-drop) Classic queue | a Prague (L4S) + Reno (classic) pair coexist — both complete, neither starved — and the L4S flow holds a **sub-ms** queue while the classic flow bloats to **~90 ms** on the same link (latency isolation); coupled-PI marking for robust throughput fairness is the noted refinement |
 
 ## 9. Environment
 

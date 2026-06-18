@@ -477,6 +477,325 @@ pub fn run_bottleneck(seed: u64, cfg: Bottleneck, bytes: usize, cc: CcKind) -> B
     }
 }
 
+// ── dual-queue L4S bottleneck (the coexistence testbed) ──────────────────────────────────────────
+
+/// A **dual-queue** L4S bottleneck — the structure of RFC 9332's dualPI2. One shared link rate is
+/// served by a fair (per-class round-robin) scheduler across **two class queues**: an **L4S** queue
+/// for ECN-capable (ECT) traffic, kept shallow and CE-marked the instant its sojourn crosses a
+/// sub-millisecond threshold, and a **Classic** queue for Not-ECT traffic, given a deep buffer that
+/// tail-drops (the only signal a loss-based sender understands). Classification is by the IP ECN
+/// field, exactly as L4S specifies (RFC 9331): a scalable sender (Prague) marks its data ECT and
+/// lands in the low-latency queue; a classic sender (Reno) is Not-ECT and lands in the deep queue.
+///
+/// This isolates the two: the classic flow can bloat its *own* queue without inflating the L4S
+/// flow's latency, while the round-robin scheduler hands each class an equal share of the link, so
+/// the two flows get fair throughput — the headline L4S result a single shared FIFO cannot deliver
+/// (there one greedy classic flow bloats the queue for everyone). The simplification vs full dualPI2
+/// is the marking law: this uses each class's own native threshold (shallow-step for L4S, tail-drop
+/// for Classic) rather than dualPI2's *coupled* PI-controller probability (`p_L = k·p_C`); the
+/// dual-queue isolation + fair scheduling are the parts demonstrated here.
+#[derive(Clone, Copy, Debug)]
+pub struct DualQueue {
+    pub rate_bytes_per_sec: u64,
+    pub base_delay_us: u64,
+    /// CE-mark an L4S frame once its queue sojourn exceeds this (shallow → sub-ms L4S latency).
+    pub l4s_threshold_us: u64,
+    /// Classic-queue buffer: a frame that would overflow it is tail-dropped — the loss signal a
+    /// classic loss-based controller needs to find its operating point.
+    pub classic_buffer_bytes: u64,
+    /// L4S-queue buffer: a backstop only. A scalable controller keeps this queue near-empty, so it
+    /// tail-drops only if marking somehow fails to restrain the flow.
+    pub l4s_buffer_bytes: u64,
+}
+
+/// Per-flow result of a [`run_dualqueue`] coexistence run.
+#[derive(Clone, Copy, Debug)]
+pub struct FlowResult {
+    pub completed: bool,
+    pub bytes: usize,
+    pub sim_time_us: u64,
+    /// Mean standing-queue delay this flow's data saw at the bottleneck (µs).
+    pub mean_queue_us: u64,
+    pub max_queue_us: u64,
+    pub marked: u64,
+    pub dropped: u64,
+}
+
+impl FlowResult {
+    pub fn throughput_bytes_per_sec(&self) -> u64 {
+        if self.sim_time_us > 0 {
+            (self.bytes as u64).saturating_mul(1_000_000) / self.sim_time_us
+        } else {
+            0
+        }
+    }
+}
+
+/// A frame waiting in a class queue for the link to serve it.
+struct DqQueued {
+    arrival: Instant,
+    flow: usize,
+    len: u64,
+    frame: Vec<u8>,
+}
+
+/// A frame past the bottleneck, propagating to its destination stack.
+struct DqFlight {
+    deliver_at: Instant,
+    flow: usize,
+    side: Side,
+    order: u64,
+    frame: Vec<u8>,
+}
+
+/// The dual-queue link. Index `[0]` is the L4S class, `[1]` the Classic class throughout.
+struct DualQueueLink {
+    cfg: DualQueue,
+    l4s: std::collections::VecDeque<DqQueued>,
+    classic: std::collections::VecDeque<DqQueued>,
+    l4s_bytes: u64,
+    classic_bytes: u64,
+    /// When the shared link finishes serialising the frame it is currently sending.
+    link_free_at: Instant,
+    /// Round-robin pointer: when both class queues are backlogged, serve L4S iff this is true, then
+    /// flip — so the link alternates between the classes and each gets an equal share of the rate.
+    serve_l4s_next: bool,
+    flight: Vec<DqFlight>,
+    order: u64,
+    sum_queue_us: [u64; 2],
+    max_queue_us: [u64; 2],
+    delivered: [u64; 2],
+    marked: [u64; 2],
+    dropped: [u64; 2],
+}
+
+impl DualQueueLink {
+    fn new(cfg: DualQueue) -> Self {
+        DualQueueLink {
+            cfg,
+            l4s: std::collections::VecDeque::new(),
+            classic: std::collections::VecDeque::new(),
+            l4s_bytes: 0,
+            classic_bytes: 0,
+            link_free_at: Instant::ZERO,
+            serve_l4s_next: true,
+            flight: Vec::new(),
+            order: 0,
+            sum_queue_us: [0; 2],
+            max_queue_us: [0; 2],
+            delivered: [0; 2],
+            marked: [0; 2],
+            dropped: [0; 2],
+        }
+    }
+
+    /// A client→server data frame arrived at the bottleneck: classify by IP ECN (ECT → L4S queue,
+    /// else → Classic queue) and enqueue, or tail-drop if that class's buffer is full.
+    fn enqueue_data(&mut self, now: Instant, flow: usize, frame: Vec<u8>) {
+        let len = frame.len() as u64;
+        if frame_is_ect(&frame) {
+            if self.l4s_bytes + len > self.cfg.l4s_buffer_bytes {
+                self.dropped[0] += 1;
+                return;
+            }
+            self.l4s_bytes += len;
+            self.l4s.push_back(DqQueued { arrival: now, flow, len, frame });
+        } else {
+            if self.classic_bytes + len > self.cfg.classic_buffer_bytes {
+                self.dropped[1] += 1;
+                return;
+            }
+            self.classic_bytes += len;
+            self.classic.push_back(DqQueued { arrival: now, flow, len, frame });
+        }
+    }
+
+    /// A server→client frame (an ACK): the reverse path is not the bottleneck, so it skips the queues
+    /// and just takes the propagation delay.
+    fn enqueue_ack(&mut self, now: Instant, flow: usize, frame: Vec<u8>) {
+        let order = self.order;
+        self.order += 1;
+        self.flight.push(DqFlight {
+            deliver_at: now.plus_micros(self.cfg.base_delay_us),
+            flow,
+            side: Side::ToClient,
+            order,
+            frame,
+        });
+    }
+
+    /// Serialise queued frames the shared link can *start* by `now`, scheduling each onward. The link
+    /// serves one frame at a time at the configured rate; while it is free and a class queue has a
+    /// frame, the round-robin scheduler picks the next class and serialises its head frame.
+    fn service(&mut self, now: Instant) {
+        let rate = self.cfg.rate_bytes_per_sec.max(1);
+        while self.link_free_at <= now {
+            let serve_l4s = match (self.l4s.is_empty(), self.classic.is_empty()) {
+                (true, true) => break,        // nothing queued
+                (false, true) => true,        // only L4S backlogged
+                (true, false) => false,       // only Classic backlogged
+                (false, false) => self.serve_l4s_next, // both: alternate
+            };
+            let f = if serve_l4s {
+                self.serve_l4s_next = false;
+                self.l4s_bytes -= self.l4s.front().unwrap().len;
+                self.l4s.pop_front().unwrap()
+            } else {
+                self.serve_l4s_next = true;
+                self.classic_bytes -= self.classic.front().unwrap().len;
+                self.classic.pop_front().unwrap()
+            };
+            let class = if serve_l4s { 0 } else { 1 };
+            // The link starts serialising when it is free *and* the frame has arrived.
+            let start = if self.link_free_at > f.arrival { self.link_free_at } else { f.arrival };
+            let queue_us = start.saturating_micros_since(f.arrival);
+            let serialize_us = f.len.saturating_mul(1_000_000) / rate;
+            self.link_free_at = start.plus_micros(serialize_us);
+
+            let mut frame = f.frame;
+            // L4S CE marking: an ECT frame whose shallow-queue sojourn tops the threshold is marked CE
+            // rather than dropped — the same mechanism as `Aqm::CeMark`, applied to the L4S class only.
+            if serve_l4s && queue_us > self.cfg.l4s_threshold_us && frame_is_ect(&frame) {
+                set_ecn(&mut frame, ECN_CE);
+                self.marked[0] += 1;
+            }
+            self.sum_queue_us[class] += queue_us;
+            self.max_queue_us[class] = self.max_queue_us[class].max(queue_us);
+            self.delivered[class] += 1;
+            let order = self.order;
+            self.order += 1;
+            self.flight.push(DqFlight {
+                deliver_at: self.link_free_at.plus_micros(self.cfg.base_delay_us),
+                flow: f.flow,
+                side: Side::ToServer,
+                order,
+                frame,
+            });
+        }
+    }
+
+    /// The next time the link has work: when it next frees to serve a queued frame, or the earliest
+    /// in-flight delivery.
+    fn next_event_at(&self) -> Option<Instant> {
+        let mut t = self.flight.iter().map(|f| f.deliver_at).min();
+        if !self.l4s.is_empty() || !self.classic.is_empty() {
+            t = Some(match t {
+                Some(t) => t.min(self.link_free_at),
+                None => self.link_free_at,
+            });
+        }
+        t
+    }
+
+    /// Inject every in-flight frame now due into its destination flow's client/server stack, in
+    /// `(deliver_at, order)` order for determinism.
+    fn deliver_due(&mut self, now: Instant, flows: &mut [Pair]) {
+        let mut due: Vec<DqFlight> = Vec::new();
+        let mut keep: Vec<DqFlight> = Vec::new();
+        for f in std::mem::take(&mut self.flight) {
+            if f.deliver_at <= now {
+                due.push(f);
+            } else {
+                keep.push(f);
+            }
+        }
+        self.flight = keep;
+        due.sort_by_key(|f| (f.deliver_at, f.order));
+        for f in due {
+            match f.side {
+                Side::ToServer => flows[f.flow].server.device_mut().inject(f.frame),
+                Side::ToClient => flows[f.flow].client.device_mut().inject(f.frame),
+            }
+        }
+    }
+
+    fn flow_result(&self, class: usize, completed: bool, bytes: usize, sim_time_us: u64) -> FlowResult {
+        FlowResult {
+            completed,
+            bytes,
+            sim_time_us,
+            mean_queue_us: if self.delivered[class] > 0 { self.sum_queue_us[class] / self.delivered[class] } else { 0 },
+            max_queue_us: self.max_queue_us[class],
+            marked: self.marked[class],
+            dropped: self.dropped[class],
+        }
+    }
+}
+
+/// Run two bulk transfers sharing one [`DualQueue`] bottleneck and return a per-flow result. Flow 0
+/// runs `l4s_cc` (a scalable, ECT-marking controller — its data lands in the shallow L4S queue);
+/// flow 1 runs `classic_cc` (a loss-based, Not-ECT controller — its data lands in the deep Classic
+/// queue). Deterministic: each flow is an independent pair of single-connection runtimes, and the
+/// scheduler/propagation are ordered by explicit counters, so the run is a pure function of the
+/// inputs. The per-class queue stats map to the flows (flow 0 ↔ L4S class, flow 1 ↔ Classic class).
+pub fn run_dualqueue(seed: u64, cfg: DualQueue, bytes: usize, l4s_cc: CcKind, classic_cc: CcKind) -> (FlowResult, FlowResult) {
+    let mut flows = vec![
+        build_pair(seed, bytes, l4s_cc),
+        build_pair(seed.wrapping_add(0x9E37_79B9), bytes, classic_cc),
+    ];
+    let mut link = DualQueueLink::new(cfg);
+    let mut now = Instant::from_micros(0);
+    let mut steps: u64 = 0;
+    // Per-flow completion sim-time (µs), recorded the step each flow's transfer first finishes — so a
+    // starved flow's longer time yields a lower throughput (the fairness metric is genuine, not the
+    // global end time both would share).
+    let mut done_at: [Option<u64>; 2] = [None; 2];
+
+    loop {
+        link.service(now);
+        link.deliver_due(now, &mut flows);
+        for p in &mut flows {
+            p.client.turn(now).expect("mock device never errors");
+            p.server.turn(now).expect("mock device never errors");
+        }
+        // Client→server data through the dual queue; server→client ACKs on the reverse path.
+        for (i, p) in flows.iter_mut().enumerate() {
+            let out_c: Vec<Vec<u8>> = p.client.device_mut().take_outbound();
+            for f in out_c {
+                link.enqueue_data(now, i, f);
+            }
+            let out_s: Vec<Vec<u8>> = p.server.device_mut().take_outbound();
+            for f in out_s {
+                link.enqueue_ack(now, i, f);
+            }
+        }
+        // Serialise anything just enqueued that the link can already start, so progress never stalls.
+        link.service(now);
+
+        for i in 0..flows.len() {
+            if done_at[i].is_none() && flows[i].connected.get() && flows[i].received.borrow().len() >= bytes {
+                done_at[i] = Some(now.micros());
+            }
+        }
+        if done_at.iter().all(|d| d.is_some()) {
+            let r0 = link.flow_result(0, *flows[0].received.borrow() == *flows[0].payload, bytes, done_at[0].unwrap());
+            let r1 = link.flow_result(1, *flows[1].received.borrow() == *flows[1].payload, bytes, done_at[1].unwrap());
+            return (r0, r1);
+        }
+
+        steps += 1;
+        if steps > MAX_STEPS || now.micros() > MAX_SIM_US {
+            let r0 = link.flow_result(0, false, flows[0].received.borrow().len(), done_at[0].unwrap_or(now.micros()));
+            let r1 = link.flow_result(1, false, flows[1].received.borrow().len(), done_at[1].unwrap_or(now.micros()));
+            return (r0, r1);
+        }
+
+        let mut next = link.next_event_at();
+        for p in &flows {
+            next = [next, p.client.poll_at(), p.server.poll_at()].into_iter().flatten().min();
+        }
+        match next {
+            Some(t) if t > now => now = t,
+            Some(_) => now = now.plus_micros(1),
+            None => {
+                let r0 = link.flow_result(0, false, flows[0].received.borrow().len(), done_at[0].unwrap_or(now.micros()));
+                let r1 = link.flow_result(1, false, flows[1].received.borrow().len(), done_at[1].unwrap_or(now.micros()));
+                return (r0, r1);
+            }
+        }
+    }
+}
+
 /// One scenario to simulate: a seed, the link's fault model, how many bytes to transfer, and which
 /// congestion controller both stacks run. Deterministic — `run` is a pure function of this.
 #[derive(Clone, Copy, Debug)]
@@ -1468,6 +1787,56 @@ mod tests {
             prague.data_queue.mean_queue_us,
             reno.data_queue.mean_queue_us
         );
+    }
+
+    /// L4S coexistence on a **dual-queue** bottleneck: a Prague (L4S, ECT) flow and a Reno (classic,
+    /// Not-ECT) flow share one link, classified by IP ECN into a shallow CE-marked L4S queue and a
+    /// deep tail-dropping Classic queue. The headline, robust result: the L4S flow holds a
+    /// **sub-millisecond** standing queue while the classic flow bloats to **tens of milliseconds** —
+    /// its latency is fully isolated from the classic flow's bufferbloat, on the *same* bottleneck,
+    /// which a single shared FIFO cannot do (there the classic flow's bloat is everyone's latency). And
+    /// the two flows *coexist* — both complete intact, neither is starved, each takes a substantial
+    /// share of the link. (The exact throughput *split* in this simplified model depends on the
+    /// buffer/threshold balance — robust throughput *fairness* across RTT and config is what dualPI2's
+    /// coupled PI-controller marking law would add, the documented refinement on [`DualQueue`].)
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dualqueue_isolates_l4s_latency_while_both_flows_coexist() {
+        let cfg = DualQueue {
+            rate_bytes_per_sec: 3_000_000,
+            base_delay_us: 2_000,
+            l4s_threshold_us: 1_000,
+            classic_buffer_bytes: 512 * 1024,
+            l4s_buffer_bytes: 256 * 1024,
+        };
+        let bytes = 3 * 1024 * 1024;
+        let (l4s, classic) = run_dualqueue(42, cfg, bytes, CcKind::Prague, CcKind::Reno);
+
+        // Both flows deliver every byte intact — coexistence, not starvation.
+        assert!(l4s.completed && classic.completed, "both flows deliver intact: l4s {l4s:?} classic {classic:?}");
+
+        // Teeth: the L4S (ECT) data was CE-marked in the shallow queue; the classic (Not-ECT) data was
+        // never marked (it took the deep tail-dropping queue) — ECN classification actually split the
+        // two flows into the two class queues.
+        assert!(l4s.marked > 0, "the L4S queue CE-marked the Prague flow's ECT data: {l4s:?}");
+        assert_eq!(classic.marked, 0, "the classic Not-ECT flow is never CE-marked: {classic:?}");
+
+        // The headline: the L4S flow holds a sub-ms queue, the classic flow bloats by orders of
+        // magnitude — full latency isolation on a shared bottleneck.
+        assert!(l4s.mean_queue_us < 1_500, "the L4S flow holds a sub-ms queue: {} µs", l4s.mean_queue_us);
+        assert!(
+            classic.mean_queue_us > 20 * l4s.mean_queue_us,
+            "the classic flow's queue dwarfs the L4S flow's (isolation): classic {} µs vs l4s {} µs",
+            classic.mean_queue_us,
+            l4s.mean_queue_us
+        );
+
+        // Coexistence: neither flow is starved — each gets a substantial share of the 3 MB/s link, and
+        // neither runs away with it (not a strict 50/50 without the coupling, but the same order).
+        let lo = l4s.throughput_bytes_per_sec().min(classic.throughput_bytes_per_sec());
+        let hi = l4s.throughput_bytes_per_sec().max(classic.throughput_bytes_per_sec());
+        assert!(lo > cfg.rate_bytes_per_sec / 5, "neither flow is starved: l4s {} vs classic {} B/s", l4s.throughput_bytes_per_sec(), classic.throughput_bytes_per_sec());
+        assert!(hi < 3 * lo, "neither flow runs away with the link: {hi} vs {lo} B/s");
     }
 
     /// Prague's loss response is the *classic* Reno fallback (the "be safe with drop-based traffic"
