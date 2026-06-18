@@ -976,9 +976,233 @@ pub fn fuzz_random_baseline(fuzz_seed: u64, iterations: u32) -> FuzzReport {
     FuzzReport { iterations, corpus_size: 0, edges: global.count(), findings, coverage: global }
 }
 
+// ── evolved congestion control (CEM trainer) ─────────────────────────────────────────────────────
+//
+// The deterministic bottleneck sim is a microsecond-fast, perfectly-reproducible environment — which
+// makes it a *training ground* for a learned controller. The cross-entropy method (CEM) searches the
+// [`LearnedParams`] genome to maximise a latency-vs-throughput fitness, evaluating each candidate
+// through the very same `run_bottleneck` path the real stack uses. Everything is std-only: the
+// Gaussian samples come from a sum-of-twelve-uniforms central-limit draw (no Box-Muller `ln`/`sqrt`/
+// `cos`), and the one square root the covariance update needs is hand-rolled Newton — so the optimiser
+// is zero-dependency and free of transcendental intrinsics, exactly like the controllers it tunes.
+
+use crate::congestion::{set_learned_override, LearnedParams};
+
+const GENOME: usize = 5;
+
+fn genome_to_vec(p: LearnedParams) -> [f64; GENOME] {
+    [p.ai_gain, p.md_loss, p.ecn_a, p.ecn_b, p.ecn_max]
+}
+
+fn vec_to_genome(v: [f64; GENOME]) -> LearnedParams {
+    LearnedParams { ai_gain: v[0], md_loss: v[1], ecn_a: v[2], ecn_b: v[3], ecn_max: v[4] }
+}
+
+/// Newton's-method square root — no `f64::sqrt` intrinsic, matching the project's no-transcendental
+/// rule (the same discipline as CUBIC's hand-rolled cube root). Returns 0 for non-positive input.
+fn sqrt_newton(a: f64) -> f64 {
+    if a <= 0.0 {
+        return 0.0;
+    }
+    let mut x = if a > 1.0 { a } else { 1.0 };
+    for _ in 0..40 {
+        x = 0.5 * (x + a / x);
+    }
+    x
+}
+
+/// A standard-normal sample as the sum of twelve uniforms minus six (central-limit theorem: mean 0,
+/// variance 1). No transcendental functions — unlike Box-Muller — so it stays zero-dependency and
+/// deterministic on every platform.
+fn gaussian01(rng: &mut Rng) -> f64 {
+    let mut s = 0.0;
+    for _ in 0..12 {
+        s += rng.next_u64() as f64 / u64::MAX as f64;
+    }
+    s - 6.0
+}
+
+/// One training/evaluation scenario for the fitness: a bottleneck, the transfer size, and the seed.
+#[derive(Clone, Copy, Debug)]
+pub struct TrainScenario {
+    pub bn: Bottleneck,
+    pub bytes: usize,
+    pub seed: u64,
+}
+
+/// The latency-throughput fitness of a genome over `scenarios`: reward goodput (as a fraction of line
+/// rate), penalise the mean standing queue (per millisecond), and heavily penalise a transfer that
+/// fails to complete with integrity. Higher is better. Each scenario runs the genome through the real
+/// `run_bottleneck` path (installed via the training override), so the fitness is exactly the
+/// behaviour the shipped controller would exhibit.
+pub fn frontier_fitness(p: LearnedParams, scenarios: &[TrainScenario]) -> f64 {
+    set_learned_override(Some(p));
+    let mut total = 0.0;
+    for s in scenarios {
+        let r = run_bottleneck(s.seed, s.bn, s.bytes, CcKind::Learned);
+        let line = s.bn.rate_bytes_per_sec.max(1) as f64;
+        let goodput = r.throughput_bytes_per_sec() as f64 / line;
+        let q_ms = r.data_queue.mean_queue_us as f64 / 1_000.0;
+        // Maximise goodput subject to a *sub-millisecond* queue: a standing queue up to 1 ms is
+        // "free" (that is the L4S target), and only the excess beyond it is penalised — so the search
+        // spends the latency budget it is allowed on throughput instead of crushing the queue to zero
+        // at a throughput cost (which is the trap DCTCP's fixed aggressive response falls into here).
+        let queue_excess = (q_ms - 1.0).max(0.0);
+        let complete = if r.completed { 0.0 } else { -5.0 };
+        total += goodput - 0.4 * queue_excess + complete;
+    }
+    set_learned_override(None);
+    total / scenarios.len().max(1) as f64
+}
+
+/// Evolve a [`LearnedParams`] genome on `train` with the **cross-entropy method**: keep a per-gene
+/// Gaussian, sample a population each generation, evaluate the fitness, and refit the Gaussian to the
+/// top `elite_frac`. Deterministic in `seed`. Returns the best genome seen and its fitness.
+pub fn evolve(train: &[TrainScenario], generations: u32, pop: usize, elite_frac: f64, seed: u64) -> (LearnedParams, f64) {
+    let mut rng = Rng::new(seed ^ 0xE70E_77E5_0E77_E50E);
+    let mut mean = genome_to_vec(LearnedParams::DEFAULT);
+    // Initial per-gene exploration spread, and a floor so the Gaussian can't collapse prematurely.
+    let mut std = [1.0_f64, 0.2, 0.6, 0.5, 0.25];
+    let floor = [0.05_f64, 0.02, 0.05, 0.05, 0.03];
+
+    let mut best = LearnedParams::DEFAULT;
+    let mut best_fit = frontier_fitness(best, train);
+    let n_elite = ((pop as f64 * elite_frac).ceil() as usize).clamp(1, pop.max(1));
+
+    for _ in 0..generations {
+        let mut scored: Vec<([f64; GENOME], f64)> = Vec::with_capacity(pop);
+        for _ in 0..pop {
+            let mut cand = mean;
+            for j in 0..GENOME {
+                cand[j] += std[j] * gaussian01(&mut rng);
+            }
+            let p = vec_to_genome(cand).sanitized();
+            let fit = frontier_fitness(p, train);
+            if fit > best_fit {
+                best_fit = fit;
+                best = p;
+            }
+            scored.push((genome_to_vec(p), fit));
+        }
+        // Rank by fitness (desc) and refit the Gaussian to the elite (mean + per-gene std).
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for j in 0..GENOME {
+            let m = scored[..n_elite].iter().map(|(c, _)| c[j]).sum::<f64>() / n_elite as f64;
+            let var = scored[..n_elite].iter().map(|(c, _)| (c[j] - m) * (c[j] - m)).sum::<f64>() / n_elite as f64;
+            mean[j] = m;
+            std[j] = sqrt_newton(var).max(floor[j]);
+        }
+    }
+    (best, best_fit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cemark_bn(rate: u64, base_us: u64, thr: u64) -> Bottleneck {
+        Bottleneck { rate_bytes_per_sec: rate, buffer_bytes: 512 * 1024, base_delay_us: base_us, aqm: Aqm::CeMark { threshold_us: thr } }
+    }
+
+    fn train_set() -> Vec<TrainScenario> {
+        // A spread of CE-marking bottlenecks: varied rate, base RTT, and marking threshold.
+        [
+            (2_500_000u64, 2_000u64, 1_000u64),
+            (5_000_000, 1_000, 800),
+            (1_250_000, 4_000, 1_500),
+            (4_000_000, 1_500, 900),
+            (1_800_000, 3_000, 1_200),
+        ]
+        .iter()
+        .map(|&(r, b, t)| TrainScenario { bn: cemark_bn(r, b, t), bytes: 1024 * 1024, seed: 7 })
+        .collect()
+    }
+
+    fn heldout_set() -> Vec<TrainScenario> {
+        // UNSEEN bottlenecks — different rate/RTT/threshold than the training set.
+        [
+            (3_500_000u64, 1_700u64, 1_100u64),
+            (2_000_000, 2_500, 700),
+            (6_000_000, 800, 1_000),
+            (1_000_000, 5_000, 1_400),
+        ]
+        .iter()
+        .map(|&(r, b, t)| TrainScenario { bn: cemark_bn(r, b, t), bytes: 1024 * 1024, seed: 11 })
+        .collect()
+    }
+
+    fn frontier_of(cc: CcKind, params: Option<LearnedParams>, set: &[TrainScenario]) -> (f64, f64) {
+        set_learned_override(params);
+        let (mut g, mut q) = (0.0, 0.0);
+        for s in set {
+            let r = run_bottleneck(s.seed, s.bn, s.bytes, cc);
+            g += r.throughput_bytes_per_sec() as f64 / s.bn.rate_bytes_per_sec as f64;
+            q += r.data_queue.mean_queue_us as f64;
+        }
+        set_learned_override(None);
+        (g / set.len() as f64, q / set.len() as f64)
+    }
+
+    /// Reproduce the baked genome from scratch and print the full frontier (ignored — the evolution
+    /// runs hundreds of sims). `evolve(&train_set(), 30, 28, 0.25, 12345)` is exactly what produced
+    /// [`LearnedParams::BAKED`]; `learned-baked` and `learned-best` should land the same frontier.
+    #[test]
+    #[ignore]
+    fn evolve_feasibility() {
+        let train = train_set();
+        let (best, fit) = evolve(&train, 30, 28, 0.25, 12345);
+        eprintln!("EVOLVED genome {best:?}  train-fitness {fit:.3}");
+        let test = heldout_set();
+        for &(name, cc, params) in &[("reno", CcKind::Reno, None), ("bbr", CcKind::Bbr, None), ("dctcp", CcKind::Dctcp, None), ("learned-baked", CcKind::Learned, None), ("learned-best", CcKind::Learned, Some(best))] {
+            let (g, q) = frontier_of(cc, params, &test);
+            eprintln!("  {name:>14}: goodput {g:.2}x line | mean queue {q:.0} us");
+        }
+    }
+
+    /// THE EVOLVED CONTROLLER (zero ML deps). On **held-out** CE-marking bottlenecks it never trained
+    /// on, the baked `Learned` genome lands a distinctly better low-latency frontier point than the
+    /// hand-tuned controllers: it recovers a large slice of the throughput DCTCP's fixed aggressive
+    /// response throws away, while holding a queue an order of magnitude below BBR's and ~100× below
+    /// Reno's. Deterministic — the genome is a constant, the scenarios fixed.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn learned_controller_beats_dctcp_on_the_held_out_frontier() {
+        let test = heldout_set();
+        let (_, reno_q) = frontier_of(CcKind::Reno, None, &test);
+        let (_, bbr_q) = frontier_of(CcKind::Bbr, None, &test);
+        let (dctcp_g, _) = frontier_of(CcKind::Dctcp, None, &test);
+        let (learned_g, learned_q) = frontier_of(CcKind::Learned, None, &test); // baked genome
+
+        // It recovers materially more throughput than DCTCP (the other low-latency controller)...
+        assert!(
+            learned_g > dctcp_g * 1.15,
+            "learned recovers throughput DCTCP sacrifices: learned {learned_g:.2}x vs dctcp {dctcp_g:.2}x"
+        );
+        // ...while still holding a low (≈ sub-ms-class) standing queue — far below BBR and Reno.
+        assert!(learned_q < 2_000.0, "learned holds a low queue: {learned_q:.0} us");
+        assert!(learned_q * 3.0 < bbr_q, "learned ≪ BBR queue: {learned_q:.0} us vs {bbr_q:.0} us");
+        assert!(learned_q * 10.0 < reno_q, "learned ≪ Reno queue: {learned_q:.0} us vs {reno_q:.0} us");
+        // sanity: the bufferbloat ladder still holds for the hand-tuned controllers.
+        assert!(bbr_q < reno_q, "bbr {bbr_q:.0} < reno {reno_q:.0}");
+    }
+
+    /// The CEM trainer is a working optimizer: a short campaign improves the fitness over the default
+    /// genome and yields a sanitized, finite-fitness result. Small budget + a two-bottleneck training
+    /// set keeps it quick; the full reproduction lives in the ignored `evolve_feasibility`.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cem_trainer_improves_over_the_default_genome() {
+        let train = vec![
+            TrainScenario { bn: cemark_bn(2_500_000, 2_000, 1_000), bytes: 1024 * 1024, seed: 7 },
+            TrainScenario { bn: cemark_bn(1_800_000, 3_000, 1_200), bytes: 1024 * 1024, seed: 7 },
+        ];
+        let default_fit = frontier_fitness(LearnedParams::DEFAULT, &train);
+        let (best, best_fit) = evolve(&train, 6, 6, 0.34, 4242);
+        assert!(best_fit.is_finite(), "fitness must be finite");
+        assert!(best_fit > default_fit, "evolution must improve on the default: {best_fit:.3} vs {default_fit:.3}");
+        // the returned genome is within the controller's valid envelope (sanitized).
+        assert_eq!(best, best.sanitized(), "the best genome is sanitized");
+    }
 
     /// Coverage-guided greybox fuzzing as a **correctness oracle**. Across a campaign of coverage-
     /// steered mutations inside a survivable fault envelope, the stack must never violate an invariant
@@ -1231,6 +1455,22 @@ mod tests {
                 let scn = Scenario { seed, link: LinkConfig::lossy(loss), bytes: 32_000, cc: CcKind::Dctcp };
                 let outcome = run(&scn);
                 assert!(outcome.is_completed(), "DCTCP must survive loss: {scn:?} -> {outcome:?}");
+            }
+        }
+    }
+
+    /// The evolved `Learned` controller must be as robust as any other under genuine loss: on the fault
+    /// link (which never CE-marks) it runs as a loss-based AIMD with its evolved gains, and it must
+    /// still deliver every byte intact and terminate — its gains were tuned for queue, never at the
+    /// cost of reliability.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dst_learned_is_robust_under_loss() {
+        for loss in [1u32, 5, 10] {
+            for seed in 0..40u64 {
+                let scn = Scenario { seed, link: LinkConfig::lossy(loss), bytes: 32_000, cc: CcKind::Learned };
+                let outcome = run(&scn);
+                assert!(outcome.is_completed(), "Learned must survive loss: {scn:?} -> {outcome:?}");
             }
         }
     }

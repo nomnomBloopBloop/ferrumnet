@@ -368,15 +368,16 @@ impl Tcb {
         }
     }
 
-    /// Whether this connection runs ECN end-to-end (DCTCP/L4S). True iff the controller is DCTCP:
-    /// we then mark our data ECT(1) on egress and echo CE back as ECE, and the controller reacts to
-    /// the marked fraction. There is **no** SYN ECN negotiation (RFC 3168 §6.1.1) — both ends are
-    /// configured DCTCP, a deliberate simplification that keeps the handshake untouched while still
-    /// exercising the full marking/echo/response loop. For every other controller this is false, so
-    /// no ECT is ever set, no ECE is ever echoed, and the wire stays byte-identical.
+    /// Whether this connection runs ECN end-to-end (DCTCP/L4S). True iff the controller is one that
+    /// reacts to ECN — DCTCP, or the evolved `Learned` controller (whose genome includes an ECN
+    /// response): we then mark our data ECT(1) on egress and echo CE back as ECE, and the controller
+    /// reacts to the marked fraction. There is **no** SYN ECN negotiation (RFC 3168 §6.1.1) — both
+    /// ends are configured the same, a deliberate simplification that keeps the handshake untouched
+    /// while still exercising the full marking/echo/response loop. For every other controller this is
+    /// false, so no ECT is ever set, no ECE is ever echoed, and the wire stays byte-identical.
     #[inline]
     fn ecn_enabled(&self) -> bool {
-        self.cc_kind == CcKind::Dctcp
+        matches!(self.cc_kind, CcKind::Dctcp | CcKind::Learned)
     }
 
     // ── application interface ─────────────────────────────────────────────────────────────

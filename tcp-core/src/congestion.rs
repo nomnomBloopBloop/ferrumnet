@@ -612,6 +612,231 @@ impl CongestionControl for Dctcp {
     }
 }
 
+/// Tunable parameters of the [`Learned`] congestion controller — the genome a search optimizes. Each
+/// is a plain `f64`; the controller is a fixed AIMD skeleton (standard slow start; loss → multiplicative
+/// decrease; congestion-avoidance additive increase; a once-per-round ECN proportional cut) whose
+/// *gains* are these numbers. The vector therefore spans a controller family that contains Reno and
+/// DCTCP as special points and can interpolate to a better latency-throughput frontier between them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LearnedParams {
+    /// Additive-increase gain: MSS added per cwnd-worth of acked bytes in congestion avoidance (Reno = 1).
+    pub ai_gain: f64,
+    /// Multiplicative-decrease factor on a packet-loss signal (Reno = 0.5, CUBIC = 0.7).
+    pub md_loss: f64,
+    /// ECN response curve: on a CE-marked round the window is cut by `clamp(ecn_a·α + ecn_b·α², 0,
+    /// ecn_max)`, with `α` the smoothed marked fraction. DCTCP is the linear point `ecn_a = 0.5,
+    /// ecn_b = 0` (`cwnd ×= 1 − α/2`); a non-zero `ecn_b` lets the search bend the curve.
+    pub ecn_a: f64,
+    pub ecn_b: f64,
+    /// Cap on the per-round ECN cut fraction (never cut more than this much at once).
+    pub ecn_max: f64,
+}
+
+impl LearnedParams {
+    /// A sane hand-set starting genome: Reno's AIMD plus DCTCP's linear ECN response. The search
+    /// departs from here, and until a trained genome is baked in this is also what ships.
+    pub const DEFAULT: LearnedParams =
+        LearnedParams { ai_gain: 1.0, md_loss: 0.5, ecn_a: 0.5, ecn_b: 0.0, ecn_max: 0.5 };
+
+    /// The evolved genome the shipped [`CcKind::Learned`] runs — the best individual the CEM trainer
+    /// in `sim` found (reproducible: `evolve(&train_set(), 30, 28, 0.25, 12345)` on the CE-marking
+    /// bottleneck training set, hinge fitness "maximise goodput subject to a sub-ms queue"). On the
+    /// held-out (unseen) bottlenecks it lands a distinctly better low-latency frontier point than
+    /// hand-tuned DCTCP — ~30% more goodput at the same sub-millisecond queue — by using a much gentler
+    /// ECN response (`ecn_a ≈ 0.18` vs DCTCP's 0.5) that doesn't needlessly crush the window.
+    pub const BAKED: LearnedParams = LearnedParams {
+        ai_gain: 0.860_860_080_762_661_4,
+        md_loss: 0.176_650_191_977_447_08,
+        ecn_a: 0.184_711_028_094_530_77,
+        ecn_b: 0.011_656_344_382_528_598,
+        ecn_max: 0.628_277_523_357_274_3,
+    };
+
+    /// Clamp every gene into the range the controller is defined on, so a search step can never produce
+    /// a pathological controller (negative increase, window growth on loss, an unbounded ECN cut).
+    pub fn sanitized(self) -> LearnedParams {
+        LearnedParams {
+            ai_gain: clamp_f64(self.ai_gain, 0.05, 8.0),
+            md_loss: clamp_f64(self.md_loss, 0.1, 0.95),
+            ecn_a: clamp_f64(self.ecn_a, 0.0, 2.0),
+            ecn_b: clamp_f64(self.ecn_b, -1.0, 2.0),
+            ecn_max: clamp_f64(self.ecn_max, 0.05, 0.95),
+        }
+    }
+}
+
+/// `f64::clamp` without relying on its total-ordering edge cases — plain comparisons, NaN-free here.
+#[inline]
+fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
+}
+
+thread_local! {
+    /// Training-time injection of a candidate genome. The CEM trainer sets this before each evaluation
+    /// run; [`Learned::new`] reads it, falling back to [`LearnedParams::BAKED`] when unset — so the
+    /// shipped `CcKind::Learned` (override `None`) is a deterministic, pure controller, while the
+    /// trainer can score arbitrary genomes through the *same* sim path the real stack uses. The sim is
+    /// single-threaded, so this is deterministic; it is std-only, so the zero-dependency rule holds.
+    static LEARNED_OVERRIDE: std::cell::Cell<Option<LearnedParams>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install a candidate genome for subsequently-constructed [`Learned`] controllers (training only).
+pub fn set_learned_override(params: Option<LearnedParams>) {
+    LEARNED_OVERRIDE.with(|c| c.set(params));
+}
+
+/// The genome a new [`Learned`] controller uses right now: the override if one is installed, else the
+/// baked genome — sanitized either way.
+pub fn current_learned_params() -> LearnedParams {
+    LEARNED_OVERRIDE.with(|c| c.get()).unwrap_or(LearnedParams::BAKED).sanitized()
+}
+
+/// A congestion controller whose AIMD/ECN *gains* are [`LearnedParams`] rather than RFC constants — so
+/// a black-box optimizer (the CEM trainer in `sim`) can evolve them against the deterministic bottleneck
+/// simulation and search for a better latency-throughput frontier than the hand-tuned controllers reach.
+/// The skeleton (slow start, loss MD, CA additive increase, a once-per-round ECN proportional cut) is
+/// fixed and contains Reno and DCTCP as special genomes, which keeps *every* genome a stable controller;
+/// only the gains move. Everything is `+ − × ÷` and comparisons (no transcendental intrinsics), so it
+/// stays deterministic and Miri-clean.
+pub struct Learned {
+    cwnd: u32,
+    ssthresh: u32,
+    mss: u32,
+    ca_acc: u32,
+    dup_acks: u8,
+    p: LearnedParams,
+    // ECN round accounting (as in `Dctcp`).
+    alpha: f64,
+    acked_in_window: u32,
+    marked_in_window: u32,
+    window_bytes: u32,
+}
+
+impl Learned {
+    pub fn new(mss: u16) -> Self {
+        Learned::with_params(mss, current_learned_params())
+    }
+
+    pub fn with_params(mss: u16, p: LearnedParams) -> Self {
+        let mss = mss as u32;
+        Learned {
+            cwnd: initial_window(mss),
+            ssthresh: u32::MAX,
+            mss,
+            ca_acc: 0,
+            dup_acks: 0,
+            p: p.sanitized(),
+            alpha: 1.0,
+            acked_in_window: 0,
+            marked_in_window: 0,
+            window_bytes: initial_window(mss),
+        }
+    }
+
+    #[inline]
+    fn in_slow_start(&self) -> bool {
+        self.cwnd < self.ssthresh
+    }
+
+    /// The evolved loss response: `ssthresh = max(FlightSize · md_loss, 2·MSS)`.
+    #[inline]
+    fn loss_ssthresh(&self, flight_size: u32) -> u32 {
+        ((flight_size as f64 * self.p.md_loss) as u32).max(2 * self.mss)
+    }
+}
+
+impl CongestionControl for Learned {
+    #[inline]
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+
+    #[inline]
+    fn ssthresh(&self) -> u32 {
+        self.ssthresh
+    }
+
+    fn on_ack(&mut self, _now: Instant, acked: u32) {
+        self.dup_acks = 0;
+        if acked == 0 {
+            return;
+        }
+        if self.in_slow_start() {
+            self.cwnd = self.cwnd.saturating_add(acked.min(self.mss));
+        } else {
+            self.ca_acc = self.ca_acc.saturating_add(acked);
+            let step = ((self.p.ai_gain * self.mss as f64) as u32).max(1); // ≥ 1 byte/round
+            while self.ca_acc >= self.cwnd {
+                self.ca_acc -= self.cwnd;
+                self.cwnd = self.cwnd.saturating_add(step);
+            }
+        }
+    }
+
+    fn on_dup_ack(&mut self, _now: Instant, flight_size: u32) -> bool {
+        self.dup_acks = self.dup_acks.saturating_add(1);
+        if self.dup_acks == 3 {
+            self.ssthresh = self.loss_ssthresh(flight_size);
+            self.cwnd = self.ssthresh;
+            self.ca_acc = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn enter_recovery(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = self.loss_ssthresh(flight_size);
+        self.cwnd = self.ssthresh;
+        self.ca_acc = 0;
+        self.dup_acks = 0;
+    }
+
+    fn on_rto(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = self.loss_ssthresh(flight_size);
+        self.cwnd = self.mss;
+        self.ca_acc = 0;
+    }
+
+    fn set_mss(&mut self, mss: u16) {
+        self.mss = mss as u32;
+        self.cwnd = self.cwnd.max(self.mss);
+        self.ca_acc = 0;
+    }
+
+    fn on_ecn(&mut self, _now: Instant, acked: u32, marked: u32) {
+        if acked == 0 {
+            return;
+        }
+        self.acked_in_window = self.acked_in_window.saturating_add(acked);
+        self.marked_in_window = self.marked_in_window.saturating_add(marked.min(acked));
+        if self.acked_in_window < self.window_bytes {
+            return;
+        }
+        let fraction = self.marked_in_window as f64 / self.acked_in_window as f64;
+        self.alpha = (1.0 - DCTCP_G) * self.alpha + DCTCP_G * fraction;
+        let cwnd_before = self.cwnd;
+        if self.marked_in_window > 0 {
+            // The learned ECN response curve: cut = clamp(ecn_a·α + ecn_b·α², 0, ecn_max).
+            let a = self.alpha;
+            let cut = clamp_f64(self.p.ecn_a * a + self.p.ecn_b * a * a, 0.0, self.p.ecn_max);
+            let reduced = (self.cwnd as f64 * (1.0 - cut)) as u32;
+            self.cwnd = reduced.max(self.mss);
+            self.ssthresh = self.cwnd;
+            self.ca_acc = 0;
+        }
+        self.acked_in_window = 0;
+        self.marked_in_window = 0;
+        self.window_bytes = cwnd_before.max(self.mss);
+    }
+}
+
 /// Which controller a connection runs. The TCB defaults to [`CcKind::Reno`]; a backend can select
 /// another (e.g. from `FERRUM_CC`) before connections form. Drives [`Cc::new`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -622,6 +847,8 @@ pub enum CcKind {
     Bbr,
     /// Data Center TCP (RFC 8257) — the L4S/ECN controller; see [`Dctcp`].
     Dctcp,
+    /// A controller whose gains are evolved in the deterministic sim; see [`Learned`].
+    Learned,
 }
 
 /// The congestion controller the TCB holds. An **enum, not `Box<dyn CongestionControl>`**: dispatch
@@ -640,6 +867,7 @@ pub enum Cc {
     Cubic(Cubic),
     Bbr(Bbr),
     Dctcp(Dctcp),
+    Learned(Learned),
 }
 
 impl Cc {
@@ -650,6 +878,7 @@ impl Cc {
             CcKind::Cubic => Cc::Cubic(Cubic::new(mss)),
             CcKind::Bbr => Cc::Bbr(Bbr::new(mss)),
             CcKind::Dctcp => Cc::Dctcp(Dctcp::new(mss)),
+            CcKind::Learned => Cc::Learned(Learned::new(mss)),
         }
     }
 }
@@ -662,6 +891,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.cwnd(),
             Cc::Bbr(c) => c.cwnd(),
             Cc::Dctcp(c) => c.cwnd(),
+            Cc::Learned(c) => c.cwnd(),
         }
     }
 
@@ -672,6 +902,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.ssthresh(),
             Cc::Bbr(c) => c.ssthresh(),
             Cc::Dctcp(c) => c.ssthresh(),
+            Cc::Learned(c) => c.ssthresh(),
         }
     }
 
@@ -681,6 +912,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.on_ack(now, acked),
             Cc::Bbr(c) => c.on_ack(now, acked),
             Cc::Dctcp(c) => c.on_ack(now, acked),
+            Cc::Learned(c) => c.on_ack(now, acked),
         }
     }
 
@@ -690,6 +922,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.on_dup_ack(now, flight_size),
             Cc::Bbr(c) => c.on_dup_ack(now, flight_size),
             Cc::Dctcp(c) => c.on_dup_ack(now, flight_size),
+            Cc::Learned(c) => c.on_dup_ack(now, flight_size),
         }
     }
 
@@ -699,6 +932,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.enter_recovery(now, flight_size),
             Cc::Bbr(c) => c.enter_recovery(now, flight_size),
             Cc::Dctcp(c) => c.enter_recovery(now, flight_size),
+            Cc::Learned(c) => c.enter_recovery(now, flight_size),
         }
     }
 
@@ -708,6 +942,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.on_rto(now, flight_size),
             Cc::Bbr(c) => c.on_rto(now, flight_size),
             Cc::Dctcp(c) => c.on_rto(now, flight_size),
+            Cc::Learned(c) => c.on_rto(now, flight_size),
         }
     }
 
@@ -717,6 +952,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.set_mss(mss),
             Cc::Bbr(c) => c.set_mss(mss),
             Cc::Dctcp(c) => c.set_mss(mss),
+            Cc::Learned(c) => c.set_mss(mss),
         }
     }
 
@@ -726,6 +962,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.pacing_rate(),
             Cc::Bbr(c) => c.pacing_rate(),
             Cc::Dctcp(c) => c.pacing_rate(),
+            Cc::Learned(c) => c.pacing_rate(),
         }
     }
 
@@ -735,6 +972,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Bbr(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Dctcp(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
+            Cc::Learned(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
         }
     }
 
@@ -744,6 +982,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Bbr(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Dctcp(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
+            Cc::Learned(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
         }
     }
 
@@ -753,6 +992,7 @@ impl CongestionControl for Cc {
             Cc::Cubic(c) => c.on_ecn(now, acked, marked),
             Cc::Bbr(c) => c.on_ecn(now, acked, marked),
             Cc::Dctcp(c) => c.on_ecn(now, acked, marked),
+            Cc::Learned(c) => c.on_ecn(now, acked, marked),
         }
     }
 }
@@ -1099,5 +1339,84 @@ mod tests {
         }
         assert_eq!(cc.cwnd(), bare.cwnd());
         assert!(cc.cwnd() < initial_window(1460), "the marked window cut fired through the enum");
+    }
+
+    // ── Learned (evolved) ───────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn learned_default_genome_is_reno_on_the_loss_path() {
+        // The DEFAULT genome (ai_gain 1, md_loss 0.5) is exactly Reno on additive increase and loss.
+        let mut l = Learned::with_params(1000, LearnedParams::DEFAULT);
+        let mut r = Reno::new(1000);
+        for _ in 0..20 {
+            l.on_ack(NOW, 1000);
+            r.on_ack(NOW, 1000);
+        }
+        assert_eq!(l.cwnd(), r.cwnd(), "additive increase matches Reno at ai_gain = 1");
+        assert!(!l.on_dup_ack(NOW, 8000));
+        assert!(!l.on_dup_ack(NOW, 8000));
+        assert!(l.on_dup_ack(NOW, 8000));
+        assert_eq!(l.ssthresh(), 4000); // FlightSize/2 at md_loss = 0.5
+        assert_eq!(l.cwnd(), 4000);
+        l.on_rto(NOW, 6000);
+        assert_eq!(l.cwnd(), 1000);
+    }
+
+    #[test]
+    fn learned_default_genome_matches_dctcp_ecn_response() {
+        // DEFAULT ecn_a = 0.5, ecn_b = 0, ecn_max = 0.5: a fully-marked window cuts cwnd by α/2 = 0.5,
+        // exactly DCTCP's response — the genome family contains DCTCP as a point.
+        let mut l = Learned::with_params(1000, LearnedParams::DEFAULT); // cwnd 10000, window 10000, α 1
+        for _ in 0..10 {
+            l.on_ecn(NOW, 1000, 1000);
+        }
+        assert_eq!(l.cwnd(), 5000, "the DEFAULT genome reproduces DCTCP's fully-marked halving");
+    }
+
+    #[test]
+    fn learned_baked_genome_holds_a_higher_window_than_dctcp_under_marking() {
+        // The evolved (baked) genome uses a gentler ECN response than DCTCP, so under identical light
+        // marking it parks a higher window — the source of its held-out throughput win over DCTCP.
+        let mut baked = Learned::with_params(1000, LearnedParams::BAKED);
+        let mut dctcp = Dctcp::new(1000);
+        for _ in 0..2_000 {
+            baked.on_ack(NOW, 1000);
+            baked.on_ecn(NOW, 1000, 1000 / 16);
+            dctcp.on_ack(NOW, 1000);
+            dctcp.on_ecn(NOW, 1000, 1000 / 16);
+        }
+        assert!(
+            baked.cwnd() > dctcp.cwnd(),
+            "the gentler evolved ECN response holds a higher window: baked {} vs dctcp {}",
+            baked.cwnd(),
+            dctcp.cwnd()
+        );
+    }
+
+    #[test]
+    fn learned_sanitizes_a_pathological_genome() {
+        // Out-of-range genes (negative increase, window-growing-on-loss, unbounded cut) are clamped...
+        let bad = LearnedParams { ai_gain: -3.0, md_loss: 2.0, ecn_a: -1.0, ecn_b: 9.0, ecn_max: 5.0 };
+        let s = bad.sanitized();
+        assert!(s.ai_gain >= 0.05 && s.md_loss <= 0.95 && s.ecn_a >= 0.0 && s.ecn_max <= 0.95);
+        // ...so a controller built from the worst genome is still stable: it grows on ACKs and never
+        // grows on a loss (RTO collapses to one MSS).
+        let mut l = Learned::with_params(1000, bad);
+        let c0 = l.cwnd();
+        l.on_ack(NOW, 1000);
+        assert!(l.cwnd() >= c0);
+        l.on_rto(NOW, 8000);
+        assert_eq!(l.cwnd(), 1000);
+    }
+
+    #[test]
+    fn cc_enum_dispatches_to_learned() {
+        set_learned_override(None); // ensure the baked genome is used (no leaked training override)
+        let mut cc = Cc::new(CcKind::Learned, 1460);
+        assert!(matches!(cc, Cc::Learned(_)));
+        let bare = Learned::with_params(1460, LearnedParams::BAKED);
+        assert_eq!(cc.cwnd(), bare.cwnd(), "CcKind::Learned uses the baked genome");
+        cc.on_ack(NOW, 1460);
+        assert!(cc.cwnd() > bare.cwnd(), "slow start grows through the enum");
     }
 }

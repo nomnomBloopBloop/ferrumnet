@@ -55,6 +55,7 @@ fn main() -> std::io::Result<()> {
         Ok("cubic") => CcKind::Cubic,
         Ok("bbr") => CcKind::Bbr,
         Ok("dctcp") => CcKind::Dctcp,
+        Ok("learned") => CcKind::Learned,
         _ => CcKind::Reno,
     };
     let cc_name = match cc_kind {
@@ -62,6 +63,7 @@ fn main() -> std::io::Result<()> {
         CcKind::Cubic => "cubic",
         CcKind::Bbr => "bbr",
         CcKind::Dctcp => "dctcp",
+        CcKind::Learned => "learned",
     };
 
     // `tcp-tun <dev> connect <server-ip> [path]` is the download client; otherwise serve.
