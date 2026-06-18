@@ -642,8 +642,10 @@ impl LearnedParams {
     /// in `sim` found (reproducible: `evolve(&train_set(), 30, 28, 0.25, 12345)` on the CE-marking
     /// bottleneck training set, hinge fitness "maximise goodput subject to a sub-ms queue"). On the
     /// held-out (unseen) bottlenecks it lands a distinctly better low-latency frontier point than
-    /// hand-tuned DCTCP — ~30% more goodput at the same sub-millisecond queue — by using a much gentler
-    /// ECN response (`ecn_a ≈ 0.18` vs DCTCP's 0.5) that doesn't needlessly crush the window.
+    /// hand-tuned DCTCP — ~30% more goodput at a comparable (still sub-millisecond) standing queue — by
+    /// using a much gentler ECN response (`ecn_a ≈ 0.18` vs DCTCP's 0.5) that doesn't needlessly crush
+    /// the window. (A better frontier *point*, not strict Pareto domination: DCTCP's queue is a hair
+    /// lower, learned's goodput much higher; both well under a millisecond.)
     pub const BAKED: LearnedParams = LearnedParams {
         ai_gain: 0.860_860_080_762_661_4,
         md_loss: 0.176_650_191_977_447_08,
@@ -687,13 +689,16 @@ thread_local! {
 }
 
 /// Install a candidate genome for subsequently-constructed [`Learned`] controllers (training only).
-pub fn set_learned_override(params: Option<LearnedParams>) {
+/// `pub(crate)`, not public API: external users go through the [`crate::sim`] trainer (`evolve` /
+/// `frontier_fitness`); this is the in-crate hook those use, and the shipped `CcKind::Learned` never
+/// touches it (it resolves to [`LearnedParams::BAKED`]).
+pub(crate) fn set_learned_override(params: Option<LearnedParams>) {
     LEARNED_OVERRIDE.with(|c| c.set(params));
 }
 
 /// The genome a new [`Learned`] controller uses right now: the override if one is installed, else the
 /// baked genome — sanitized either way.
-pub fn current_learned_params() -> LearnedParams {
+pub(crate) fn current_learned_params() -> LearnedParams {
     LEARNED_OVERRIDE.with(|c| c.get()).unwrap_or(LearnedParams::BAKED).sanitized()
 }
 
