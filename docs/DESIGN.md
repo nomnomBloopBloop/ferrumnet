@@ -68,7 +68,7 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
                reliability, flow control, teardown, per-connection timers, SACK recovery,
                active open (SYN-SENT), RFC 7323 timestamps + PAWS, delayed ACKs
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
-  congestion   pluggable CongestionControl trait + Cc enum: Reno/CUBIC/DCTCP [M3,M13,M14]
+  congestion   CongestionControl trait + Cc enum: Reno/CUBIC/DCTCP/Learned  [M3,M13-M15]
   bbr          BBR v1: delivery-rate sampler + windowed-max + state machine [M13]
   buffers      rx/tx ring buffers                                       [M2]
   reasm        receiver out-of-order reassembly (coalesced runs)        [M8]
@@ -76,8 +76,9 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
   runtime/     hand-rolled async: executor, reactor, TcpListener/Stream/ [M4,M9]
                TcpConnector, Device trait + in-memory MockDevice
-  sim          deterministic simulation testing: 2 stacks over a seeded   [M14]
-               fault link + a finite-buffer bottleneck (CeMark/L4S AQM)
+  sim          deterministic simulation testing: 2 stacks over a seeded   [M14,M15]
+               fault link + finite-buffer bottleneck (CeMark/L4S AQM);
+               a coverage-guided greybox fuzzer; a CEM trainer for Learned
 tcp-tun/   (Linux-only backend + demo)
   sys          extern "C" ioctl/poll + repr(C) ifreq/pollfd            [M0]
   tun          TunDevice : Device (IFF_TUN|IFF_NO_PI, O_NONBLOCK)       [M0/M5]
@@ -94,7 +95,7 @@ unnecessary at this scale.
 
 **Originally out of scope, now implemented.** The demo began as a bare server, so delayed ACKs,
 TCP timestamps, active open (`connect`), SACK, out-of-order reassembly, RFC 6675 selective recovery,
-window scaling, the Reno→CUBIC→BBR→DCTCP controllers, and the io_uring backend were all out of the
+window scaling, the Reno→CUBIC→BBR→DCTCP→Learned controllers, and the io_uring backend were all out of the
 first cut — none stubbed, the code paths simply didn't exist. They were added milestone by milestone
 (§5.5, §5.8, §5.9, §5.10). What remains genuinely out of scope: **IP fragmentation/reassembly** (a
 fragmented inbound datagram is dropped) and **IPv6**.
@@ -297,6 +298,21 @@ marked — is the limit of one-bit ECN feedback and biases the queue *lower*, ne
 **AccECN** (RFC 9768) is what would carry the exact per-byte count. The measured latency ladder (sim and
 hardware) is in §5.10.
 
+**Learned (the evolved controller, M15).** The five RFC controllers above are hand-tuned. `Learned`
+instead has its gains **trained**: it is the same AIMD skeleton — slow start, loss multiplicative
+decrease (`ssthresh = FlightSize · md_loss`), congestion-avoidance additive increase (`ai_gain · MSS`
+per round), and a once-per-round ECN cut (`cwnd ×= 1 − clamp(ecn_a·α + ecn_b·α², 0, ecn_max)`) — but its
+five gains are a `LearnedParams` **genome**. The family *contains* Reno (`ai_gain 1, md_loss 0.5,
+ecn = 0`) and DCTCP (`ecn_a 0.5, ecn_b 0`) as points, and `sanitized()` clamps every gene into the
+controller's defined range, so **every genome is a stable controller** — increase is positive, the
+window never grows on loss, the cut is bounded. Only `+ − × ÷`/comparisons (no transcendental
+intrinsics), so it stays deterministic and Miri-clean. The genome is evolved by the CEM trainer in §5.10;
+the shipped `CcKind::Learned` bakes the winner as `LearnedParams::BAKED`. Because `Learned` reacts to
+ECN, `ecn_enabled()` includes it alongside DCTCP (so it marks ECT and echoes ECE); Reno/CUBIC/BBR stay
+byte-identical. A training-time thread-local (`pub(crate)`) injects a candidate genome through the *same*
+`run_bottleneck` path the real stack uses; the shipped controller never touches it (it resolves to the
+baked constant), so it is a pure, deterministic controller in production.
+
 ### 5.6 Async runtime (`runtime`) — M4
 
 Hand-rolled executor + reactor exposing `TcpListener`/`TcpStream`. Verified traps:
@@ -492,6 +508,35 @@ DCTCP 0.95 ms** RTT-under-load at ~6 MB/s each (confirmed on the wire with `tcpd
 ECT(1), the qdisc rewrites it to CE, and the receiver echoes ECE). The deterministic sim and the real
 Linux forwarding path agree — sub-millisecond, below even BBR's paced queue, at line rate.
 
+**Coverage-guided greybox fuzzing (M15).** The DST suite above runs a *fixed* grid of seeds; the fuzzer
+adds feedback-driven search on top — keep the scenarios that exercise new behaviour, mutate them, reach
+states a fixed grid never would (the AFL/libFuzzer discipline). The twist is the coverage signal: it is
+read **entirely off the wire** — the sequence of segment-event classes the two stacks emit (SYN, fresh
+data, retransmit, pure/duplicate/SACK ACK, FIN, RST, zero-window…), hashed pairwise as a 3-event n-gram
+and **stratified by recovery depth** (retransmit / dup-ACK streak length), plus run-outcome features,
+into a 2048-bit map. So the coverage needs **no engine instrumentation**: the sans-IO core stays
+untouched and the whole campaign is a pure function of its seed (a discovered scenario replays bit-for-
+bit). `run()` is refactored to an optional collector that is fully elided when off, so the 1080-grid
+pays nothing. Measured honestly: across hundreds of coverage-steered mutations in a survivable envelope
+it finds **zero** invariant violations (a continuous correctness oracle), it is deterministic, and the
+feedback reaches ~50–60 deep-recovery-sequence edges a uniform-random sampler misses at equal budget —
+guidance buys *depth*, not total breadth (random samples configs more widely, so neither dominates total
+coverage; the guided-only tail is the point, and the test asserts exactly that rather than overclaiming).
+
+**A CEM training ground for the evolved controller (M15).** Because the bottleneck sim is microsecond-
+fast and perfectly reproducible, it is also a *training environment*. A from-scratch **cross-entropy
+method** (`evolve`) searches the `Learned` genome (§5.5): keep a per-gene Gaussian, sample a population,
+score each through the real `run_bottleneck`, refit the Gaussian to the elite. Everything is std-only —
+the Gaussian samples are a **sum-of-twelve-uniforms** central-limit draw (no Box-Muller `ln`/`sqrt`/
+`cos`) and the one variance square root is **hand-rolled Newton** — so the optimiser is as zero-dep and
+transcendental-free as the controllers it tunes. The fitness rewards goodput subject to a sub-millisecond
+queue (a hinge: queue ≤ 1 ms is free, the excess penalised). On **held-out** bottlenecks it never trained
+on, the baked genome lands a better low-latency frontier point than hand-tuned DCTCP: **~0.69× line at
+~0.93 ms** vs DCTCP's **0.53× at 0.85 ms** — ~30% more goodput at a comparable sub-ms queue (a gentler
+ECN response, `ecn_a ≈ 0.18` vs 0.5), and a queue ~9× below BBR and ~100× below Reno. It is a better
+frontier *point*, not strict Pareto domination, and it **generalises** to paths outside training. The
+result is reproducible from a fixed seed (`evolve(&train_set(), 30, 28, 0.25, 12345)`).
+
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
 
@@ -539,6 +584,7 @@ Linux forwarding path agree — sub-millisecond, below even BBR's paced queue, a
 | M12 | folded checksum; `tcp-tun` client mode + two-instance-over-TUN benchmark (caught + fixed the run()-ordering and MSS-options bugs) | two userspace stacks: 125→300 MB/s match-MTU; 11.2 MB/s at +20 ms RTT (3.5× the 64 KiB cap) — window scaling on real hardware |
 | M13 | CUBIC (RFC 8312) + BBR v1 (model-paced, BBRv2 `inflight_hi`/`inflight_lo` bounds) + an ack-clocked go-back-N drain that un-sticks the post-RTO wedge for all controllers | Reno↔CUBIC↔BBR head-to-head over the two-instance bench; BBR ~3.5× lower latency on a bottleneck queue at equal goodput |
 | M14 | deterministic simulation testing (`sim`); **L4S/DCTCP** — ECN ECT/CE/ECE wiring + the DCTCP controller (α-EWMA proportional cut) + a `CeMark` AQM | 1080 adversarial DST scenarios all deliver intact; DCTCP holds a **sub-millisecond** queue (sim *and* hardware) where Reno bloats to tens of ms |
+| M15 | a **coverage-guided greybox fuzzer** (off-the-wire coverage, no engine instrumentation); an **evolved** `Learned` controller trained by a from-scratch CEM (zero ML libs) | fuzzer is a deterministic correctness oracle (zero findings); the evolved genome beats hand-tuned DCTCP on the held-out latency-throughput frontier |
 
 ## 9. Environment
 
@@ -556,5 +602,6 @@ RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP + host requirements, incl. delayed AC
 (CUBIC), the BBR congestion-control draft + Cheng/Cardwell delivery-rate estimation, RFC 3168 (ECN) +
 RFC 8257 (DCTCP) + RFC 9330–9332 (L4S architecture / dual-queue / id) + RFC 9768 (AccECN), RFC 6298
 (RTO), RFC 2018 + 6675 (SACK & selective recovery), RFC 7323 (timestamps & window scaling), RFC 5961 +
-6528 (blind-attack hardening / ISN); the Linux `io_uring` ABI (`<linux/io_uring.h>`); W. R. Stevens,
-*TCP/IP Illustrated, Vol. 1*; the smoltcp source as a cross-reference.
+6528 (blind-attack hardening / ISN); the Linux `io_uring` ABI (`<linux/io_uring.h>`); the cross-entropy
+method (Rubinstein) for the evolved controller and AFL-style coverage-guided fuzzing for the greybox
+search; W. R. Stevens, *TCP/IP Illustrated, Vol. 1*; the smoltcp source as a cross-reference.

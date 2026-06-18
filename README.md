@@ -30,9 +30,10 @@ $ curl -v http://10.0.0.2:8080/
   received bytes and emits bytes to send, with time injected as a parameter. So the whole
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
-  selective recovery, **pluggable congestion control** (Reno / CUBIC / BBR / DCTCP), and a **two-stack
-  userspace loopback** (two instances connecting to each other entirely in memory). **187 tests**,
-  green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no leaks, no suppression).
+  selective recovery, **five pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP / an
+  **evolved** one), and a **two-stack userspace loopback** (two instances connecting to each other
+  entirely in memory). **197 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
+  leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
   reordering, bit-corruption — driven by an event scheduler over the injected clock. The same seed
@@ -41,7 +42,10 @@ $ curl -v http://10.0.0.2:8080/
   terminates — and it has teeth (disabling the TCP checksum makes it flag an integrity violation on
   seed 0 at once). This is TigerBeetle/FoundationDB-style **deterministic simulation testing**,
   applied to a real TCP implementation — which production stacks can't do, being entangled with the
-  kernel clock and NIC. (`sim`)
+  kernel clock and NIC. On top of the fixed grid sits a **coverage-guided greybox fuzzer** whose
+  coverage signal is read *entirely off the wire* (the emitted segment-event sequence, AFL-hashed and
+  stratified by recovery depth) — **no engine instrumentation** — so the sans-IO core stays untouched
+  while a novelty search steers toward behaviour a fixed grid never reaches. (`sim`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -106,8 +110,9 @@ splitting between ~6–14 and ~70–78 MB/s depending on where losses fall.)
 
 **Congestion control — Reno vs CUBIC vs BBR.** The controller is **pluggable**: a
 `CongestionControl` trait behind a match-dispatched `Cc` enum (no `Box<dyn>`, zero-alloc, sans-IO),
-selectable at runtime with `FERRUM_CC={reno,cubic,bbr,dctcp}`. All four are hand-written from the RFCs
-(DCTCP is detailed in the latency-leap section below) — the first three being
+selectable at runtime with `FERRUM_CC={reno,cubic,bbr,dctcp,learned}`. Four are hand-written from the
+RFCs (DCTCP in the latency-leap section below, the evolved `learned` one after it) — the first three
+being
 **Reno** (RFC 5681), **CUBIC** (RFC 8312, the Linux default: cubic window growth + the TCP-friendly
 region), and **BBR** v1 (model-based — it estimates bottleneck bandwidth and min-RTT and *paces* to
 the bandwidth-delay product instead of reacting to loss, with a full STARTUP→DRAIN→PROBE_BW→PROBE_RTT
@@ -201,6 +206,32 @@ deterministic sim result carries through the real Linux forwarding path and qdis
 echoes and all (verified on the wire with `tcpdump`). Both ends run DCTCP: there is no SYN ECN
 negotiation, a documented simplification since the two stacks are configured together.
 
+**An evolved congestion controller — beats DCTCP on the frontier, with zero ML libraries.** Because the
+sim is a microsecond-fast, perfectly-reproducible environment, it doubles as a *training ground*. A
+fifth controller, **`Learned`**, is an AIMD skeleton (slow start, loss multiplicative decrease, additive
+increase, a once-per-round ECN cut) whose **gains are a 5-number genome** — the family contains Reno and
+DCTCP as special points, so every genome is a *stable* controller. The genome is evolved by a
+**cross-entropy method written from scratch in `std`**: keep a per-gene Gaussian, sample a population,
+keep the elite, refit — with the Gaussian drawn from a **sum-of-twelve-uniforms** central-limit sample
+(no Box-Muller `ln`/`cos`) and the one variance square root done by **Newton's method**, so the
+optimizer is as zero-dependency and transcendental-free as the controllers it tunes. The fitness rewards
+goodput subject to a sub-millisecond queue. On **held-out** bottlenecks it never trained on:
+
+| held-out CE-marking bottlenecks | goodput | mean standing queue |
+|---|---|---|
+| Reno | 0.94× line | ~90 ms |
+| BBR | 0.88× line | ~8.6 ms |
+| DCTCP | 0.53× line | ~0.85 ms |
+| **Learned (evolved)** | **0.69× line** | **~0.93 ms** |
+
+The evolved genome lands a distinctly better low-latency frontier point than hand-tuned DCTCP — it
+recovers **~30% more goodput at a comparable, still sub-millisecond queue** (a gentler ECN response,
+`ecn_a ≈ 0.18` vs DCTCP's 0.5, that doesn't needlessly crush the window), while holding a queue ~9×
+below BBR and ~100× below Reno — and it **generalizes to paths outside the training set**. It is a
+better frontier *point*, not strict domination (DCTCP's queue is a hair lower, its goodput far lower).
+The result is reproducible from a fixed seed (`evolve(&train_set(), 30, 28, 0.25, 12345)`), the baked
+genome ships as a constant, and the controller is selectable with `FERRUM_CC=learned`.
+
 **Kernel baseline** (Python `http.server` over `lo`, kernel TCP, 16 MiB): median **~800 MB/s**
 (556–893). *Not* apples-to-apples — `lo`'s MTU is 65536 and it is fully in-kernel (no per-packet
 syscall or user/kernel copy), so it is structurally faster on this path. Matching the MTU closes
@@ -221,7 +252,7 @@ neither beats in-kernel loopback, which has neither a per-packet syscall nor a u
   │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream / TcpConnector│
   │    Stack  →  TCB per connection (active + passive open)                            │
   │      wire (parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)            │
-  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR/DCTCP · sack+reasm (2018/6675)    │
+  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR/DCTCP/Learned · sack+reasm        │
   │      timestamps (RFC 7323) · delayed ACKs (RFC 1122) · buffers · timers            │
   └────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -250,12 +281,14 @@ and wakes the async tasks.
    selective loss recovery with out-of-order reassembly (RFC 2018 + RFC 6675), RFC 7323
    **timestamps** (Karn-free RTT + PAWS), and **delayed ACKs** (RFC 1122). (`tcb`, `rtt`, `sack`,
    `reasm`)
-3. **Congestion control** — **pluggable** behind a `CongestionControl` trait + match-dispatched
-   `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312), **BBR** (v1
-   model paced to the BDP, plus BBRv2 `inflight_hi`/`inflight_lo` bounds + ACK-aggregation for
-   under-loss throughput), and **DCTCP** (RFC 8257, the L4S/ECN controller — ECT marking, CE→ECE
-   echo, and a proportional `cwnd ×= 1 − α/2` cut that holds a sub-millisecond queue). Selectable
-   with `FERRUM_CC`. (`congestion`, `bbr`)
+3. **Congestion control** — **five pluggable controllers** behind a `CongestionControl` trait +
+   match-dispatched `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312),
+   **BBR** (v1 model paced to the BDP, plus BBRv2 `inflight_hi`/`inflight_lo` bounds + ACK-aggregation
+   for under-loss throughput), **DCTCP** (RFC 8257, the L4S/ECN controller — ECT marking, CE→ECE echo,
+   a proportional `cwnd ×= 1 − α/2` cut that holds a sub-millisecond queue), and an **evolved**
+   controller whose gains were trained against the deterministic sim by a from-scratch cross-entropy
+   method (zero ML libraries) and beat hand-tuned DCTCP on the held-out frontier. Selectable with
+   `FERRUM_CC`. (`congestion`, `bbr`, `sim`)
 4. **Zero-copy parsing** — header views over `&[u8]` and the one's-complement Internet checksum
    (RFC 1071), with a clean RX/TX borrow split. (`wire`)
 5. **Async integration** — the `Waker` lifecycle over the sans-IO core, built on the safe
@@ -296,12 +329,14 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 187 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 197 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECN echo, alpha, CeMark AQM,
-                            #            the sub-ms latency ladder) + the ack-clocked go-back-N drain
+                            #            the sub-ms latency ladder) + an evolved controller (CEM
+                            #            trainer, held-out frontier) + the ack-clocked go-back-N drain
                             #            + deterministic simulation testing (1080 adversarial seeds)
+                            #            + a coverage-guided greybox fuzzer (off-the-wire coverage)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -322,8 +357,9 @@ IP forwarding, so it is safe to run alongside other services.
 ## Roadmap
 
 The big milestones are done — active open, SACK loss recovery, MTU-adaptive MSS, window scaling,
-RFC 7323 timestamps, delayed ACKs, an io_uring backend, and **pluggable Reno/CUBIC/BBR congestion
-control** measured head-to-head over the two-instance hardware bench. What's left:
+RFC 7323 timestamps, delayed ACKs, an io_uring backend, **five pluggable congestion controllers**
+(Reno/CUBIC/BBR/DCTCP plus an evolved one) measured head-to-head over the two-instance hardware bench,
+and a **coverage-guided fuzzer** over the deterministic sim. What's left:
 
 - **BBR under random loss — done, with a known residual.** BBRv2 `inflight_hi`/`inflight_lo` bounds
   + ACK-aggregation, plus an ACK-clocked go-back-N drain that un-sticks the post-RTO wedge, took BBR
@@ -331,11 +367,15 @@ control** measured head-to-head over the two-instance hardware bench. What's lef
   residual gap at light loss is BBR v1's documented weakness — loss depresses the measured delivery
   rate, so pacing throttles. Closing it fully needs a **loss-aware delivery-rate estimate** (the
   direction later BBR versions take). Full traced diagnosis in `docs/DESIGN.md`.
-- **Deterministic simulation testing — done (the `sim` module), and the foundation for more.** Two
-  stacks over a seeded, fault-injecting virtual link, replayable from the seed. It already grew the
-  next layer: a **bit-reproducible congestion-control testbed** — a virtual *bottleneck* (rate +
-  finite buffer + AQM) turns the noisy `netem` sweep into exact experiments (bufferbloat, and the
-  CE-marking AQM behind the DCTCP latency ladder above).
+- **Deterministic simulation testing — done (the `sim` module), and the foundation for everything
+  above.** Two stacks over a seeded, fault-injecting virtual link, replayable from the seed. It grew
+  three layers on top: a **bit-reproducible congestion-control testbed** (a virtual *bottleneck* +
+  AQM, behind the DCTCP latency ladder), a **coverage-guided greybox fuzzer** (off-the-wire coverage,
+  a deterministic correctness oracle that found zero invariant violations across thousands of
+  coverage-steered mutations), and the **CEM training ground** for the evolved controller. The natural
+  next rigor step is a **bounded checker** — exhaustively enumerate small SACK-scoreboard op-sequences
+  and wire-parser structural inputs and prove the invariants (zero-dep, no external model checker), so
+  the stack is one you can *fuzz, train against, and prove*.
 - **L4S — the ECN half is done; the scalable-CC frontier is next.** **DCTCP** (RFC 8257) + ECN
   marking/echo (RFC 3168) ship now, holding a sub-millisecond queue on a CE-marking bottleneck (sim
   *and* hardware, table above). The bleeding edge from here is the rest of **L4S** (RFC 9330–9332):
@@ -360,5 +400,6 @@ RFC 791 (IPv4), RFC 793 / 1122 / 9293 (TCP + host requirements, incl. delayed AC
 (checksum), RFC 1982 (serial numbers), RFC 5681 + 6928 (Reno + initial window), RFC 8312 (CUBIC),
 the BBR congestion-control draft + Cheng/Cardwell delivery-rate estimation, RFC 3168 (ECN) + RFC 8257
 (DCTCP) + RFC 9330–9332 (L4S), RFC 6298 (RTO), RFC 2018 + 6675 (SACK & selective recovery), RFC 7323
-(timestamps & window scaling), RFC 5961 + 6528 (blind-attack hardening); W. R. Stevens, *TCP/IP
-Illustrated, Vol. 1*. Built milestone by milestone; see [`docs/DESIGN.md`](docs/DESIGN.md).
+(timestamps & window scaling), RFC 5961 + 6528 (blind-attack hardening); the cross-entropy method
+(Rubinstein) for the evolved controller and AFL-style coverage-guided fuzzing for the greybox search;
+W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built milestone by milestone; see [`docs/DESIGN.md`](docs/DESIGN.md).
