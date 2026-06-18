@@ -24,6 +24,7 @@ const MAX_RUNS: usize = 128;
 
 type Run = (SeqNumber, SeqNumber); // half-open [left, right) in sequence space
 
+#[derive(Clone)]
 pub struct Scoreboard {
     /// SACKed runs, sorted ascending by left edge (serial), coalesced, within `(SND.UNA, SND.NXT]`.
     sacked: Vec<Run>,
@@ -129,6 +130,16 @@ impl Scoreboard {
 
     pub fn set_rescue_done(&mut self) {
         self.rescue_done = true;
+    }
+
+    /// The scoreboard's internal well-formedness invariant: both run lists (`sacked`, `rexmit`) are
+    /// each non-empty-run, strictly ascending, and disjoint-with-a-gap (consecutive runs satisfy
+    /// `r_i < l_{i+1}`, since [`insert_run`] coalesces overlapping *and* adjacent runs). The
+    /// bounded model checker ([`crate::bmc`]) asserts this holds after every operation sequence; it
+    /// is the structural contract the RFC 6675 predicates rely on. (`pub(crate)`: a verification hook,
+    /// not public API.)
+    pub(crate) fn invariants_hold(&self) -> bool {
+        run_list_well_formed(&self.sacked) && run_list_well_formed(&self.rexmit)
     }
 
     // ── interval queries ─────────────────────────────────────────────────────────────────────
@@ -270,6 +281,19 @@ fn insert_run(runs: &mut Vec<Run>, mut l: SeqNumber, mut r: SeqNumber) {
     }
     let pos = runs.iter().position(|&(rl, _)| l.lt(rl)).unwrap_or(runs.len());
     runs.insert(pos, (l, r));
+}
+
+/// A run list is well-formed iff every run is non-empty (`l < r`) and consecutive runs are strictly
+/// ascending with a gap (`r_i < l_{i+1}`) — the sorted, disjoint, coalesced invariant. All comparisons
+/// are [`SeqNumber`] serial; the list spans far less than 2³¹ (one receive window), so the order is
+/// total and the pairwise check is sound across the wrap.
+fn run_list_well_formed(runs: &[Run]) -> bool {
+    for &(l, r) in runs {
+        if !l.lt(r) {
+            return false;
+        }
+    }
+    runs.windows(2).all(|w| w[0].1.lt(w[1].0))
 }
 
 /// Drop runs entirely at/below `snd_una`; clip a straddling run's left edge up to it.
