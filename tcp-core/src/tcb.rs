@@ -385,13 +385,14 @@ impl Tcb {
     }
 
     /// Whether this connection runs ECN end-to-end (DCTCP/L4S with AccECN feedback). True iff the
-    /// controller is one that reacts to ECN — DCTCP, or the evolved `Learned` controller (whose genome
-    /// includes an ECN response): we then mark our data ECT(1) on egress, reflect CE back through the
-    /// AccECN ACE counter (RFC 9768 §3.2.2), and the controller reacts to the exact marked fraction.
-    /// There is **no** SYN ECN negotiation (RFC 3168 §6.1.1 / RFC 9768 §3.1) — both ends are configured
-    /// the same, a deliberate simplification that keeps the handshake untouched while still exercising
-    /// the full mark/feedback/response loop. For every other controller this is false, so no ECT is
-    /// ever set, no ACE bits are ever encoded, and the wire stays byte-identical.
+    /// controller reacts to ECN — **DCTCP**, the evolved **`Learned`** controller (whose genome includes
+    /// an ECN response), or **TCP Prague** (the L4S scalable controller): we then mark our data ECT(1) on
+    /// egress, reflect CE back through the AccECN ACE counter (RFC 9768 §3.2.2), and the controller reacts
+    /// to the exact marked fraction. There is **no** SYN ECN negotiation (RFC 3168 §6.1.1 / RFC 9768 §3.1)
+    /// — both ends are configured the same, a deliberate simplification that keeps the handshake untouched
+    /// while still exercising the full mark/feedback/response loop. For the loss-based controllers
+    /// (Reno/CUBIC/BBR) this is false, so no ECT is ever set, no ACE bits are ever encoded, and the wire
+    /// stays byte-identical.
     #[inline]
     fn ecn_enabled(&self) -> bool {
         matches!(self.cc_kind, CcKind::Dctcp | CcKind::Learned | CcKind::Prague)
@@ -1620,6 +1621,10 @@ impl Tcb {
     #[cfg(test)]
     fn cwnd_dbg(&self) -> u32 {
         self.cc.cwnd()
+    }
+    #[cfg(test)]
+    fn cc_prague_srtt_dbg(&self) -> Option<u32> {
+        self.cc.prague_srtt_dbg()
     }
     #[cfg(test)]
     pub(crate) fn cc_kind_dbg(&self) -> CcKind {
@@ -3296,5 +3301,32 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].ace, 0, "a non-ECN receiver emits a zero ACE field (byte-identical wire)");
         assert!(!out[0].flags.ece() && !out[0].flags.cwr(), "neither ECE nor CWR is ever set for Reno");
+    }
+
+    /// End-to-end plumbing for TCP Prague's defining feature: the TCB must feed the controller the
+    /// smoothed RTT (`process_ack` → `on_rtt_sample`) so Prague's RTT-independent additive increase
+    /// actually engages over the real stack — not just in the controller unit tests that call
+    /// `on_rtt_sample` directly. Without this glue, Prague would silently stay at its `srtt == 0`
+    /// one-MSS (Reno) step. We drive a clean RTT measurement and confirm the controller received it.
+    #[test]
+    fn prague_tcb_feeds_the_controller_the_smoothed_rtt() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 1000, 64000);
+        tcb.set_congestion_control(CcKind::Prague); // rebuilds the controller — srtt starts at 0
+        assert_eq!(tcb.cc_prague_srtt_dbg(), Some(0), "a fresh Prague controller has no RTT yet");
+
+        // Send a segment; its ACK arrives 80 ms later, a clean (un-retransmitted) RTT sample over the
+        // Karn path. The TCB must forward the resulting smoothed RTT to the controller.
+        assert_eq!(tcb.send(b"hello world"), 11);
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1, "the data segment is emitted");
+        let later = now.plus_millis(80);
+        deliver(&mut tcb, later, &inbound(cnxt, iss + 1 + 11, TcpFlags::ACK, 64000, None, b""));
+
+        let srtt = tcb.cc_prague_srtt_dbg().expect("the connection runs Prague");
+        // A real RTT reached the controller (the deleted-plumbing regression leaves this at 0, failing
+        // here). The value is the smoothed RTT — blended with the ~0 µs same-instant handshake sample,
+        // so it is a few ms rather than the raw 80 ms, but unambiguously non-zero and multi-millisecond.
+        assert!(srtt > 1_000, "the controller received a real smoothed RTT over the stack, got {srtt} µs");
     }
 }

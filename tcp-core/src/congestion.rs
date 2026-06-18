@@ -691,6 +691,13 @@ impl Prague {
         let scaled = self.mss as f64 * (self.srtt_us as f64 / PRAGUE_RTT_REF_US);
         clamp_f64(scaled, (self.mss / 4).max(1) as f64, (self.mss * 4) as f64) as u32
     }
+
+    /// The smoothed RTT (µs) the controller currently holds — 0 until the TCB feeds it one. Test-only,
+    /// to verify the TCB→controller `on_rtt_sample` plumbing end-to-end (a deleted feed leaves it 0).
+    #[cfg(test)]
+    pub(crate) fn srtt_dbg(&self) -> u32 {
+        self.srtt_us
+    }
 }
 
 impl CongestionControl for Prague {
@@ -1065,6 +1072,16 @@ impl Cc {
             CcKind::Dctcp => Cc::Dctcp(Dctcp::new(mss)),
             CcKind::Learned => Cc::Learned(Learned::new(mss)),
             CcKind::Prague => Cc::Prague(Prague::new(mss)),
+        }
+    }
+
+    /// The smoothed RTT (µs) a [`Cc::Prague`] controller holds, or `None` for any other variant.
+    /// Test-only, so a TCB-level test can confirm the `on_rtt_sample` plumbing reached the controller.
+    #[cfg(test)]
+    pub(crate) fn prague_srtt_dbg(&self) -> Option<u32> {
+        match self {
+            Cc::Prague(c) => Some(c.srtt_dbg()),
+            _ => None,
         }
     }
 }
@@ -1651,28 +1668,29 @@ mod tests {
 
     #[test]
     fn prague_growth_per_second_is_constant_across_rtt() {
-        // The RTT-independence property, measured end-to-end: drive two CA flows at 1× and 2× the
-        // reference RTT through the same wall-clock window of acks. The long-RTT flow gets half as many
-        // acks (RTT-clocked) but a doubled step, so both add the same number of bytes — equal shares.
-        fn grown_bytes(rtt_us: u32, acks: u32, acks_per_rtt: u32) -> u32 {
+        // The RTT-independence property: two CA flows at 1× and 2× the reference RTT, driven over the
+        // *same wall-clock span*. Because growth is RTT-clocked, the 2× flow sees half as many acks in
+        // that span — so we hand it half the ack count. RTT-independence means the doubled per-RTT step
+        // exactly compensates, and both flows grow by the same number of bytes (equal shares).
+        fn grown_bytes(rtt_us: u32, acks_in_span: u32) -> u32 {
             let mut p = Prague::new(1000);
             p.on_rto(NOW, 20_000); // drop into congestion avoidance (ssthresh = 10000, cwnd = 1000)
             p.on_rtt_sample(rtt_us);
             let start = p.cwnd();
-            // `acks` total acks over a fixed wall-clock span; a flow with `acks_per_rtt` acks per RTT.
-            for _ in 0..acks {
+            for _ in 0..acks_in_span {
                 p.on_ack(NOW, 1000);
             }
-            let _ = acks_per_rtt;
             p.cwnd() - start
         }
-        // Same wall-clock span: the 1× flow sees 2N acks, the 2× flow sees N acks (half the RTTs).
-        let short = grown_bytes(PRAGUE_RTT_REF_US as u32, 200, 1);
-        let long = grown_bytes(2 * PRAGUE_RTT_REF_US as u32, 100, 1);
-        // The long-RTT flow grew at least as much despite seeing half the acks — RTT-independence. (A
-        // classic +1-MSS-per-RTT controller would have grown the long flow only half as much.)
-        assert!(long * 10 >= short * 9, "RTT-independent growth: long {long} vs short {short}");
-        assert!(long >= short / 2 + short / 4, "the long-RTT flow is not RTT-penalised: long {long} vs short {short}");
+        // Equal wall-clock span: the 1× flow sees 200 acks, the 2× flow (half the RTTs) sees 100.
+        let short = grown_bytes(PRAGUE_RTT_REF_US as u32, 200);
+        let long = grown_bytes(2 * PRAGUE_RTT_REF_US as u32, 100);
+        // The two grow by essentially the same number of bytes (within 10% either way) — neither RTT is
+        // penalised. A classic +1-MSS-per-RTT controller would have grown the long flow only ~half as
+        // much (it would fail the lower bound); a controller that ignored RTT and over-stepped the long
+        // flow would fail the upper bound. Both directions are pinned.
+        assert!(long * 10 >= short * 9, "the long-RTT flow is not RTT-penalised: long {long} vs short {short}");
+        assert!(short * 10 >= long * 9, "the long-RTT flow does not over-grow either: long {long} vs short {short}");
     }
 
     #[test]

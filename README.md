@@ -32,7 +32,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **six pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one), and a **two-stack userspace loopback** (two instances connecting to
-  each other entirely in memory). **212 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
+  each other entirely in memory). **213 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
   no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -348,7 +348,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 212 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 213 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
