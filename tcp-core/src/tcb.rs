@@ -394,7 +394,7 @@ impl Tcb {
     /// ever set, no ACE bits are ever encoded, and the wire stays byte-identical.
     #[inline]
     fn ecn_enabled(&self) -> bool {
-        matches!(self.cc_kind, CcKind::Dctcp | CcKind::Learned)
+        matches!(self.cc_kind, CcKind::Dctcp | CcKind::Learned | CcKind::Prague)
     }
 
     // ── application interface ─────────────────────────────────────────────────────────────
@@ -944,6 +944,11 @@ impl Tcb {
             // retransmitting, a doubled RTO never comes back down and recovery ratchets toward
             // the 60 s cap — which made bulk transfers effectively wedge under loss.
             self.rtt.on_clean_ack();
+            // Hand the smoothed RTT to the controller (TCP Prague reads it for its RTT-independent
+            // additive increase). A no-op for every other controller. Once a measurement exists.
+            if let Some(srtt) = self.rtt.srtt_micros() {
+                self.cc.on_rtt_sample(srtt);
+            }
 
             if self.snd_una == self.snd_nxt {
                 // Everything outstanding is acked: stop the timer, clear Karn state.

@@ -56,6 +56,17 @@ impl RttEstimator {
         self.rto
     }
 
+    /// The smoothed round-trip time in **microseconds**, or `None` until the first measurement.
+    /// Used by a delay/RTT-aware controller (TCP Prague's RTT-independent additive increase).
+    #[inline]
+    pub fn srtt_micros(&self) -> Option<u32> {
+        if self.have_measurement {
+            Some(self.srtt)
+        } else {
+            None
+        }
+    }
+
     /// Incorporate a fresh RTT measurement `r` (µs) from a non-retransmitted segment.
     pub fn on_sample(&mut self, r: u32) {
         // A sample longer than the max RTO is meaningless; clamping it also keeps the

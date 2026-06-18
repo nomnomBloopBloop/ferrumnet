@@ -137,6 +137,13 @@ pub trait CongestionControl {
     /// no-op default means Reno/CUBIC/BBR ignore the ECN signal and stay byte-identical — exactly as
     /// they do today, since the TCB only ever passes `marked > 0` on a DCTCP (ECN-enabled) connection.
     fn on_ecn(&mut self, _now: Instant, _acked: u32, _marked: u32) {}
+
+    /// The smoothed round-trip time (µs) was updated. A delay/RTT-aware controller (TCP Prague) reads
+    /// it to make its additive increase **RTT-independent**; the no-op default leaves every window-only
+    /// controller — and the ACK-clocked ones — byte-identical. The TCB calls this once a measurement
+    /// exists, on each advancing ACK; the controller applies it on its next additive-increase step (a
+    /// one-ACK lag on a slowly-smoothed value, immaterial to the per-round window growth).
+    fn on_rtt_sample(&mut self, _srtt_us: u32) {}
 }
 
 pub struct Reno {
@@ -612,6 +619,176 @@ impl CongestionControl for Dctcp {
     }
 }
 
+/// TCP Prague reference RTT (µs) for the RTT-independent additive increase. The per-RTT window
+/// increase is scaled by `srtt / PRAGUE_RTT_REF_US`, so the increase *per unit time* — `step / srtt`
+/// — is the constant `mss / PRAGUE_RTT_REF_US` regardless of a flow's RTT. That is the lever for the
+/// L4S "reduce RTT dependence" requirement (RFC 9330 §5): a short-RTT and a long-RTT Prague flow
+/// converge toward equal shares instead of the short-RTT one grabbing throughput ∝ 1/RTT as classic
+/// AIMD (and DCTCP) do. 25 ms is a representative internet base RTT; at exactly this RTT Prague's step
+/// is one MSS, identical to Reno/DCTCP.
+const PRAGUE_RTT_REF_US: f64 = 25_000.0;
+
+/// TCP Prague — the L4S scalable congestion control (RFC 9330 architecture + the "Prague requirements").
+/// It is the natural consumer of the exact AccECN feedback this stack now carries: like [`Dctcp`] it
+/// reacts to the smoothed *fraction* of CE-marked bytes with a proportional cut (`cwnd ×= 1 − α/2`), so
+/// it holds a shallow sub-millisecond queue behind an L4S AQM. It differs from DCTCP in two faithful
+/// ways. (1) Its additive increase is **RTT-independent**: the per-RTT step is scaled by `srtt /
+/// PRAGUE_RTT_REF_US` (see [`PRAGUE_RTT_REF_US`]) so the growth *rate* in bytes/second does not depend
+/// on RTT — flows of different RTT sharing a bottleneck converge to fair shares. (2) On genuine loss
+/// (three dup-ACKs / RTO) it falls back to a **classic** Reno-style multiplicative decrease, the
+/// "coexist safely with classic loss-based traffic" requirement, so behind a coupled dual-queue AQM
+/// (dualPI2) an L4S Prague flow and a classic Reno flow get fair shares. `α` and the RTT scale are the
+/// only `f64`s, updated with `+ − × ÷`/comparisons alone (no transcendental intrinsics), so it stays
+/// deterministic and Miri-clean like the others.
+pub struct Prague {
+    cwnd: u32,
+    ssthresh: u32,
+    mss: u32,
+    /// Bytes-acked accumulator for the (RTT-scaled) additive increase.
+    ca_acc: u32,
+    dup_acks: u8,
+    /// Smoothed fraction of bytes marked CE, in `[0, 1]` (DCTCP `α`, RFC 8257).
+    alpha: f64,
+    acked_in_window: u32,
+    marked_in_window: u32,
+    window_bytes: u32,
+    /// Most recent smoothed RTT (µs), fed by [`CongestionControl::on_rtt_sample`]; 0 until the first
+    /// measurement, when the additive increase falls back to Reno's one-MSS step.
+    srtt_us: u32,
+}
+
+impl Prague {
+    pub fn new(mss: u16) -> Self {
+        let mss = mss as u32;
+        Prague {
+            cwnd: initial_window(mss),
+            ssthresh: u32::MAX, // slow start until the first loss (identical to Reno/DCTCP)
+            mss,
+            ca_acc: 0,
+            dup_acks: 0,
+            alpha: 1.0, // conservative until the EWMA learns the marking level (RFC 8257 §3.3)
+            acked_in_window: 0,
+            marked_in_window: 0,
+            window_bytes: initial_window(mss),
+            srtt_us: 0,
+        }
+    }
+
+    #[inline]
+    fn in_slow_start(&self) -> bool {
+        self.cwnd < self.ssthresh
+    }
+
+    /// The RTT-independent additive-increase step (bytes added per `cwnd`-worth of acked bytes, i.e.
+    /// per RTT). Scaling the per-RTT step by `srtt / PRAGUE_RTT_REF_US` makes the increase *per unit
+    /// time* constant; the result is clamped to `[mss/4, 4·mss]` so a pathological RTT can never make
+    /// the controller grow unboundedly fast or stall. Before the first RTT sample it is one MSS (Reno).
+    #[inline]
+    fn ai_step(&self) -> u32 {
+        if self.srtt_us == 0 {
+            return self.mss;
+        }
+        let scaled = self.mss as f64 * (self.srtt_us as f64 / PRAGUE_RTT_REF_US);
+        clamp_f64(scaled, (self.mss / 4).max(1) as f64, (self.mss * 4) as f64) as u32
+    }
+}
+
+impl CongestionControl for Prague {
+    #[inline]
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+
+    #[inline]
+    fn ssthresh(&self) -> u32 {
+        self.ssthresh
+    }
+
+    /// Additive increase: exponential in slow start (capped at +1 MSS/ACK, like Reno), then the
+    /// RTT-independent step ([`Prague::ai_step`]) per `cwnd`-worth of acked bytes in congestion
+    /// avoidance. The ECN reaction is separate ([`Prague::on_ecn`]).
+    fn on_ack(&mut self, _now: Instant, acked: u32) {
+        self.dup_acks = 0;
+        if acked == 0 {
+            return;
+        }
+        if self.in_slow_start() {
+            self.cwnd = self.cwnd.saturating_add(acked.min(self.mss));
+        } else {
+            self.ca_acc = self.ca_acc.saturating_add(acked);
+            let step = self.ai_step();
+            while self.ca_acc >= self.cwnd {
+                self.ca_acc -= self.cwnd;
+                self.cwnd = self.cwnd.saturating_add(step);
+            }
+        }
+    }
+
+    /// Genuine loss — three duplicate ACKs — is the *classic* fallback: halve from FlightSize and stay
+    /// in fast recovery, exactly like Reno. Prague only replaces the ECN reaction, not the loss one, so
+    /// it stays safe with classic drop-based traffic.
+    fn on_dup_ack(&mut self, _now: Instant, flight_size: u32) -> bool {
+        self.dup_acks = self.dup_acks.saturating_add(1);
+        if self.dup_acks == 3 {
+            self.ssthresh = (flight_size / 2).max(2 * self.mss);
+            self.cwnd = self.ssthresh;
+            self.ca_acc = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn enter_recovery(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.cwnd = self.ssthresh;
+        self.ca_acc = 0;
+        self.dup_acks = 0;
+    }
+
+    fn on_rto(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.cwnd = self.mss;
+        self.ca_acc = 0;
+    }
+
+    fn set_mss(&mut self, mss: u16) {
+        self.mss = mss as u32;
+        self.cwnd = self.cwnd.max(self.mss);
+        self.ca_acc = 0;
+    }
+
+    /// The scalable ECN reaction, identical to DCTCP: accumulate the marked fraction over a window,
+    /// refresh `α`, and cut `cwnd ×= 1 − α/2` at most once per marked window. Fed by the exact AccECN
+    /// mark count, so `α` tracks the true marking level.
+    fn on_ecn(&mut self, _now: Instant, acked: u32, marked: u32) {
+        if acked == 0 {
+            return;
+        }
+        self.acked_in_window = self.acked_in_window.saturating_add(acked);
+        self.marked_in_window = self.marked_in_window.saturating_add(marked.min(acked));
+        if self.acked_in_window < self.window_bytes {
+            return;
+        }
+        let fraction = self.marked_in_window as f64 / self.acked_in_window as f64;
+        self.alpha = (1.0 - DCTCP_G) * self.alpha + DCTCP_G * fraction;
+        let cwnd_before = self.cwnd;
+        if self.marked_in_window > 0 {
+            let reduced = (self.cwnd as f64 * (1.0 - self.alpha / 2.0)) as u32;
+            self.cwnd = reduced.max(self.mss);
+            self.ssthresh = self.cwnd;
+            self.ca_acc = 0;
+        }
+        self.acked_in_window = 0;
+        self.marked_in_window = 0;
+        self.window_bytes = cwnd_before.max(self.mss);
+    }
+
+    fn on_rtt_sample(&mut self, srtt_us: u32) {
+        self.srtt_us = srtt_us;
+    }
+}
+
 /// Tunable parameters of the [`Learned`] congestion controller — the genome a search optimizes. Each
 /// is a plain `f64`; the controller is a fixed AIMD skeleton (standard slow start; loss → multiplicative
 /// decrease; congestion-avoidance additive increase; a once-per-round ECN proportional cut) whose
@@ -854,6 +1031,8 @@ pub enum CcKind {
     Dctcp,
     /// A controller whose gains are evolved in the deterministic sim; see [`Learned`].
     Learned,
+    /// TCP Prague — the L4S scalable, RTT-independent controller; see [`Prague`].
+    Prague,
 }
 
 /// The congestion controller the TCB holds. An **enum, not `Box<dyn CongestionControl>`**: dispatch
@@ -873,6 +1052,7 @@ pub enum Cc {
     Bbr(Bbr),
     Dctcp(Dctcp),
     Learned(Learned),
+    Prague(Prague),
 }
 
 impl Cc {
@@ -884,6 +1064,7 @@ impl Cc {
             CcKind::Bbr => Cc::Bbr(Bbr::new(mss)),
             CcKind::Dctcp => Cc::Dctcp(Dctcp::new(mss)),
             CcKind::Learned => Cc::Learned(Learned::new(mss)),
+            CcKind::Prague => Cc::Prague(Prague::new(mss)),
         }
     }
 }
@@ -897,6 +1078,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.cwnd(),
             Cc::Dctcp(c) => c.cwnd(),
             Cc::Learned(c) => c.cwnd(),
+            Cc::Prague(c) => c.cwnd(),
         }
     }
 
@@ -908,6 +1090,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.ssthresh(),
             Cc::Dctcp(c) => c.ssthresh(),
             Cc::Learned(c) => c.ssthresh(),
+            Cc::Prague(c) => c.ssthresh(),
         }
     }
 
@@ -918,6 +1101,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.on_ack(now, acked),
             Cc::Dctcp(c) => c.on_ack(now, acked),
             Cc::Learned(c) => c.on_ack(now, acked),
+            Cc::Prague(c) => c.on_ack(now, acked),
         }
     }
 
@@ -928,6 +1112,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.on_dup_ack(now, flight_size),
             Cc::Dctcp(c) => c.on_dup_ack(now, flight_size),
             Cc::Learned(c) => c.on_dup_ack(now, flight_size),
+            Cc::Prague(c) => c.on_dup_ack(now, flight_size),
         }
     }
 
@@ -938,6 +1123,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.enter_recovery(now, flight_size),
             Cc::Dctcp(c) => c.enter_recovery(now, flight_size),
             Cc::Learned(c) => c.enter_recovery(now, flight_size),
+            Cc::Prague(c) => c.enter_recovery(now, flight_size),
         }
     }
 
@@ -948,6 +1134,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.on_rto(now, flight_size),
             Cc::Dctcp(c) => c.on_rto(now, flight_size),
             Cc::Learned(c) => c.on_rto(now, flight_size),
+            Cc::Prague(c) => c.on_rto(now, flight_size),
         }
     }
 
@@ -958,6 +1145,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.set_mss(mss),
             Cc::Dctcp(c) => c.set_mss(mss),
             Cc::Learned(c) => c.set_mss(mss),
+            Cc::Prague(c) => c.set_mss(mss),
         }
     }
 
@@ -968,6 +1156,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.pacing_rate(),
             Cc::Dctcp(c) => c.pacing_rate(),
             Cc::Learned(c) => c.pacing_rate(),
+            Cc::Prague(c) => c.pacing_rate(),
         }
     }
 
@@ -978,6 +1167,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Dctcp(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Learned(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
+            Cc::Prague(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
         }
     }
 
@@ -988,6 +1178,7 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Dctcp(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Learned(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
+            Cc::Prague(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
         }
     }
 
@@ -998,6 +1189,18 @@ impl CongestionControl for Cc {
             Cc::Bbr(c) => c.on_ecn(now, acked, marked),
             Cc::Dctcp(c) => c.on_ecn(now, acked, marked),
             Cc::Learned(c) => c.on_ecn(now, acked, marked),
+            Cc::Prague(c) => c.on_ecn(now, acked, marked),
+        }
+    }
+
+    fn on_rtt_sample(&mut self, srtt_us: u32) {
+        match self {
+            Cc::Reno(c) => c.on_rtt_sample(srtt_us),
+            Cc::Cubic(c) => c.on_rtt_sample(srtt_us),
+            Cc::Bbr(c) => c.on_rtt_sample(srtt_us),
+            Cc::Dctcp(c) => c.on_rtt_sample(srtt_us),
+            Cc::Learned(c) => c.on_rtt_sample(srtt_us),
+            Cc::Prague(c) => c.on_rtt_sample(srtt_us),
         }
     }
 }
@@ -1423,5 +1626,108 @@ mod tests {
         assert_eq!(cc.cwnd(), bare.cwnd(), "CcKind::Learned uses the baked genome");
         cc.on_ack(NOW, 1460);
         assert!(cc.cwnd() > bare.cwnd(), "slow start grows through the enum");
+    }
+
+    #[test]
+    fn prague_additive_increase_is_rtt_independent() {
+        let mut p = Prague::new(1000);
+        // Before any RTT sample the step is one MSS (Reno's), so a Prague flow that hasn't measured
+        // RTT yet behaves like DCTCP.
+        assert_eq!(p.ai_step(), 1000);
+        // At the reference RTT the step is exactly one MSS.
+        p.on_rtt_sample(PRAGUE_RTT_REF_US as u32);
+        assert_eq!(p.ai_step(), 1000);
+        // At twice the reference RTT the per-RTT step doubles — so the increase *per second* (step /
+        // RTT) is unchanged, and a long-RTT flow no longer loses to a short-RTT one.
+        p.on_rtt_sample(2 * PRAGUE_RTT_REF_US as u32);
+        assert_eq!(p.ai_step(), 2000);
+        // A very short RTT is floored at mss/4, a very long one capped at 4·mss — the controller can
+        // never stall or run away on a pathological RTT.
+        p.on_rtt_sample(PRAGUE_RTT_REF_US as u32 / 8);
+        assert_eq!(p.ai_step(), 250, "floored at mss/4");
+        p.on_rtt_sample(100 * PRAGUE_RTT_REF_US as u32);
+        assert_eq!(p.ai_step(), 4000, "capped at 4·mss");
+    }
+
+    #[test]
+    fn prague_growth_per_second_is_constant_across_rtt() {
+        // The RTT-independence property, measured end-to-end: drive two CA flows at 1× and 2× the
+        // reference RTT through the same wall-clock window of acks. The long-RTT flow gets half as many
+        // acks (RTT-clocked) but a doubled step, so both add the same number of bytes — equal shares.
+        fn grown_bytes(rtt_us: u32, acks: u32, acks_per_rtt: u32) -> u32 {
+            let mut p = Prague::new(1000);
+            p.on_rto(NOW, 20_000); // drop into congestion avoidance (ssthresh = 10000, cwnd = 1000)
+            p.on_rtt_sample(rtt_us);
+            let start = p.cwnd();
+            // `acks` total acks over a fixed wall-clock span; a flow with `acks_per_rtt` acks per RTT.
+            for _ in 0..acks {
+                p.on_ack(NOW, 1000);
+            }
+            let _ = acks_per_rtt;
+            p.cwnd() - start
+        }
+        // Same wall-clock span: the 1× flow sees 2N acks, the 2× flow sees N acks (half the RTTs).
+        let short = grown_bytes(PRAGUE_RTT_REF_US as u32, 200, 1);
+        let long = grown_bytes(2 * PRAGUE_RTT_REF_US as u32, 100, 1);
+        // The long-RTT flow grew at least as much despite seeing half the acks — RTT-independence. (A
+        // classic +1-MSS-per-RTT controller would have grown the long flow only half as much.)
+        assert!(long * 10 >= short * 9, "RTT-independent growth: long {long} vs short {short}");
+        assert!(long >= short / 2 + short / 4, "the long-RTT flow is not RTT-penalised: long {long} vs short {short}");
+    }
+
+    #[test]
+    fn prague_fully_marked_window_halves_like_dctcp() {
+        // Prague's ECN reaction is DCTCP's exactly: a fully CE-marked window degrades to a Reno-style
+        // halving (heavy marking earns a heavy response).
+        let mut p = Prague::new(1000);
+        for _ in 0..10 {
+            p.on_ecn(NOW, 1000, 1000);
+        }
+        assert!((p.alpha - 1.0).abs() < 1e-9, "alpha stays 1 under full marking, got {}", p.alpha);
+        assert_eq!(p.cwnd(), 5000, "cwnd ×= 1 − α/2 = 0.5 under full marking");
+        assert_eq!(p.ssthresh(), 5000);
+    }
+
+    #[test]
+    fn prague_holds_a_high_window_under_light_marking() {
+        // The scalable property: under steady light marking Prague (like DCTCP) holds a high window
+        // rather than collapsing. Driven at the reference RTT so the additive step is one MSS.
+        let mut p = Prague::new(1000);
+        p.on_rto(NOW, 20_000);
+        p.on_rtt_sample(PRAGUE_RTT_REF_US as u32);
+        for _ in 0..3_000 {
+            p.on_ack(NOW, 1000);
+            p.on_ecn(NOW, 1000, 1000 / 16); // ~6% marked
+        }
+        assert!(p.alpha < 0.2, "alpha converges near the ~1/16 marked fraction, got {}", p.alpha);
+        assert!(p.cwnd() > 12_000, "Prague holds a high window under light marking; cwnd {}", p.cwnd());
+    }
+
+    #[test]
+    fn prague_loss_response_is_classic_reno() {
+        // Genuine loss falls back to the classic Reno halving — the "be safe with classic drop-based
+        // traffic" Prague requirement — not the gentle ECN cut.
+        let mut p = Prague::new(1000);
+        for _ in 0..20 {
+            p.on_ack(NOW, 1000);
+        }
+        let third = p.on_dup_ack(NOW, 8000) || p.on_dup_ack(NOW, 8000) || p.on_dup_ack(NOW, 8000);
+        assert!(third, "the 3rd dup-ACK triggers recovery");
+        assert_eq!(p.ssthresh(), 4000, "classic Reno halving from FlightSize (8000/2)");
+        assert_eq!(p.cwnd(), 4000);
+    }
+
+    #[test]
+    fn cc_enum_dispatches_to_prague() {
+        let mut cc = Cc::new(CcKind::Prague, 1460);
+        assert!(matches!(cc, Cc::Prague(_)));
+        assert_eq!(cc.cwnd(), initial_window(1460));
+        cc.on_ack(NOW, 1460);
+        assert!(cc.cwnd() > initial_window(1460), "slow start grows through the enum");
+        // The RTT hook reaches the Prague controller through the enum dispatch.
+        cc.on_rtt_sample(2 * PRAGUE_RTT_REF_US as u32);
+        if let Cc::Prague(p) = &cc {
+            assert_eq!(p.ai_step(), 2920, "2·mss at twice the reference RTT");
+        }
     }
 }

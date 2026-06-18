@@ -30,10 +30,10 @@ $ curl -v http://10.0.0.2:8080/
   received bytes and emits bytes to send, with time injected as a parameter. So the whole
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
-  selective recovery, **five pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP / an
-  **evolved** one), and a **two-stack userspace loopback** (two instances connecting to each other
-  entirely in memory). **204 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
-  leaks, no suppression).
+  selective recovery, **six pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
+  **Prague** / an **evolved** one), and a **two-stack userspace loopback** (two instances connecting to
+  each other entirely in memory). **212 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
+  no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
   reordering, bit-corruption — driven by an event scheduler over the injected clock. The same seed
@@ -110,9 +110,9 @@ splitting between ~6–14 and ~70–78 MB/s depending on where losses fall.)
 
 **Congestion control — Reno vs CUBIC vs BBR.** The controller is **pluggable**: a
 `CongestionControl` trait behind a match-dispatched `Cc` enum (no `Box<dyn>`, zero-alloc, sans-IO),
-selectable at runtime with `FERRUM_CC={reno,cubic,bbr,dctcp,learned}`. Four are hand-written from the
-RFCs (DCTCP in the latency-leap section below, the evolved `learned` one after it) — the first three
-being
+selectable at runtime with `FERRUM_CC={reno,cubic,bbr,dctcp,prague,learned}`. Five are hand-written from
+the RFCs (DCTCP and Prague in the latency-leap section below, the evolved `learned` one after it) — the
+first three being
 **Reno** (RFC 5681), **CUBIC** (RFC 8312, the Linux default: cubic window growth + the TCP-friendly
 region), and **BBR** v1 (model-based — it estimates bottleneck bandwidth and min-RTT and *paces* to
 the bandwidth-delay product instead of reacting to loss, with a full STARTUP→DRAIN→PROBE_BW→PROBE_RTT
@@ -269,7 +269,7 @@ neither beats in-kernel loopback, which has neither a per-packet syscall nor a u
   │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream / TcpConnector│
   │    Stack  →  TCB per connection (active + passive open)                            │
   │      wire (parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)            │
-  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR/DCTCP/Learned · sack+reasm        │
+  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR/DCTCP/Prague/Learned · sack+reasm │
   │      timestamps (RFC 7323) · delayed ACKs (RFC 1122) · buffers · timers            │
   └────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -298,11 +298,13 @@ and wakes the async tasks.
    selective loss recovery with out-of-order reassembly (RFC 2018 + RFC 6675), RFC 7323
    **timestamps** (Karn-free RTT + PAWS), and **delayed ACKs** (RFC 1122). (`tcb`, `rtt`, `sack`,
    `reasm`)
-3. **Congestion control** — **five pluggable controllers** behind a `CongestionControl` trait +
+3. **Congestion control** — **six pluggable controllers** behind a `CongestionControl` trait +
    match-dispatched `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312),
    **BBR** (v1 model paced to the BDP, plus BBRv2 `inflight_hi`/`inflight_lo` bounds + ACK-aggregation
    for under-loss throughput), **DCTCP** (RFC 8257, the L4S/ECN controller — ECT marking, exact CE feedback via the AccECN ACE counter (RFC 9768),
-   a proportional `cwnd ×= 1 − α/2` cut that holds a sub-millisecond queue), and an **evolved**
+   a proportional `cwnd ×= 1 − α/2` cut that holds a sub-millisecond queue), **Prague** (the L4S
+   scalable controller, RFC 9330 — DCTCP's ECN response plus an **RTT-independent** additive increase so
+   flows of different RTT share fairly, and a classic Reno loss fallback), and an **evolved**
    controller whose gains were trained against the deterministic sim by a from-scratch cross-entropy
    method (zero ML libraries) and beat hand-tuned DCTCP on the held-out frontier. Selectable with
    `FERRUM_CC`. (`congestion`, `bbr`, `sim`)
@@ -346,7 +348,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 204 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 212 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -398,12 +400,13 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   layout up to two words (~1.7 M), confirming the scoreboard's structural invariants, the RFC 6675
   `pipe ≤ inflight` bound, and the option walker's panic-freedom. So the stack is one you can *fuzz,
   train against, and prove*.
-- **L4S — ECN + exact feedback are done; the scalable-CC frontier is next.** **DCTCP** (RFC 8257) + ECN
-  marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE counter for *exact* per-packet CE feedback)
-  ship now, holding a sub-millisecond queue on a CE-marking bottleneck (sim *and* hardware, table above).
-  The bleeding edge from here is the rest of **L4S** (RFC 9330–9332): a **TCP Prague**-style scalable +
-  RTT-independent controller, and a **dual-queue coupled AQM** (dualPI2) proving L4S flows coexist fairly
-  with classic traffic. Both slot into the same `CongestionControl` trait.
+- **L4S — ECN, exact feedback, and the scalable controller are done; the dual-queue is next.** **DCTCP**
+  (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE counter for *exact* per-packet
+  CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent** controller) ship now, holding
+  a sub-millisecond queue on a CE-marking bottleneck (sim *and* hardware, table above). The remaining L4S
+  piece (RFC 9330–9332) is the **coupled dual-queue AQM** (dualPI2) proving an L4S flow and a classic flow
+  coexist *fairly* on a shared bottleneck — which needs a multi-flow bottleneck the single-flow sim does
+  not yet model. It slots into the same `sim` testbed alongside the existing `CeMark` AQM.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
 - **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, classic ECN negotiation
   (RFC 3168 — DCTCP here skips the SYN handshake), TCP Fast Open, keepalives, Nagle — the details

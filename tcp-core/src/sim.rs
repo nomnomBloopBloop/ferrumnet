@@ -1444,6 +1444,47 @@ mod tests {
         );
     }
 
+    /// TCP Prague (the L4S scalable controller) on the same CE-marking bottleneck: its ECN reaction is
+    /// DCTCP's, so it likewise holds a **sub-millisecond** standing queue where loss-based Reno bloats —
+    /// end-to-end proof the scalable controller works over the real stack, not just the unit tests.
+    /// Prague's distinguishing RTT-independence is exercised by the controller unit tests and the
+    /// dual-queue coexistence demo; on this single short-RTT flow it simply rides the shallow CE marks.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn bottleneck_prague_holds_a_sub_millisecond_queue() {
+        let bn = Bottleneck { rate_bytes_per_sec: 2_500_000, buffer_bytes: 512 * 1024, base_delay_us: 2_000, aqm: Aqm::CeMark { threshold_us: 1_000 } };
+        let bytes = 8 * 1024 * 1024;
+        let reno = run_bottleneck(7, bn, bytes, CcKind::Reno);
+        let prague = run_bottleneck(7, bn, bytes, CcKind::Prague);
+        assert!(reno.completed && prague.completed, "both deliver intact: reno {reno:?} prague {prague:?}");
+        // Teeth: the AQM CE-marked Prague's ECT data (without marks it would behave like Reno), and the
+        // shallow queue it holds never fills the buffer (pure marking, no tail-drop).
+        assert!(prague.data_queue.marked > 0, "the CE-marking AQM must mark Prague's ECT data: {prague:?}");
+        assert_eq!(prague.data_queue.dropped, 0, "Prague holds the queue shallow — nothing tail-drops: {prague:?}");
+        assert!(prague.data_queue.mean_queue_us < 1_000, "Prague holds a sub-millisecond queue: {} µs", prague.data_queue.mean_queue_us);
+        assert!(
+            prague.data_queue.mean_queue_us * 10 < reno.data_queue.mean_queue_us,
+            "Prague ≪ Reno standing queue: prague {} µs vs reno {} µs",
+            prague.data_queue.mean_queue_us,
+            reno.data_queue.mean_queue_us
+        );
+    }
+
+    /// Prague's loss response is the *classic* Reno fallback (the "be safe with drop-based traffic"
+    /// requirement): on the fault link (which never CE-marks) it must be exactly as robust as any other
+    /// controller — every byte intact under heavy loss, duplication and reordering.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dst_prague_is_robust_under_loss() {
+        for loss in [1u32, 5, 10] {
+            for seed in 0..40u64 {
+                let scn = Scenario { seed, link: LinkConfig::lossy(loss), bytes: 32_000, cc: CcKind::Prague };
+                let outcome = run(&scn);
+                assert!(outcome.is_completed(), "Prague must survive loss: {scn:?} -> {outcome:?}");
+            }
+        }
+    }
+
     /// DCTCP's L4S ECN reaction is *additive* to the loss machinery, never a replacement for it: on
     /// the fault link (which never CE-marks), DCTCP sees no marks and must be exactly as robust as any
     /// other controller — delivering every byte intact under heavy loss, duplication and reordering.

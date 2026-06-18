@@ -342,6 +342,24 @@ byte-identical. A training-time thread-local (`pub(crate)`) injects a candidate 
 `run_bottleneck` path the real stack uses; the shipped controller never touches it (it resolves to the
 baked constant), so it is a pure, deterministic controller in production.
 
+**Prague (the L4S scalable controller, M17).** `Cc::Prague` is the reference L4S sender (RFC 9330
+architecture + the "Prague requirements"), the natural consumer of the exact AccECN feedback. Its ECN
+reaction *is* DCTCP's — the smoothed-fraction `α` and the proportional `cwnd ×= 1 − α/2` cut — so it
+holds the same sub-millisecond queue behind an L4S AQM (verified end-to-end: `bottleneck_prague_holds_a_
+sub_millisecond_queue`). It differs from DCTCP in two faithful ways. (1) Its additive increase is
+**RTT-independent**: the per-RTT step is scaled by `srtt / PRAGUE_RTT_REF_US` (clamped to `[mss/4, 4·mss]`),
+so the growth *rate in bytes/second* — `step / srtt` — is constant regardless of RTT. That is the lever
+for the L4S "reduce RTT dependence" requirement (RFC 9330 §5): two Prague flows of different RTT converge
+toward equal shares instead of the short-RTT one grabbing throughput ∝ 1/RTT as classic AIMD and DCTCP do
+(unit-proven: `prague_growth_per_second_is_constant_across_rtt`). The TCB feeds it the smoothed RTT through
+a no-op-default `on_rtt_sample` trait hook, so every other controller stays byte-identical. (2) On genuine
+loss (three dup-ACKs / RTO) it falls back to the **classic** Reno multiplicative decrease — the "coexist
+safely with classic drop-based traffic" requirement — so behind a coupled dual-queue AQM it shares fairly
+with loss-based flows. Only `α` and the RTT scale are `f64`, updated with `+ − × ÷`/comparisons (no
+transcendental intrinsics), so it is deterministic and Miri-clean. The coupled **dualPI2 dual-queue AQM**
+that proves L4S/classic coexistence on a *shared* bottleneck is the next step (it needs the multi-flow
+bottleneck the current single-flow `run_bottleneck` does not yet model).
+
 ### 5.6 Async runtime (`runtime`) — M4
 
 Hand-rolled executor + reactor exposing `TcpListener`/`TcpStream`. Verified traps:
@@ -644,6 +662,7 @@ drives exactly the code paths the live stack runs.
 | M14 | deterministic simulation testing (`sim`); **L4S/DCTCP** — ECN ECT/CE/ECE wiring + the DCTCP controller (α-EWMA proportional cut) + a `CeMark` AQM | 1080 adversarial DST scenarios all deliver intact; DCTCP holds a **sub-millisecond** queue (sim *and* hardware) where Reno bloats to tens of ms |
 | M15 | a **coverage-guided greybox fuzzer** (off-the-wire coverage, no engine instrumentation); an **evolved** `Learned` controller trained by a from-scratch CEM (zero ML libs); a **bounded model checker** (exhaustive SACK / option proofs, no Kani) | fuzzer is a deterministic correctness oracle (zero findings); the evolved genome beats hand-tuned DCTCP on the held-out frontier; the BMC proves the scoreboard + option-walker invariants over ~400 K + ~1.7 M cases |
 | M16 | **AccECN (RFC 9768)** — exact CE feedback via the 3-bit **ACE counter** (AE·CWR·ECE = `r.cep mod 8`), replacing the one-bit ECE-echo run-boundary approximation; the wire now carries the **AE bit** (byte-12 bit-0, old NS) | the sender recovers the *exact* per-packet CE count from the wrapping ACE delta; a delayed ACK coalescing a CE + non-CE segment conveys exactly one mark (no run-boundary over-count); DCTCP/`Learned` get exact `marked`, holding a 642 µs queue at comparable goodput |
+| M17 | **TCP Prague** (`Cc::Prague`) — the L4S scalable controller: DCTCP's proportional ECN response + an **RTT-independent** additive increase (per-RTT step scaled by `srtt / 25 ms`) + a classic Reno loss fallback; fed RTT via a no-op-default `on_rtt_sample` hook | holds a sub-millisecond queue end-to-end on the CE-marking bottleneck like DCTCP; growth *per second* is constant across RTT (unit-proven), the lever for fair L4S coexistence; the coupled dualPI2 dual-queue (shared-bottleneck coexistence) is next |
 
 ## 9. Environment
 
