@@ -781,8 +781,9 @@ impl CovCollector {
         // Recovery depth: consecutive retransmits and consecutive duplicate ACKs on this side.
         // Folding the depth into the location stratifies every event by *how deep into recovery* it
         // happens — "a data segment at retransmit-streak 6" is a different bucket from "...at streak 1"
-        // — and those deep buckets need a specific high-loss input to reach, which is exactly what
-        // makes coverage feedback pay off over blind sampling.
+        // — which multiplies the distinct event *sequences* the coverage map distinguishes. (A blind
+        // sampler reaches the same recovery *depths*; what coverage feedback adds is reaching more of
+        // the depth-stratified event sequences *within* recovery — see the feedback test below.)
         if is_rtx {
             self.rtx_streak[i] = self.rtx_streak[i].saturating_add(1);
         } else if payload_len > 0 {
@@ -874,10 +875,12 @@ pub struct FuzzReport {
     pub coverage: Coverage,
 }
 
-/// Mutate a scenario by perturbing 1–3 of its dimensions, staying inside a **survivable** envelope
-/// (loss ≤ 12%, dup ≤ 8%, corrupt ≤ 2%, jitter ≤ 6 ms, ≤ 24 KB — all within the range the fixed DST
-/// suite already proves the stack survives), so any non-completion the fuzzer turns up is a genuine
-/// bug, never an un-survivably-hostile link.
+/// Mutate a scenario by perturbing 1–3 of its dimensions, staying inside a **survivable** envelope:
+/// loss ≤ 12%, dup ≤ 8%, corrupt ≤ 2%, jitter ≤ 6 ms, ≤ 24 KB. Each cap sits at or below a point the
+/// fixed DST suite already exercises on *that* axis (loss 12% < its 20% heavy-loss test; corrupt 2% <
+/// its 8% corruption test; dup/jitter at the grid's levels), and the four-way worst corner was
+/// re-confirmed survivable directly. So the link stays survivable and any non-completion the fuzzer
+/// turns up is a genuine bug, never an un-survivably-hostile link.
 fn fuzz_mutate(rng: &mut Rng, s: &Scenario) -> Scenario {
     let mut s = *s;
     let n = 1 + rng.below(3);
@@ -922,33 +925,33 @@ fn fuzz_base() -> Scenario {
     Scenario { seed: 1, link: LinkConfig::lossy(5), bytes: 8_000, cc: CcKind::Reno }
 }
 
-/// Run a **coverage-guided** fuzzing campaign of `iterations` scenarios, deterministically driven by
-/// `fuzz_seed`. It keeps every scenario that advances coverage and mutates the corpus, so it reaches
-/// behaviour a fixed grid never would — and it asserts nothing itself: the caller inspects the
-/// [`FuzzReport`] (its `findings` must be empty; its `coverage`/`edges` are the search's reach).
+/// Run a **coverage-guided** fuzzing campaign that evaluates exactly `iterations` scenarios,
+/// deterministically driven by `fuzz_seed`. The first scenario is a mild fixed base; each subsequent
+/// one is a mutation of a corpus member, and the corpus grows with every scenario that advances
+/// coverage — so the search steers toward new behaviour a fixed grid never would. It asserts nothing
+/// itself: the caller inspects the [`FuzzReport`] (its `findings` must be empty; its `coverage`/
+/// `edges` are the search's reach). The `iterations` evaluation count matches
+/// [`fuzz_random_baseline`] exactly, so the two are an equal-budget comparison.
 pub fn fuzz(fuzz_seed: u64, iterations: u32) -> FuzzReport {
     let mut rng = Rng::new(fuzz_seed ^ 0xF1F2_F3F4_F5F6_F7F8);
     let mut global = Coverage::new();
     let mut corpus: Vec<Scenario> = Vec::new();
     let mut findings: Vec<Scenario> = Vec::new();
 
-    let base = fuzz_base();
-    let (o, c) = run_with_coverage(&base);
-    global.merge(&c);
-    corpus.push(base);
-    if !o.is_completed() {
-        findings.push(base);
-    }
-
     for _ in 0..iterations {
-        let parent = corpus[rng.below(corpus.len() as u64) as usize];
-        let child = fuzz_mutate(&mut rng, &parent);
-        let (o, c) = run_with_coverage(&child);
+        // The first scenario seeds the corpus from a fixed base; the rest mutate a corpus member.
+        let scn = if corpus.is_empty() {
+            fuzz_base()
+        } else {
+            let idx = rng.below(corpus.len() as u64) as usize;
+            fuzz_mutate(&mut rng, &corpus[idx])
+        };
+        let (o, c) = run_with_coverage(&scn);
         if global.merge(&c) > 0 {
-            corpus.push(child); // it found new behaviour — keep it to mutate further
+            corpus.push(scn); // it found new behaviour — keep it to mutate further
         }
         if !o.is_completed() {
-            findings.push(child);
+            findings.push(scn);
         }
     }
 
@@ -1001,12 +1004,13 @@ mod tests {
         assert!(a.coverage == b.coverage, "coverage must replay bit-for-bit");
     }
 
-    /// Coverage feedback earns its keep on **depth**, not breadth. Because every event is bucketed by
-    /// how deep into recovery it occurs (retransmit / dup-ACK streak length), the deep buckets need a
-    /// specific high-loss input to reach — so steering the budget toward the corpus members that
-    /// already reached recovery finds behaviour a uniform-random sampler at the same budget never does.
-    /// (Random samples configs more broadly, so neither strictly dominates *total* coverage; the point
-    /// is the guided-only behaviour — the deep tail the feedback buys.)
+    /// Coverage feedback earns its keep on the **depth-stratified event sequences** within recovery,
+    /// not on breadth. Every event is bucketed by how deep into recovery it occurs (retransmit /
+    /// dup-ACK streak length), so the coverage map distinguishes a large space of recovery sequences;
+    /// steering the budget toward the corpus members already in recovery reaches more of those
+    /// sequences than a uniform-random sampler does at the same budget. (Random reaches the same
+    /// recovery *depths* and samples configs more broadly, so neither strictly dominates *total*
+    /// coverage — the point is the guided-only behaviour, the sequence tail the feedback buys.)
     #[test]
     #[cfg_attr(miri, ignore)]
     fn coverage_feedback_reaches_states_random_search_misses() {
