@@ -110,14 +110,20 @@ pub struct Tcb {
     /// `poll_transmit` (every `build` runs inside `poll_transmit`, so it is always fresh).
     cur_tsval: u32,
     /// AccECN (RFC 9768 §3.2.2) **receiver** state: a running count of CE-marked data packets this
-    /// endpoint has accepted (`r.cep`). [`Tcb::on_segment`] increments it for each ECN-CE data
-    /// segment; [`Tcb::build`] reflects `accecn_cep mod 8` in the 3-bit **ACE** field (AE·CWR·ECE) of
-    /// every post-handshake ACK. Because it is a *counter*, not a one-bit latch, a delayed ACK that
-    /// coalesces a CE and a non-CE segment conveys **exactly one** mark — the run-boundary imprecision
-    /// of the old single-bit ECE echo is gone, and marks are never double- or under-counted regardless
-    /// of how ACKs coalesce (as long as fewer than 8 accrue between ACKs, which the every-other-segment
-    /// rule guarantees). Seeded to [`ACE_INIT`]; inert (never read, never encoded) unless this is an
-    /// AccECN connection ([`Tcb::ecn_enabled`]), so the wire stays byte-identical for Reno/CUBIC/BBR.
+    /// endpoint has *accepted* (`r.cep`). [`Tcb::on_segment`] increments it once per ECN-CE data segment
+    /// that actually contributes accepted data (fresh in-order bytes or newly buffered out-of-order
+    /// data — never a dropped or wholly-duplicate one, which would double-count on retransmission);
+    /// [`Tcb::build`] reflects `accecn_cep mod 8` in the 3-bit **ACE** field (AE·CWR·ECE) of every
+    /// post-handshake ACK. Because it is a *counter*, not a one-bit latch, a delayed ACK that coalesces
+    /// a CE and a non-CE segment conveys **exactly one** mark — the run-boundary imprecision of the old
+    /// single-bit ECE echo is gone. The exact count is recoverable by the sender only while fewer than 8
+    /// CE marks fall between two ACKs it reads (the 3-bit field's inherent wrap); the reactor emits at
+    /// most one ACK per turn, so on the in-process paths exercised here the bottleneck serialises data
+    /// arrivals to ~one segment per turn and the field never wraps — a real-device burst of ≥8 CE
+    /// segments in a single read under sustained heavy marking would lose a multiple of 8, for which RFC
+    /// 9768's byte-accurate AccECN Option (§3.2.3) is the standard fix (see `docs/DESIGN.md`). Seeded to
+    /// [`ACE_INIT`]; inert (never read, never encoded) unless this is an AccECN connection
+    /// ([`Tcb::ecn_enabled`]), so the wire stays byte-identical for Reno/CUBIC/BBR.
     accecn_cep: u8,
     /// AccECN (RFC 9768 §3.2.2) **sender** state: the last ACE value we decoded from the peer's ACKs.
     /// [`Tcb::process_ack`] computes the wrapping delta `(ace − accecn_ace_seen) mod 8` on each
@@ -616,14 +622,7 @@ impl Tcb {
         // out-of-order runs contiguous, which are then drained in). Out-of-order data — a gap
         // below it — is buffered for reassembly when SACK is enabled, instead of being dropped.
         if !payload.is_empty() {
-            // AccECN receiver (RFC 9768 §3.2.2): count this accepted data segment's CE mark into the
-            // CE-packet counter, which our next ACK reflects in the ACE field (see `build`). A running
-            // counter — not a one-bit latch — so a mark on a segment later coalesced under a delayed
-            // ACK is conveyed exactly once, never lost and never inflated to the whole coalesced span.
-            // Inert unless this is an AccECN connection.
-            if self.ecn_enabled() && ce {
-                self.accecn_cep = self.accecn_cep.wrapping_add(1);
-            }
+            let rcv_nxt_before = self.rcv_nxt;
             // Left-trim a segment overlapping the left window edge (seg_seq < RCV.NXT) so its
             // fresh in-order tail is delivered rather than dropped; an already-delivered prefix
             // (or a wholly-duplicate segment) trims to empty.
@@ -666,6 +665,19 @@ impl Tcb {
                     let edge = self.reasm_right_edge();
                     self.reasm.insert(self.rcv_nxt, edge, data_seq, data);
                 }
+            }
+            // AccECN receiver (RFC 9768 §3.2.2): count this segment's CE mark into the CE-packet
+            // counter (which our next ACK reflects in the ACE field, see `build`) — but only if the
+            // segment actually contributed *accepted* data: fresh in-order bytes (RCV.NXT advanced) or
+            // newly buffered out-of-order data. Counting before the accept decision would double-count
+            // a CE-marked segment that is dropped — out-of-order with SACK disabled, or no rx room —
+            // and then retransmitted CE-marked: the same congestion mark would land in the counter
+            // twice, inflating the sender's marked fraction. A running counter, not a one-bit latch, so
+            // a mark on a segment later coalesced under a delayed ACK is still conveyed exactly once.
+            // Inert unless this is an AccECN connection.
+            let accepted = self.rcv_nxt != rcv_nxt_before || self.reasm.buffered() > reasm_before;
+            if self.ecn_enabled() && ce && accepted {
+                self.accecn_cep = self.accecn_cep.wrapping_add(1);
             }
             // ACK scheduling (RFC 1122 §4.2.3.2). Only a *clean* in-order segment may defer its ACK
             // (coalesced with the next, or piggybacked on outgoing data): in order, fully accepted,
@@ -3174,46 +3186,93 @@ mod tests {
     }
 
     /// AccECN sender (RFC 9768 §3.2.2): the wrapping ACE delta the peer reports is decoded into an
-    /// exact marked-byte count and fed to the controller, so CE feedback actually cuts the window.
-    /// Driving an identical send/ACK schedule with vs. without per-segment CE marks, the marked run
-    /// ends with a strictly smaller congestion window — the sender reacted to the ACE counter.
+    /// *exact* marked-byte count (`delta · SMSS`), not a per-ACK "marked at all?" estimate, and fed to
+    /// the controller — so the cut is proportional to the true mark count. We drive three identical bulk
+    /// transfers that differ only in how many of each coalesced 2-segment ACK's segments were CE-marked:
+    /// 0 (clean), 1 (delta = 1, half marked), 2 (delta = 2, fully marked). The fully-marked run must cut
+    /// **strictly more** than the half-marked run. This pins the exactness the commit exists for: with a
+    /// per-ACK latch (`delta.min(1)`) or the old all-or-nothing estimate (`marked = data_acked`) the
+    /// delta = 1 and delta = 2 runs would be identical, and the assertion would fail.
     #[test]
-    fn accecn_sender_reacts_to_the_exact_ace_delta() {
-        // One run of the sender: emit a congestion window of data in a single burst, then ACK each
-        // emitted segment in order. When `mark`, raise the ACE counter by one per segment (model every
-        // data packet as CE-marked); otherwise hold it at the baseline (no congestion). Returns the
-        // controller's window after the schedule.
-        fn drive(mark: bool) -> u32 {
+    fn accecn_sender_cut_is_proportional_to_the_exact_ace_delta() {
+        // Bulk transfer where every ACK cumulatively covers two emitted segments and advances the peer's
+        // ACE counter by `marks_per_ack` (0..=2) — i.e. `marks_per_ack` of the two acked packets were
+        // CE-marked. Returns the controller's window after the schedule. `marks_per_ack < 8`, so the
+        // 3-bit field never wraps.
+        fn drive(marks_per_ack: u8) -> u32 {
             let now = Instant::from_millis(0);
-            let (mut tcb, _iss, cnxt) = established(now, 7000, 64000);
+            let (mut tcb, _iss, cnxt) = established(now, 9000, 64000);
             tcb.set_congestion_control(CcKind::Dctcp);
-            tcb.send(&vec![0x5a; 64 * 1024]);
-            let segs: Vec<(SeqNumber, u32)> = drain(&mut tcb, now)
-                .iter()
-                .filter(|o| !o.payload.is_empty())
-                .map(|o| (o.seq, o.payload.len() as u32))
-                .collect();
-            assert!(segs.len() >= 8, "the initial window should span several segments: {}", segs.len());
+            tcb.send(&vec![0x5a; 128 * 1024]);
             let mut ace = ACE_INIT;
-            for (seq, len) in segs {
-                if mark {
-                    ace = ace.wrapping_add(1); // this data packet was CE-marked
+            let mut pending: Vec<(SeqNumber, u32)> = Vec::new();
+            for _ in 0..400 {
+                for o in drain(&mut tcb, now) {
+                    if !o.payload.is_empty() {
+                        pending.push((o.seq, o.payload.len() as u32));
+                    }
                 }
-                // Cumulative ACK covering this segment, carrying the receiver's current ACE counter.
+                if pending.is_empty() {
+                    break; // send buffer drained — schedule complete
+                }
+                // Coalesce up to two segments into one delayed ACK (cumulative ack covers both).
+                let n = pending.len().min(2);
+                let (seq, len) = pending[n - 1];
+                pending.drain(0..n);
+                ace = ace.wrapping_add(marks_per_ack);
                 deliver(&mut tcb, now, &inbound_ace(cnxt, seq + len, 64000, ace & 0x07));
             }
             tcb.cwnd_dbg()
         }
 
-        let marked = drive(true);
-        let clean = drive(false);
-        // The clean run only ever grows (slow start, no cut); the marked run takes a proportional
-        // DCTCP cut once its window of marks is fully acknowledged.
+        let clean = drive(0); // no marks: slow-start growth, no cut
+        let half = drive(1); // ~50% marked: a gentle proportional cut
+        let full = drive(2); // ~100% marked: a much deeper cut
         assert!(clean > crate::congestion::initial_window(1460), "the un-marked control grows its window: {clean}");
+        assert!(half < clean, "a marked run cuts the window below the un-marked control: half {half} vs clean {clean}");
         assert!(
-            marked < clean,
-            "exact AccECN marks must cut the sender's window below the un-marked control: marked {marked} vs clean {clean}"
+            full < half,
+            "a fully-marked run (delta 2/ACK) must cut strictly more than a half-marked one (delta 1/ACK) — \
+             the cut tracks the *exact* decoded mark count, not a per-ACK latch: full {full} vs half {half}"
         );
+    }
+
+    /// AccECN receiver, finding-1 regression (RFC 9768 §3.2.2): a CE mark is counted only for a segment
+    /// whose data is actually *accepted*. On a SACK-off connection an out-of-order segment is dropped, so
+    /// its CE must NOT bump the counter — otherwise the in-order retransmission of that same data would
+    /// count the one congestion mark twice, inflating the sender's marked fraction.
+    #[test]
+    fn accecn_receiver_does_not_count_a_dropped_out_of_order_ce_mark() {
+        let now = Instant::from_millis(0);
+        // `established` offers no SACK-Permitted, so this connection has reassembly disabled: an
+        // out-of-order segment is dropped rather than buffered.
+        let (mut tcb, iss, cnxt) = established(now, 1000, 64000);
+        tcb.set_congestion_control(CcKind::Dctcp);
+
+        // An out-of-order CE-marked segment (a 5-byte gap below it is still missing): dropped, so the
+        // CE-packet counter must stay at the baseline. The out-of-order arrival forces an immediate ACK.
+        let mut ooo = inbound(cnxt + 5, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"world");
+        crate::wire::set_ecn(&mut ooo, crate::wire::ECN_CE);
+        deliver(&mut tcb, now, &ooo);
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ace, ACE_INIT & 0x07, "a dropped out-of-order CE segment must not be counted");
+
+        // Two in-order CE-marked segments are now accepted (the first fills the missing gap, the second
+        // is the data the dropped out-of-order segment carried). With SACK off the receiver can't tell a
+        // gap was filled, so the first defers its ACK (every-other-segment rule) and the second triggers
+        // the coalesced ACK. Its ACE must be baseline + 2 — only the two *accepted* segments are counted;
+        // the dropped out-of-order arrival is not. (With the pre-fix double-count it would read +3.)
+        let mut fill1 = inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"hello");
+        crate::wire::set_ecn(&mut fill1, crate::wire::ECN_CE);
+        deliver(&mut tcb, now, &fill1);
+        assert!(drain(&mut tcb, now).is_empty(), "the lone in-order segment defers its ACK");
+        let mut fill2 = inbound(cnxt + 5, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"world");
+        crate::wire::set_ecn(&mut fill2, crate::wire::ECN_CE);
+        deliver(&mut tcb, now, &fill2);
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ace, (ACE_INIT + 2) & 0x07, "only the two accepted in-order CE segments are counted");
     }
 
     /// The byte-identical guarantee at the wire level: a non-ECN (Reno) receiver never sets *any* ACE

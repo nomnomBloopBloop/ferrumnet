@@ -301,20 +301,31 @@ byte); CWR and ECE are the existing flag bits. The sender differences the field 
 its data packets the receiver newly saw CE-marked**, and converts it to `marked ≈ delta · SMSS` (clamped
 to the bytes that ACK delivered) for `on_ecn`. Because the counter is *per-packet*, a delayed ACK that
 coalesces a CE and a non-CE segment conveys exactly one mark — the run-boundary imprecision of the old
-single-bit ECE echo (a whole coalesced span counted as marked) is **gone**, and marks are never double-
-or under-counted regardless of ACK timing. On the sub-ms demo this sharpens the feedback: DCTCP's α now
-tracks the *true* marking level instead of the echo's queue-lowering over-attribution, holding a **642 µs**
-queue at comparable goodput (the old echo's 525 µs was an artefact of over-counting, not a better
-operating point). Both counters seed to **5** (RFC 9768 §3.2.2.2) so the first wrapping delta is zero.
+single-bit ECE echo (a whole coalesced span counted as marked) is **gone**. The receiver counts a mark
+only for a segment whose data it actually *accepts* (fresh in-order bytes or newly buffered out-of-order
+data), so a dropped-then-retransmitted CE segment is not double-counted. On the sub-ms demo this sharpens
+the feedback: DCTCP's α now tracks the *true* marking level instead of the echo's queue-lowering
+over-attribution, holding a **642 µs** queue at comparable goodput (the old echo's 525 µs was an artefact
+of over-counting, not a better operating point). Both counters seed to **5** (RFC 9768 §3.2.2.2) so the
+first wrapping delta is zero.
+
+*The 3-bit field's wrap, honestly.* The ACE counter recovers the exact CE count only while **fewer than 8**
+marks fall between two ACKs the sender reads — the inherent limit of a 3-bit field. The reactor emits at
+most one ACK per turn (it drains all inbound, then `poll_transmit` once), so the real bound is "CE-marked
+segments accepted per turn." On the in-process sim / loopback paths exercised here the bottleneck
+**serialises** data arrivals to roughly one segment per turn, so the field never wraps — verified, not
+assumed. A real TUN handed a burst of ≥8 CE-marked frames in a single read under *sustained heavy*
+marking could lose a multiple of 8; RFC 9768's two standard mitigations are change-triggered immediate
+ACKs (§3.2.2.3) and the byte-accurate **AccECN Option** (§3.2.3), the latter being the proper fix and a
+listed roadmap item.
 
 *Three deliberate simplifications, all documented.* (1) **No SYN ECN negotiation** (RFC 3168 §6.1.1 / RFC
 9768 §3.1) — both ends are configured the same, so the handshake stays byte-identical and never carries
 ACE. (2) **No change-triggered immediate ACKs** (RFC 9768 §3.2.2.3): the receiver keeps the ordinary
-delayed-ACK schedule. The counter is exact regardless of ACK timing, so this is purely a latency
-refinement, not a correctness one — and the every-other-segment rule caps marks-between-ACKs far below 8,
-so the 3-bit field never wraps ambiguously. (3) **No AccECN Option** (the byte-accurate `EE0B`/`CEB`
-fields, RFC 9768 §3.2.3) — the packet-granular ACE counter is enough for the controllers here. The
-measured latency ladder (sim and hardware) is in §5.10.
+delayed-ACK schedule — a latency refinement that, combined with the AccECN Option, would also close the
+wrap window above. (3) **No AccECN Option** (the byte-accurate `EE0B`/`CEB` fields, RFC 9768 §3.2.3) — the
+packet-granular ACE counter is enough for the controllers and the serialised paths here. The measured
+latency ladder (sim and hardware) is in §5.10.
 
 **Learned (the evolved controller, M15).** The five RFC controllers above are hand-tuned. `Learned`
 instead has its gains **trained**: it is the same AIMD skeleton — slow start, loss multiplicative

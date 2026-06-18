@@ -32,7 +32,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **five pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP / an
   **evolved** one), and a **two-stack userspace loopback** (two instances connecting to each other
-  entirely in memory). **201 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
+  entirely in memory). **204 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
   leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -211,13 +211,17 @@ not a one-bit echo: the receiver counts the CE-marked data packets it accepts an
 (`mod 8`) in the three header bits **AE · CWR · ECE** on every ACK — AE being byte-12 bit-0 (RFC 3168's
 old NS), which the wire now emits and parses, folded into the TCP checksum. The sender differences the
 field across ACKs, so the wrapping delta is the *exact* number of its packets the receiver newly saw
-marked. The win over the one-bit echo is exactness under coalescing: a delayed ACK spanning a CE and a
-non-CE segment now conveys **exactly one** mark instead of attributing the whole span as marked. That
-sharpens DCTCP's α to the true marking level — the demo queue settles at ~0.64 ms (the earlier ~0.5 ms
-was the echo's over-counting biasing it low), at comparable goodput. Three documented simplifications:
-no SYN ECN negotiation, no change-triggered immediate ACKs (the counter is exact regardless of ACK
-timing, and the every-other-segment rule keeps the 3-bit field from wrapping), and no byte-accurate
-AccECN Option — the packet-granular counter is enough for these controllers.
+marked (counted only for segments whose data it actually accepts, so a dropped-then-retransmitted CE
+isn't double-counted). The win over the one-bit echo is exactness under coalescing: a delayed ACK
+spanning a CE and a non-CE segment now conveys **exactly one** mark instead of attributing the whole span
+as marked. That sharpens DCTCP's α to the true marking level — the demo queue settles at ~0.64 ms (the
+earlier ~0.5 ms was the echo's over-counting biasing it low), at comparable goodput. The 3-bit field is
+exact only while fewer than 8 marks fall between two ACKs the sender reads; the reactor emits one ACK per
+turn and the in-process bottleneck serialises arrivals to ~one segment per turn, so it never wraps here —
+a real-device burst of ≥8 CE frames under sustained heavy marking is the inherent limit the byte-accurate
+**AccECN Option** (RFC 9768 §3.2.3, a roadmap item) closes. Three documented simplifications: no SYN ECN
+negotiation, no change-triggered immediate ACKs, and no AccECN Option (the packet-granular counter is
+enough for these controllers on the serialised paths here).
 
 **An evolved congestion controller — beats DCTCP on the frontier, with zero ML libraries.** Because the
 sim is a microsecond-fast, perfectly-reproducible environment, it doubles as a *training ground*. A
@@ -342,7 +346,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 203 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 204 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
