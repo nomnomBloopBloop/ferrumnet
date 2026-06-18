@@ -275,6 +275,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(
             Endpoint::new(HOST, CPORT),
@@ -669,6 +670,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(Endpoint::new(US, 8080), Endpoint::new(HOST, our_port), &repr, b"")
     }
@@ -740,6 +742,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(Endpoint::new(HOST, cport), Endpoint::new(US, 8080), &repr, payload)
     }

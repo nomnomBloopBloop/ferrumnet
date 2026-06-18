@@ -74,6 +74,13 @@ const MAX_SYN_RETRIES: u16 = 7;
 /// work, so this only bounds the wait for a lone or trailing in-order segment.
 const DELAYED_ACK_MILLIS: u64 = 40;
 
+/// AccECN (RFC 9768 §3.2.2.2) initial value of the CE-packet counter `r.cep`, and therefore of the
+/// sender's reference `accecn_ace_seen`. Both ends seed it identically so the first wrapping delta is
+/// zero; the RFC picks 5 (`0b101`) so a classic-ECN middlebox that strips the AE bit is still
+/// distinguishable, which is moot here (we never negotiate ECN on the handshake) but kept for
+/// faithfulness. The only thing that matters for delta correctness is that both ends agree on it.
+const ACE_INIT: u8 = 5;
+
 pub struct Tcb {
     pub state: State,
     local: Endpoint,
@@ -102,23 +109,24 @@ pub struct Tcb {
     /// Our TSval to stamp on outgoing segments: the microsecond clock captured at the top of each
     /// `poll_transmit` (every `build` runs inside `poll_transmit`, so it is always fresh).
     cur_tsval: u32,
-    /// DCTCP/L4S (RFC 8257) congestion echo — "was any data CE-marked since our last ACK?". A
-    /// receiver **ORs in** the IPv4 CE codepoint of each data segment it accepts; [`Tcb::build`]
-    /// mirrors it as the TCP ECE flag and then clears it, so the next ACK starts a fresh
-    /// accumulation. ORing (not overwriting) is load-bearing: under the every-other-segment delayed-
-    /// ACK rule, a CE mark on a deferred segment would otherwise be lost when the segment that
-    /// triggers the combined ACK is itself un-marked — which systematically under-counts the marked
-    /// fraction and lets the queue bloat. Active only on a DCTCP connection ([`Tcb::ecn_enabled`]);
-    /// inert (never read, never set) for every other controller, so the wire stays byte-identical
-    /// for Reno/CUBIC/BBR.
-    ///
-    /// This is the simplified "OR since the last ACK" receiver, not the full RFC 8257 §3.2 state
-    /// machine (which sends an immediate ACK on every CE-state change). The residual imprecision — a
-    /// single ACK that coalesces a marked/un-marked run boundary attributes its whole span as marked
-    /// — is the limit of one-bit ECN feedback and biases the queue *lower*, never dropping a signal;
-    /// AccECN (RFC 9768) is what conveys the exact per-byte mark count. There is likewise no SYN ECN
-    /// negotiation: both ends are configured DCTCP (see `ecn_enabled`).
-    ece_echo: bool,
+    /// AccECN (RFC 9768 §3.2.2) **receiver** state: a running count of CE-marked data packets this
+    /// endpoint has accepted (`r.cep`). [`Tcb::on_segment`] increments it for each ECN-CE data
+    /// segment; [`Tcb::build`] reflects `accecn_cep mod 8` in the 3-bit **ACE** field (AE·CWR·ECE) of
+    /// every post-handshake ACK. Because it is a *counter*, not a one-bit latch, a delayed ACK that
+    /// coalesces a CE and a non-CE segment conveys **exactly one** mark — the run-boundary imprecision
+    /// of the old single-bit ECE echo is gone, and marks are never double- or under-counted regardless
+    /// of how ACKs coalesce (as long as fewer than 8 accrue between ACKs, which the every-other-segment
+    /// rule guarantees). Seeded to [`ACE_INIT`]; inert (never read, never encoded) unless this is an
+    /// AccECN connection ([`Tcb::ecn_enabled`]), so the wire stays byte-identical for Reno/CUBIC/BBR.
+    accecn_cep: u8,
+    /// AccECN (RFC 9768 §3.2.2) **sender** state: the last ACE value we decoded from the peer's ACKs.
+    /// [`Tcb::process_ack`] computes the wrapping delta `(ace − accecn_ace_seen) mod 8` on each
+    /// advancing ACK — the exact number of our data packets the peer newly saw CE-marked — converts it
+    /// to a marked-byte estimate (`delta · SMSS`, clamped to the bytes that ACK delivered), and feeds
+    /// the controller via [`crate::congestion::CongestionControl::on_ecn`]. Seeded to [`ACE_INIT`] to
+    /// match the peer's initial `r.cep` so the first delta is zero. There is no SYN ECN negotiation:
+    /// both ends are configured the same (see `ecn_enabled`).
+    accecn_ace_seen: u8,
 
     // Receive sequence space.
     irs: SeqNumber,
@@ -245,7 +253,8 @@ impl Tcb {
             ts_enabled,
             ts_recent,
             cur_tsval: 0,
-            ece_echo: false,
+            accecn_cep: ACE_INIT,
+            accecn_ace_seen: ACE_INIT,
             irs,
             rcv_nxt,
             rcv_adv: rcv_nxt + rcv_wnd as u32,
@@ -316,7 +325,8 @@ impl Tcb {
             ts_enabled: false, // negotiated on the SYN-ACK
             ts_recent: 0,
             cur_tsval: 0,
-            ece_echo: false,
+            accecn_cep: ACE_INIT,
+            accecn_ace_seen: ACE_INIT,
             irs: SeqNumber::new(0), // unknown until the SYN/SYN-ACK carries IRS
             rcv_nxt: SeqNumber::new(0),
             rcv_adv: SeqNumber::new(0),
@@ -368,13 +378,14 @@ impl Tcb {
         }
     }
 
-    /// Whether this connection runs ECN end-to-end (DCTCP/L4S). True iff the controller is one that
-    /// reacts to ECN — DCTCP, or the evolved `Learned` controller (whose genome includes an ECN
-    /// response): we then mark our data ECT(1) on egress and echo CE back as ECE, and the controller
-    /// reacts to the marked fraction. There is **no** SYN ECN negotiation (RFC 3168 §6.1.1) — both
-    /// ends are configured the same, a deliberate simplification that keeps the handshake untouched
-    /// while still exercising the full marking/echo/response loop. For every other controller this is
-    /// false, so no ECT is ever set, no ECE is ever echoed, and the wire stays byte-identical.
+    /// Whether this connection runs ECN end-to-end (DCTCP/L4S with AccECN feedback). True iff the
+    /// controller is one that reacts to ECN — DCTCP, or the evolved `Learned` controller (whose genome
+    /// includes an ECN response): we then mark our data ECT(1) on egress, reflect CE back through the
+    /// AccECN ACE counter (RFC 9768 §3.2.2), and the controller reacts to the exact marked fraction.
+    /// There is **no** SYN ECN negotiation (RFC 3168 §6.1.1 / RFC 9768 §3.1) — both ends are configured
+    /// the same, a deliberate simplification that keeps the handshake untouched while still exercising
+    /// the full mark/feedback/response loop. For every other controller this is false, so no ECT is
+    /// ever set, no ACE bits are ever encoded, and the wire stays byte-identical.
     #[inline]
     fn ecn_enabled(&self) -> bool {
         matches!(self.cc_kind, CcKind::Dctcp | CcKind::Learned)
@@ -546,7 +557,10 @@ impl Tcb {
                 && !flags.syn()
                 && seg_ack == self.snd_una
                 && self.snd_una != self.snd_nxt;
-            if !self.process_ack(seg_seq, seg_ack, tcp.window(), seg_ts.map(|(_, e)| e), flags.ece(), now) {
+            // Decode the peer's 3-bit AccECN ACE counter (RFC 9768 §3.2.2): AE·CWR·ECE. On a non-ECN
+            // connection the peer never sets these, so this is 0 and `process_ack` ignores it.
+            let ace = (u8::from(tcp.ae()) << 2) | (u8::from(flags.cwr()) << 1) | u8::from(flags.ece());
+            if !self.process_ack(seg_seq, seg_ack, tcp.window(), seg_ts.map(|(_, e)| e), ace, now) {
                 return; // SEG.ACK > SND.NXT: ACK already owed, drop the segment
             }
             if self.sack_enabled {
@@ -602,12 +616,13 @@ impl Tcb {
         // out-of-order runs contiguous, which are then drained in). Out-of-order data — a gap
         // below it — is buffered for reassembly when SACK is enabled, instead of being dropped.
         if !payload.is_empty() {
-            // DCTCP/L4S receiver: OR this accepted segment's CE mark into the echo, to reflect on our
-            // next ACK (see `build`). ORing (not overwriting) keeps a mark on a segment that is then
-            // coalesced under a delayed ACK from being lost when the segment that triggers the
-            // combined ACK is itself un-marked. Inert unless this is a DCTCP connection.
-            if self.ecn_enabled() {
-                self.ece_echo |= ce;
+            // AccECN receiver (RFC 9768 §3.2.2): count this accepted data segment's CE mark into the
+            // CE-packet counter, which our next ACK reflects in the ACE field (see `build`). A running
+            // counter — not a one-bit latch — so a mark on a segment later coalesced under a delayed
+            // ACK is conveyed exactly once, never lost and never inflated to the whole coalesced span.
+            // Inert unless this is an AccECN connection.
+            if self.ecn_enabled() && ce {
+                self.accecn_cep = self.accecn_cep.wrapping_add(1);
             }
             // Left-trim a segment overlapping the left window edge (seg_seq < RCV.NXT) so its
             // fresh in-order tail is delivered rather than dropped; an already-delivered prefix
@@ -804,7 +819,7 @@ impl Tcb {
     /// Advance over acked data/FIN, sample RTT, manage the rtx timer and send window. `seg_tsecr`
     /// is the ACK's echoed timestamp (RFC 7323), used for RTT when timestamps are negotiated.
     /// Returns `false` if the ACK is for unsent data (caller drops the segment).
-    fn process_ack(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16, seg_tsecr: Option<u32>, ece: bool, now: Instant) -> bool {
+    fn process_ack(&mut self, seg_seq: SeqNumber, seg_ack: SeqNumber, seg_wnd: u16, seg_tsecr: Option<u32>, ace: u8, now: Instant) -> bool {
         if seg_ack.gt(self.snd_nxt) {
             self.needs_ack = true; // acks data we never sent: ACK and drop (RFC 793)
             return false;
@@ -836,21 +851,29 @@ impl Tcb {
                 cc_inflight
             };
             self.cc.on_ack_sample(now, self.snd_una, cc_inflight, data_acked as u32, cc_pipe, in_recovery);
-            // DCTCP/L4S: feed the ECN signal. The receiver echoes ECE on an ACK whose data was
-            // CE-marked, so `marked` is the acked data bytes the peer flagged congested (all-or-
-            // nothing per ACK at this granularity). The DCTCP controller turns the marked *fraction*
-            // over a window into a proportional `cwnd ×= 1 − α/2` cut; every other controller's
-            // `on_ecn` is the no-op trait default, so this is byte-identical for Reno/CUBIC/BBR.
+            // AccECN (RFC 9768 §3.2.2): the peer reflects its CE-marked-packet counter in the 3-bit
+            // ACE field of every ACK. The wrapping delta since we last read it is the *exact* number of
+            // our data packets it newly saw CE-marked, so `marked ≈ delta · SMSS` (clamped to the bytes
+            // this ACK delivered) — a per-packet count, not the all-or-nothing-per-ACK estimate the old
+            // one-bit ECE echo gave. The DCTCP/Learned controller turns the marked *fraction* over a
+            // window into a proportional `cwnd ×= 1 − α/2` cut; every other controller's `on_ecn` is the
+            // no-op trait default and `ecn_enabled()` is false, so this is byte-identical for them.
             //
-            // Gated out of SACK recovery, exactly like `on_ack` above: there the window is managed by
-            // the loss-recovery algorithm, which (RFC 6675) requires `cwnd > pipe` to keep the
-            // selective retransmit flowing — an ECN cut mid-recovery could drop `cwnd` below `pipe`
-            // and stall repair. The loss response already cut the window; DCTCP resumes ECN accounting
-            // once recovery exits. (A path that both drops *and* CE-marks is the only case this gate
-            // affects; with the shallow queue DCTCP holds, the buffer never fills, so it cannot drop.)
-            if !in_recovery {
-                let marked = if ece && self.ecn_enabled() { data_acked as u32 } else { 0 };
-                self.cc.on_ecn(now, data_acked as u32, marked);
+            // The reference advances on *every* advancing ACK, even inside SACK recovery, so the delta
+            // never re-counts a mark and a post-recovery ACK cannot deliver a spurious spike. The cut
+            // itself is gated out of recovery, exactly like `on_ack` above: there the window is managed
+            // by the loss-recovery algorithm, which (RFC 6675) requires `cwnd > pipe` to keep the
+            // selective retransmit flowing — an ECN cut mid-recovery could drop `cwnd` below `pipe` and
+            // stall repair. The loss response already cut the window; ECN accounting resumes on exit.
+            // (A path that both drops *and* CE-marks is the only case this gate affects; with the shallow
+            // queue DCTCP holds the buffer never fills, so it cannot drop.)
+            if self.ecn_enabled() {
+                let delta = (ace.wrapping_sub(self.accecn_ace_seen) & 0x07) as u32;
+                self.accecn_ace_seen = ace & 0x07;
+                if !in_recovery {
+                    let marked = delta.saturating_mul(self.snd_mss as u32).min(data_acked as u32);
+                    self.cc.on_ecn(now, data_acked as u32, marked);
+                }
             }
             if self.sack_enabled {
                 self.scoreboard.trim(self.snd_una);
@@ -1379,14 +1402,23 @@ impl Tcb {
         // delayed ACK — clear it so the delayed-ACK timer does not later fire a redundant one.
         self.delayed_ack_deadline = None;
         self.unacked_segs = 0;
-        // DCTCP/L4S: a receiver echoes congestion by setting ECE on an ACK whenever any data it
-        // accepted since its last ACK was CE-marked (RFC 3168 §6.1.2 / RFC 8257), then clears the
-        // accumulator so the next ACK starts fresh. `ece_echo` is only ever set on a DCTCP
-        // connection, so this is inert (no ECE, no clear) for every other controller.
+        // AccECN (RFC 9768 §3.2.2): an ECN-enabled receiver reflects its CE-marked-packet counter
+        // `accecn_cep mod 8` in the 3-bit ACE field — AE (byte-12 bit 0) · CWR · ECE — on every
+        // post-handshake ACK, so the sender recovers the exact mark count from the wrapping delta. The
+        // counter is *not* cleared here (unlike the old one-bit echo): it is a running value the sender
+        // differences. Never on a SYN/SYN-ACK — ECN is not negotiated on the handshake, so it stays
+        // byte-identical — and entirely inert (no AE/CWR/ECE) for a non-ECN controller.
         let mut flag_bits = extra_flags | TcpFlags::ACK;
-        if self.ecn_enabled() && self.ece_echo {
-            flag_bits |= TcpFlags::ECE;
-            self.ece_echo = false; // echoed: begin a fresh "CE since last ACK" accumulation
+        let mut ae = false;
+        if self.ecn_enabled() && (flag_bits & TcpFlags::SYN) == 0 {
+            let ace = self.accecn_cep & 0x07;
+            if ace & 0x01 != 0 {
+                flag_bits |= TcpFlags::ECE;
+            }
+            if ace & 0x02 != 0 {
+                flag_bits |= TcpFlags::CWR;
+            }
+            ae = ace & 0x04 != 0;
         }
         let flags = TcpFlags(flag_bits);
         // Encode the advertised window into the 16-bit field. The SYN-ACK's window is never
@@ -1434,6 +1466,7 @@ impl Tcb {
             window_scale,
             sack,
             timestamps,
+            ae,
         };
         let mut frame = build_segment(self.local, self.remote, &repr, payload);
         // DCTCP/L4S: mark our own ECN-capable *data* ECT(1) so a bottleneck can signal congestion by
@@ -1530,6 +1563,7 @@ impl Tcb {
             window_scale: Some(RCV_WSCALE),
             sack: SackBlocks::default(),
             timestamps: Some((self.cur_tsval, 0)),
+            ae: false, // a SYN carries no ACE field — ECN is not negotiated on the handshake
         };
         build_segment(self.local, self.remote, &repr, b"")
     }
@@ -1548,6 +1582,7 @@ impl Tcb {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(self.local, self.remote, &repr, b"")
     }
@@ -1636,6 +1671,8 @@ mod tests {
         seq: SeqNumber,
         ack: SeqNumber,
         payload: Vec<u8>,
+        /// The decoded 3-bit AccECN ACE counter on this emitted segment (AE·CWR·ECE), 0..=7.
+        ace: u8,
     }
 
     fn parse(frame: &[u8]) -> Out {
@@ -1651,6 +1688,7 @@ mod tests {
             seq: tcp.seq(),
             ack: tcp.ack(),
             payload: tcp.payload().to_vec(),
+            ace: (u8::from(tcp.ae()) << 2) | (u8::from(tcp.flags().cwr()) << 1) | u8::from(tcp.flags().ece()),
         }
     }
 
@@ -1667,6 +1705,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(ep_host(), ep_us(), &repr, payload)
     }
@@ -1685,6 +1724,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
     }
@@ -1707,6 +1747,7 @@ mod tests {
             window_scale: None,
             sack,
             timestamps: None,
+            ae: false,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
     }
@@ -2375,6 +2416,7 @@ mod tests {
             window_scale: Some(wscale),
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
     }
@@ -2503,6 +2545,7 @@ mod tests {
             window_scale: wscale,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         build_segment(server_remote(), client_local(), &repr, payload)
     }
@@ -2741,6 +2784,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: Some((tsval, 0)),
+            ae: false,
         };
         build_segment(ep_host(), ep_us(), &repr, b"")
     }
@@ -2760,6 +2804,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: Some((tsval, tsecr)),
+            ae: false,
         };
         build_segment(ep_host(), ep_us(), &repr, payload)
     }
@@ -3052,20 +3097,48 @@ mod tests {
         assert_eq!(tcb.tx_free(), full, "pacing delivered the whole buffer without wedging");
     }
 
-    /// DCTCP receiver echo (RFC 8257): a CE mark on a segment that is then coalesced under a delayed
-    /// ACK must NOT be lost. The receiver ORs marks since its last ACK, so even when an un-marked
-    /// segment triggers the combined ACK, the deferred segment's CE is still echoed as ECE — and the
-    /// echo is cleared once sent, so a later un-marked pair does not re-echo it. (Regression for the
-    /// overwrite bug the adversarial review caught: `ece_echo = ce` dropped ~half the marks under
-    /// coalescing, under-counting DCTCP's alpha and letting the queue bloat.)
+    /// An inbound pure ACK carrying a given 3-bit AccECN ACE counter (AE·CWR·ECE), to drive the
+    /// sender-side delta decode. `seq` is the peer's (client's) sequence; `ack` is what it
+    /// cumulatively acknowledges of our data.
+    fn inbound_ace(seq: SeqNumber, ack: SeqNumber, window: u16, ace: u8) -> Vec<u8> {
+        let mut flag_bits = TcpFlags::ACK;
+        if ace & 0x02 != 0 {
+            flag_bits |= TcpFlags::CWR;
+        }
+        if ace & 0x01 != 0 {
+            flag_bits |= TcpFlags::ECE;
+        }
+        let repr = TcpRepr {
+            src_port: CPORT,
+            dst_port: 8080,
+            seq,
+            ack,
+            flags: TcpFlags(flag_bits),
+            window,
+            mss: None,
+            sack_permitted: false,
+            window_scale: None,
+            sack: SackBlocks::default(),
+            timestamps: None,
+            ae: ace & 0x04 != 0,
+        };
+        build_segment(ep_host(), ep_us(), &repr, b"")
+    }
+
+    /// AccECN receiver (RFC 9768 §3.2.2): the CE-marked-packet counter is reflected *exactly* in the
+    /// 3-bit ACE field, no matter how delayed ACKs coalesce segments. A CE mark on a segment later
+    /// coalesced under a delayed ACK bumps the counter by exactly one — the run-boundary imprecision
+    /// of the old one-bit ECE echo (which attributed the whole coalesced span as marked) is gone. This
+    /// is the exactness AccECN buys: the counter is monotonic and per-packet, never per-ACK.
     #[test]
-    fn dctcp_receiver_echoes_a_coalesced_ce_mark() {
+    fn accecn_receiver_reflects_the_exact_ce_count() {
         let now = Instant::from_millis(0);
         let (mut tcb, iss, cnxt) = established(now, 1000, 64000);
         tcb.set_congestion_control(CcKind::Dctcp);
 
-        // First clean in-order segment is CE-marked and deferred; the second is un-marked and
-        // triggers the combined ACK. The ACK must still echo ECE (the deferred mark is not lost).
+        // First in-order segment is CE-marked and deferred (a lone segment → delayed ACK); the second
+        // is un-marked and triggers the coalesced ACK. The ACK's ACE must be baseline + 1 — exactly
+        // one CE, not two: the un-marked partner in the coalesced pair is not counted.
         let mut s1 = inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"hello");
         crate::wire::set_ecn(&mut s1, crate::wire::ECN_CE);
         deliver(&mut tcb, now, &s1);
@@ -3076,22 +3149,78 @@ mod tests {
         let out = drain(&mut tcb, now);
         assert_eq!(out.len(), 1, "the second segment triggers the coalesced ACK");
         assert_eq!(out[0].ack, cnxt + 10);
-        assert!(out[0].flags.ece(), "the coalesced ACK must echo the CE mark from the deferred segment");
+        assert_eq!(out[0].ace, (ACE_INIT + 1) & 0x07, "exactly one CE counted across the coalesced pair");
 
-        // The echo is cleared once sent: a following un-marked pair must NOT re-echo ECE.
-        let s3 = inbound(cnxt + 10, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"12345");
+        // A second CE-marked segment, again coalesced, advances the counter by exactly one more — and
+        // the counter is *not* reset between ACKs (the sender differences it), so a following ACK with
+        // no new CE reflects the same value rather than dropping back to baseline.
+        let mut s3 = inbound(cnxt + 10, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"12345");
+        crate::wire::set_ecn(&mut s3, crate::wire::ECN_CE);
         deliver(&mut tcb, now, &s3);
         let s4 = inbound(cnxt + 15, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"67890");
         deliver(&mut tcb, now, &s4);
         let out = drain(&mut tcb, now);
         assert_eq!(out.len(), 1);
-        assert!(!out[0].flags.ece(), "ECE clears after it is echoed — no CE since the last ACK");
+        assert_eq!(out[0].ace, (ACE_INIT + 2) & 0x07, "the counter is monotonic — two CE marks total");
+
+        // No new CE: the counter holds, so the next ACK reflects the same value (delta 0 at the sender).
+        let s5 = inbound(cnxt + 20, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"abcde");
+        deliver(&mut tcb, now, &s5);
+        let s6 = inbound(cnxt + 25, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"fghij");
+        deliver(&mut tcb, now, &s6);
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ace, (ACE_INIT + 2) & 0x07, "no new CE → the counter is unchanged");
     }
 
-    /// The byte-identical guarantee at the wire level: a non-DCTCP (Reno) receiver never sets ECE,
-    /// even when the data it receives is CE-marked — ECN is entirely gated on the controller.
+    /// AccECN sender (RFC 9768 §3.2.2): the wrapping ACE delta the peer reports is decoded into an
+    /// exact marked-byte count and fed to the controller, so CE feedback actually cuts the window.
+    /// Driving an identical send/ACK schedule with vs. without per-segment CE marks, the marked run
+    /// ends with a strictly smaller congestion window — the sender reacted to the ACE counter.
     #[test]
-    fn non_dctcp_receiver_never_echoes_ece_even_for_ce_data() {
+    fn accecn_sender_reacts_to_the_exact_ace_delta() {
+        // One run of the sender: emit a congestion window of data in a single burst, then ACK each
+        // emitted segment in order. When `mark`, raise the ACE counter by one per segment (model every
+        // data packet as CE-marked); otherwise hold it at the baseline (no congestion). Returns the
+        // controller's window after the schedule.
+        fn drive(mark: bool) -> u32 {
+            let now = Instant::from_millis(0);
+            let (mut tcb, _iss, cnxt) = established(now, 7000, 64000);
+            tcb.set_congestion_control(CcKind::Dctcp);
+            tcb.send(&vec![0x5a; 64 * 1024]);
+            let segs: Vec<(SeqNumber, u32)> = drain(&mut tcb, now)
+                .iter()
+                .filter(|o| !o.payload.is_empty())
+                .map(|o| (o.seq, o.payload.len() as u32))
+                .collect();
+            assert!(segs.len() >= 8, "the initial window should span several segments: {}", segs.len());
+            let mut ace = ACE_INIT;
+            for (seq, len) in segs {
+                if mark {
+                    ace = ace.wrapping_add(1); // this data packet was CE-marked
+                }
+                // Cumulative ACK covering this segment, carrying the receiver's current ACE counter.
+                deliver(&mut tcb, now, &inbound_ace(cnxt, seq + len, 64000, ace & 0x07));
+            }
+            tcb.cwnd_dbg()
+        }
+
+        let marked = drive(true);
+        let clean = drive(false);
+        // The clean run only ever grows (slow start, no cut); the marked run takes a proportional
+        // DCTCP cut once its window of marks is fully acknowledged.
+        assert!(clean > crate::congestion::initial_window(1460), "the un-marked control grows its window: {clean}");
+        assert!(
+            marked < clean,
+            "exact AccECN marks must cut the sender's window below the un-marked control: marked {marked} vs clean {clean}"
+        );
+    }
+
+    /// The byte-identical guarantee at the wire level: a non-ECN (Reno) receiver never sets *any* ACE
+    /// bit (AE / CWR / ECE), even when the data it receives is CE-marked — AccECN is entirely gated on
+    /// the controller, so Reno/CUBIC/BBR emit a zero ACE field exactly as before.
+    #[test]
+    fn non_ecn_receiver_never_sets_ace_bits_even_for_ce_data() {
         let now = Instant::from_millis(0);
         let (mut tcb, iss, cnxt) = established(now, 1000, 64000); // default Reno
         let mut s1 = inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"hello");
@@ -3101,6 +3230,7 @@ mod tests {
         deliver(&mut tcb, now, &s2);
         let out = drain(&mut tcb, now);
         assert_eq!(out.len(), 1);
-        assert!(!out[0].flags.ece(), "a non-DCTCP receiver must never echo ECE (byte-identical wire)");
+        assert_eq!(out[0].ace, 0, "a non-ECN receiver emits a zero ACE field (byte-identical wire)");
+        assert!(!out[0].flags.ece() && !out[0].flags.cwr(), "neither ECE nor CWR is ever set for Reno");
     }
 }

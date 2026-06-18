@@ -277,28 +277,44 @@ Reno/CUBIC at the same goodput, a ~3.5× latency win.
 **DCTCP (RFC 8257) — the L4S controller, the next rung past BBR's bottleneck queue.** Where Reno/CUBIC
 react to *loss* and BBR *paces* to a rate, DCTCP reacts to **explicit congestion marks**, so it holds a
 far shallower standing queue. The whole ECN loop is hand-built across the wire and the TCB —
-`ecn_enabled()` gates all of it on `cc_kind == Dctcp`, so Reno/CUBIC/BBR stay byte-identical: the sender
-marks its data **ECT(1)** in the IPv4 header (`wire::set_ecn`, after `build`, fixing only the IP
-checksum — the TCP pseudo-header excludes the ECN byte, so the segment stays valid); a CE-marking AQM
-flips ECT→**CE** once the queue is deep enough; the receiver detects CE on ingress and echoes it as the
-TCP **ECE** flag on its ACKs; the sender turns the per-ACK ECE into a marked-byte count. The controller
-(`congestion::Dctcp`) keeps Reno's additive increase and Reno's loss response, and *adds* the DCTCP
-reaction: an EWMA `α` of the marked fraction over a window (`α ← (1−g)·α + g·fraction`, `g = 1/16`) and,
-once per marked round, a proportional cut `cwnd ×= 1 − α/2`. Light marking → tiny `α` → a gentle trim
-that parks the window just above the BDP (a sub-millisecond queue); heavy marking → `α → 1` → a
-Reno-style halving. `on_ecn` is a no-op trait default for the other three, and the ECN reaction is gated
-out of SACK recovery so it can never drop `cwnd` below `pipe` (the invariant the BBR work established).
+`ecn_enabled()` gates all of it on the controller (DCTCP or `Learned`), so Reno/CUBIC/BBR stay
+byte-identical: the sender marks its data **ECT(1)** in the IPv4 header (`wire::set_ecn`, after `build`,
+fixing only the IP checksum — the TCP pseudo-header excludes the ECN byte, so the segment stays valid); a
+CE-marking AQM flips ECT→**CE** once the queue is deep enough; the receiver detects CE on ingress and
+feeds it back through the **AccECN** counter (below); the sender turns the feedback into a marked-byte
+count. The controller (`congestion::Dctcp`) keeps Reno's additive increase and Reno's loss response, and
+*adds* the DCTCP reaction: an EWMA `α` of the marked fraction over a window (`α ← (1−g)·α + g·fraction`,
+`g = 1/16`) and, once per marked round, a proportional cut `cwnd ×= 1 − α/2`. Light marking → tiny `α` →
+a gentle trim that parks the window just above the BDP (a sub-millisecond queue); heavy marking → `α → 1`
+→ a Reno-style halving. `on_ecn` is a no-op trait default for the other three, and the ECN reaction is
+gated out of SACK recovery so it can never drop `cwnd` below `pipe` (the invariant the BBR work
+established).
 
-*Two deliberate simplifications, both documented.* There is **no SYN ECN negotiation** (RFC 3168
-§6.1.1) — both ends are configured DCTCP together. And the receiver echo is the simplified "OR the marks
-since the last ACK" rule, not the full RFC 8257 §3.2 receiver state machine: it **ORs** each segment's
-CE into `ece_echo` and clears it when echoed, so a mark on a segment coalesced under a delayed ACK is
-never lost — the adversarial review caught the original *overwrite* dropping ~half the marks (measured
-~46% of the CE signal lost on the demo path), which under-counted `α` and let the queue bloat. The
-residual imprecision — one ACK spanning a marked/un-marked run boundary attributes its whole span as
-marked — is the limit of one-bit ECN feedback and biases the queue *lower*, never dropping a signal;
-**AccECN** (RFC 9768) is what would carry the exact per-byte count. The measured latency ladder (sim and
-hardware) is in §5.10.
+**AccECN feedback (RFC 9768 §3.2.2) — exact CE counts, the M16 upgrade.** The feedback channel is the
+standard **ACE 3-bit counter**, not a one-bit echo. The receiver keeps a running count `r.cep` of the
+CE-marked data packets it has accepted (`Tcb::accecn_cep`, incremented in `on_segment`) and reflects
+`r.cep mod 8` in the three-bit ACE field — **AE · CWR · ECE** — on every post-handshake ACK (`Tcb::build`).
+AE is byte 12 bit 0 (the position RFC 3168 called NS), which the wire now emits and parses
+(`TcpRepr.ae` / `TcpPacket::ae`, folded into the TCP checksum like any header bit, unlike the IP ECN
+byte); CWR and ECE are the existing flag bits. The sender differences the field across ACKs — `delta =
+(ace − s.last) mod 8` (`Tcb::process_ack`, reference `accecn_ace_seen`) — which is the **exact number of
+its data packets the receiver newly saw CE-marked**, and converts it to `marked ≈ delta · SMSS` (clamped
+to the bytes that ACK delivered) for `on_ecn`. Because the counter is *per-packet*, a delayed ACK that
+coalesces a CE and a non-CE segment conveys exactly one mark — the run-boundary imprecision of the old
+single-bit ECE echo (a whole coalesced span counted as marked) is **gone**, and marks are never double-
+or under-counted regardless of ACK timing. On the sub-ms demo this sharpens the feedback: DCTCP's α now
+tracks the *true* marking level instead of the echo's queue-lowering over-attribution, holding a **642 µs**
+queue at comparable goodput (the old echo's 525 µs was an artefact of over-counting, not a better
+operating point). Both counters seed to **5** (RFC 9768 §3.2.2.2) so the first wrapping delta is zero.
+
+*Three deliberate simplifications, all documented.* (1) **No SYN ECN negotiation** (RFC 3168 §6.1.1 / RFC
+9768 §3.1) — both ends are configured the same, so the handshake stays byte-identical and never carries
+ACE. (2) **No change-triggered immediate ACKs** (RFC 9768 §3.2.2.3): the receiver keeps the ordinary
+delayed-ACK schedule. The counter is exact regardless of ACK timing, so this is purely a latency
+refinement, not a correctness one — and the every-other-segment rule caps marks-between-ACKs far below 8,
+so the 3-bit field never wraps ambiguously. (3) **No AccECN Option** (the byte-accurate `EE0B`/`CEB`
+fields, RFC 9768 §3.2.3) — the packet-granular ACE counter is enough for the controllers here. The
+measured latency ladder (sim and hardware) is in §5.10.
 
 **Learned (the evolved controller, M15).** The five RFC controllers above are hand-tuned. `Learned`
 instead has its gains **trained**: it is the same AIMD skeleton — slow start, loss multiplicative
@@ -310,7 +326,7 @@ controller's defined range, so **every genome is a stable controller** — incre
 window never grows on loss, the cut is bounded. Only `+ − × ÷`/comparisons (no transcendental
 intrinsics), so it stays deterministic and Miri-clean. The genome is evolved by the CEM trainer in §5.10;
 the shipped `CcKind::Learned` bakes the winner as `LearnedParams::BAKED`. Because `Learned` reacts to
-ECN, `ecn_enabled()` includes it alongside DCTCP (so it marks ECT and echoes ECE); Reno/CUBIC/BBR stay
+ECN, `ecn_enabled()` includes it alongside DCTCP (so it marks ECT and runs the AccECN counter); Reno/CUBIC/BBR stay
 byte-identical. A training-time thread-local (`pub(crate)`) injects a candidate genome through the *same*
 `run_bottleneck` path the real stack uses; the shipped controller never touches it (it resolves to the
 baked constant), so it is a pure, deterministic controller in production.
@@ -504,11 +520,13 @@ fills the buffer; BBR paces and holds ~1 BDP). Adding **`Aqm::CeMark { threshold
 an ECT frame the moment its standing-queue delay crosses the threshold (the L4S marking behaviour, with
 tail-drop kept as the backstop) — makes it the DCTCP testbed (§5.5). On one 2.5 MB/s / 4 ms-RTT
 bottleneck with a 1 ms threshold, an 8 MiB transfer paints the full ladder at the same goodput: **Reno
-~102 ms, BBR ~6.7 ms, DCTCP ~0.5 ms** mean standing queue. The result carries to **real hardware** — the
-two-instance bench through a Linux `codel ce_threshold 1ms ecn` qdisc gives **Reno 42 ms, BBR 1.0 ms,
-DCTCP 0.95 ms** RTT-under-load at ~6 MB/s each (confirmed on the wire with `tcpdump`: the data leaves
-ECT(1), the qdisc rewrites it to CE, and the receiver echoes ECE). The deterministic sim and the real
-Linux forwarding path agree — sub-millisecond, below even BBR's paced queue, at line rate.
+~102 ms, BBR ~6.7 ms, DCTCP ~0.64 ms** mean standing queue (the DCTCP figure with exact AccECN feedback,
+M16; the earlier ~0.5 ms was the one-bit echo's mark over-attribution biasing the queue low). The result
+carries to **real hardware** — the two-instance bench through a Linux `codel ce_threshold 1ms ecn` qdisc
+gives **Reno 42 ms, BBR 1.0 ms, DCTCP 0.95 ms** RTT-under-load at ~6 MB/s each (confirmed on the wire with
+`tcpdump`: the data leaves ECT(1), the qdisc rewrites it to CE, and the receiver reflects it through the
+AccECN ACE counter). The deterministic sim and the real Linux forwarding path agree — sub-millisecond,
+below even BBR's paced queue, at line rate.
 
 **Coverage-guided greybox fuzzing (M15).** The DST suite above runs a *fixed* grid of seeds; the fuzzer
 adds feedback-driven search on top — keep the scenarios that exercise new behaviour, mutate them, reach
@@ -614,6 +632,7 @@ drives exactly the code paths the live stack runs.
 | M13 | CUBIC (RFC 8312) + BBR v1 (model-paced, BBRv2 `inflight_hi`/`inflight_lo` bounds) + an ack-clocked go-back-N drain that un-sticks the post-RTO wedge for all controllers | Reno↔CUBIC↔BBR head-to-head over the two-instance bench; BBR ~3.5× lower latency on a bottleneck queue at equal goodput |
 | M14 | deterministic simulation testing (`sim`); **L4S/DCTCP** — ECN ECT/CE/ECE wiring + the DCTCP controller (α-EWMA proportional cut) + a `CeMark` AQM | 1080 adversarial DST scenarios all deliver intact; DCTCP holds a **sub-millisecond** queue (sim *and* hardware) where Reno bloats to tens of ms |
 | M15 | a **coverage-guided greybox fuzzer** (off-the-wire coverage, no engine instrumentation); an **evolved** `Learned` controller trained by a from-scratch CEM (zero ML libs); a **bounded model checker** (exhaustive SACK / option proofs, no Kani) | fuzzer is a deterministic correctness oracle (zero findings); the evolved genome beats hand-tuned DCTCP on the held-out frontier; the BMC proves the scoreboard + option-walker invariants over ~400 K + ~1.7 M cases |
+| M16 | **AccECN (RFC 9768)** — exact CE feedback via the 3-bit **ACE counter** (AE·CWR·ECE = `r.cep mod 8`), replacing the one-bit ECE-echo run-boundary approximation; the wire now carries the **AE bit** (byte-12 bit-0, old NS) | the sender recovers the *exact* per-packet CE count from the wrapping ACE delta; a delayed ACK coalescing a CE + non-CE segment conveys exactly one mark (no run-boundary over-count); DCTCP/`Learned` get exact `marked`, holding a 642 µs queue at comparable goodput |
 
 ## 9. Environment
 

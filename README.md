@@ -176,19 +176,19 @@ bottleneck above is the next rung down, and **DCTCP** (RFC 8257, the L4S control
 reacts to *explicit congestion marks* instead of loss, so it parks a far shallower queue. The whole
 loop is hand-built — the sender marks its data **ECT(1)** (RFC 3168), a CE-marking AQM flips it to
 **CE** the moment the standing queue crosses a threshold (instead of waiting for the buffer to
-overflow), the receiver echoes the marks back as **ECE**, and DCTCP cuts its window in proportion to
-the *fraction* of marked bytes (`cwnd ×= 1 − α/2`, with α an EWMA of that fraction). That proportional
-response parks the queue near the threshold instead of sawtoothing through it. DCTCP is a 4th `Cc`
-variant behind the same trait; the ECN reaction is a no-op default for the others, so Reno/CUBIC/BBR
-stay byte-identical. In the deterministic `sim`, a finite-buffer bottleneck (2.5 MB/s, 4 ms RTT) gains
-a CE-marking AQM (`Aqm::CeMark`) at a 1 ms threshold — and an 8 MiB transfer paints the full ladder
-with **zero variance**:
+overflow), the receiver feeds the marks back through the **AccECN** counter (next paragraph), and DCTCP
+cuts its window in proportion to the *fraction* of marked bytes (`cwnd ×= 1 − α/2`, with α an EWMA of
+that fraction). That proportional response parks the queue near the threshold instead of sawtoothing
+through it. DCTCP is a 4th `Cc` variant behind the same trait; the ECN reaction is a no-op default for
+the others, so Reno/CUBIC/BBR stay byte-identical. In the deterministic `sim`, a finite-buffer
+bottleneck (2.5 MB/s, 4 ms RTT) gains a CE-marking AQM (`Aqm::CeMark`) at a 1 ms threshold — and an 8 MiB
+transfer paints the full ladder with **zero variance**:
 
 | same CE-marking bottleneck (sim) | goodput | mean standing queue |
 |---|---|---|
 | Reno  | ~2.4 MB/s | ~102 ms |
 | BBR   | ~2.2 MB/s | ~6.7 ms |
-| **DCTCP** | ~2.2 MB/s | **~0.5 ms** |
+| **DCTCP** | ~2.3 MB/s | **~0.64 ms** |
 
 And it reproduces **on real hardware** — the two-instance bench through a `codel ce_threshold 1ms ecn`
 bottleneck at 50 mbit (so the Linux qdisc does the CE marking), latency measured as RTT-under-load via
@@ -202,9 +202,22 @@ bottleneck at 50 mbit (so the Linux qdisc does the CE marking), latency measured
 
 Same goodput across the board; DCTCP holds the lowest queue — **sub-millisecond**, below even BBR's
 paced queue — a **~44× latency reduction** over loss-based Reno at identical throughput. The
-deterministic sim result carries through the real Linux forwarding path and qdisc, CE marks and ECE
-echoes and all (verified on the wire with `tcpdump`). Both ends run DCTCP: there is no SYN ECN
+deterministic sim result carries through the real Linux forwarding path and qdisc, CE marks and AccECN
+feedback and all (verified on the wire with `tcpdump`). Both ends run DCTCP: there is no SYN ECN
 negotiation, a documented simplification since the two stacks are configured together.
+
+**Exact CE feedback — AccECN (RFC 9768).** The feedback channel is the standard **ACE 3-bit counter**,
+not a one-bit echo: the receiver counts the CE-marked data packets it accepts and reflects that count
+(`mod 8`) in the three header bits **AE · CWR · ECE** on every ACK — AE being byte-12 bit-0 (RFC 3168's
+old NS), which the wire now emits and parses, folded into the TCP checksum. The sender differences the
+field across ACKs, so the wrapping delta is the *exact* number of its packets the receiver newly saw
+marked. The win over the one-bit echo is exactness under coalescing: a delayed ACK spanning a CE and a
+non-CE segment now conveys **exactly one** mark instead of attributing the whole span as marked. That
+sharpens DCTCP's α to the true marking level — the demo queue settles at ~0.64 ms (the earlier ~0.5 ms
+was the echo's over-counting biasing it low), at comparable goodput. Three documented simplifications:
+no SYN ECN negotiation, no change-triggered immediate ACKs (the counter is exact regardless of ACK
+timing, and the every-other-segment rule keeps the 3-bit field from wrapping), and no byte-accurate
+AccECN Option — the packet-granular counter is enough for these controllers.
 
 **An evolved congestion controller — beats DCTCP on the frontier, with zero ML libraries.** Because the
 sim is a microsecond-fast, perfectly-reproducible environment, it doubles as a *training ground*. A
@@ -284,7 +297,7 @@ and wakes the async tasks.
 3. **Congestion control** — **five pluggable controllers** behind a `CongestionControl` trait +
    match-dispatched `Cc` enum (no `Box<dyn>`): **Reno** (RFC 5681 + 6928), **CUBIC** (RFC 8312),
    **BBR** (v1 model paced to the BDP, plus BBRv2 `inflight_hi`/`inflight_lo` bounds + ACK-aggregation
-   for under-loss throughput), **DCTCP** (RFC 8257, the L4S/ECN controller — ECT marking, CE→ECE echo,
+   for under-loss throughput), **DCTCP** (RFC 8257, the L4S/ECN controller — ECT marking, exact CE feedback via the AccECN ACE counter (RFC 9768),
    a proportional `cwnd ×= 1 − α/2` cut that holds a sub-millisecond queue), and an **evolved**
    controller whose gains were trained against the deterministic sim by a from-scratch cross-entropy
    method (zero ML libraries) and beat hand-tuned DCTCP on the held-out frontier. Selectable with
@@ -329,12 +342,12 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 201 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 203 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
-                            #            inflight bounds) + DCTCP/L4S (ECN echo, alpha, CeMark AQM,
-                            #            the sub-ms latency ladder) + an evolved controller (CEM
-                            #            trainer, held-out frontier) + the ack-clocked go-back-N drain
+                            #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
+                            #            alpha, CeMark AQM, the sub-ms latency ladder) + an evolved
+                            #            controller (CEM trainer, held-out frontier) + go-back-N drain
                             #            + deterministic simulation testing (1080 adversarial seeds)
                             #            + a coverage-guided greybox fuzzer (off-the-wire coverage)
                             #            + a bounded model checker (exhaustive SACK / option proofs)
@@ -381,13 +394,12 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   layout up to two words (~1.7 M), confirming the scoreboard's structural invariants, the RFC 6675
   `pipe ≤ inflight` bound, and the option walker's panic-freedom. So the stack is one you can *fuzz,
   train against, and prove*.
-- **L4S — the ECN half is done; the scalable-CC frontier is next.** **DCTCP** (RFC 8257) + ECN
-  marking/echo (RFC 3168) ship now, holding a sub-millisecond queue on a CE-marking bottleneck (sim
-  *and* hardware, table above). The bleeding edge from here is the rest of **L4S** (RFC 9330–9332):
-  **AccECN** (RFC 9768, multi-bit ECN feedback — what would convey the exact per-byte mark count the
-  one-bit ECE echo only approximates), a **TCP Prague**-style scalable + RTT-independent controller,
-  and a **dual-queue coupled AQM** (dualPI2) proving L4S flows coexist fairly with classic traffic.
-  All slot into the same `CongestionControl` trait.
+- **L4S — ECN + exact feedback are done; the scalable-CC frontier is next.** **DCTCP** (RFC 8257) + ECN
+  marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE counter for *exact* per-packet CE feedback)
+  ship now, holding a sub-millisecond queue on a CE-marking bottleneck (sim *and* hardware, table above).
+  The bleeding edge from here is the rest of **L4S** (RFC 9330–9332): a **TCP Prague**-style scalable +
+  RTT-independent controller, and a **dual-queue coupled AQM** (dualPI2) proving L4S flows coexist fairly
+  with classic traffic. Both slot into the same `CongestionControl` trait.
 - **IPv6** — a second wire format (parse/emit, the pseudo-header checksum); currently IPv4-only.
 - **RFC 1122/9293 robustness** — PMTUD (RFC 1191), silly-window avoidance, classic ECN negotiation
   (RFC 3168 — DCTCP here skips the SYN handshake), TCP Fast Open, keepalives, Nagle — the details

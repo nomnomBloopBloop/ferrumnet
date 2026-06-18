@@ -69,11 +69,19 @@ impl TcpFlags {
     pub fn psh(self) -> bool {
         self.has(Self::PSH)
     }
-    /// ECN-Echo (RFC 3168 §6.1.2): set by a receiver to tell the sender its data was CE-marked.
-    /// DCTCP (RFC 8257) reads it per-ACK to estimate the marked fraction.
+    /// ECN-Echo (RFC 3168 §6.1.2): in classic ECN a receiver sets it to tell the sender its data was
+    /// CE-marked. Under AccECN (RFC 9768 §3.2.2) it is the **least-significant bit of the 3-bit ACE
+    /// counter** (AE·CWR·ECE), not a standalone flag — the sender reads the whole field, not this bit.
     #[inline]
     pub fn ece(self) -> bool {
         self.has(Self::ECE)
+    }
+    /// Congestion Window Reduced (RFC 3168 §6.1.2). Under AccECN (RFC 9768 §3.2.2) it is the **middle
+    /// bit of the 3-bit ACE counter** (AE·CWR·ECE). This stack never uses it as a standalone RFC 3168
+    /// signal, so it is zero except as part of an AccECN connection's ACE field.
+    #[inline]
+    pub fn cwr(self) -> bool {
+        self.has(Self::CWR)
     }
 }
 
@@ -151,6 +159,14 @@ impl<'a> TcpPacket<'a> {
     #[inline]
     pub fn flags(&self) -> TcpFlags {
         TcpFlags(self.buf[13])
+    }
+    /// The AccECN **AE** bit (RFC 9768 §3.2.2): byte 12, bit 0 — the position RFC 3168 called NS.
+    /// Together with CWR and ECE it forms the 3-bit ACE counter `AE·CWR·ECE`. The high nibble of the
+    /// same byte is the data offset, so reading bit 0 here never disturbs [`Self::data_offset`].
+    /// Outside an AccECN connection this is a reserved bit and reads 0.
+    #[inline]
+    pub fn ae(&self) -> bool {
+        self.buf[12] & 0x01 != 0
     }
     #[inline]
     pub fn window(&self) -> u16 {
@@ -330,6 +346,11 @@ pub struct TcpRepr {
     /// is set alongside SACK blocks the option area would exceed 40 bytes, so the emitter caps the
     /// SACK blocks at 3 (12 bytes for timestamps + 4 + 8·3 = 40).
     pub timestamps: Option<(u32, u32)>,
+    /// The AccECN **AE** bit (RFC 9768 §3.2.2): byte 12, bit 0 (RFC 3168's old NS position) — the
+    /// most-significant bit of the 3-bit ACE counter, whose other two bits ride in `flags` (CWR·ECE).
+    /// Emitted *before* the checksum (byte 12 is inside the TCP header the checksum covers, unlike the
+    /// IP ECN byte), so it cannot be patched in after `emit`. `false` for every non-AccECN segment.
+    pub ae: bool,
 }
 
 impl TcpRepr {
@@ -385,7 +406,9 @@ impl TcpRepr {
         buf[2..4].copy_from_slice(&self.dst_port.to_be_bytes());
         buf[4..8].copy_from_slice(&self.seq.raw().to_be_bytes());
         buf[8..12].copy_from_slice(&self.ack.raw().to_be_bytes());
-        buf[12] = ((hlen / 4) as u8) << 4; // data offset in 32-bit words; reserved = 0
+        // High nibble = data offset in 32-bit words; bit 0 = the AccECN AE bit (RFC 9768 §3.2.2);
+        // the rest of the reserved field stays 0. Set before the checksum covers byte 12.
+        buf[12] = (((hlen / 4) as u8) << 4) | u8::from(self.ae);
         buf[13] = self.flags.0;
         buf[14..16].copy_from_slice(&self.window.to_be_bytes());
         buf[16..18].copy_from_slice(&[0, 0]); // checksum zeroed for computation
@@ -467,6 +490,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         let mut buf = [0u8; 40];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -500,6 +524,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         let payload = b"GET / HTTP/1.0\r\n\r\n";
         let mut buf = [0u8; 80];
@@ -538,6 +563,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         let mut buf = [0u8; 28];
         repr.emit(A, B, b"", &mut buf);
@@ -625,6 +651,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         let mut buf = [0u8; 60];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -655,6 +682,7 @@ mod tests {
             window_scale: None,
             sack,
             timestamps: None,
+            ae: false,
         };
         let mut buf = [0u8; 80];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -684,6 +712,7 @@ mod tests {
             window_scale: Some(7),
             sack: SackBlocks::default(),
             timestamps: None,
+            ae: false,
         };
         let mut buf = [0u8; 60];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -713,6 +742,7 @@ mod tests {
             window_scale: None,
             sack: SackBlocks::default(),
             timestamps: Some((0x1122_3344, 0x5566_7788)),
+            ae: false,
         };
         let mut buf = [0u8; 60];
         let n = repr.emit(B, A, b"", &mut buf);
@@ -747,6 +777,7 @@ mod tests {
             window_scale: None,
             sack,
             timestamps: Some((1, 2)),
+            ae: false,
         };
         assert_eq!(repr.header_len(), 20 + 12 + 4 + 8 * 3); // 60-byte header, exactly the max
         let mut buf = [0u8; 80];
@@ -757,5 +788,48 @@ mod tests {
         let mut blocks = [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS];
         assert_eq!(pkt.sack_blocks(&mut blocks), 3, "the 4th SACK block is dropped under timestamps");
         assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()));
+    }
+
+    #[test]
+    fn accecn_ace_field_round_trips_and_is_checksummed() {
+        // The 3-bit ACE counter (RFC 9768 §3.2.2) is AE·CWR·ECE. Emit every value 0..=7 by setting
+        // the AE bit (byte 12) and the CWR/ECE flag bits (byte 13), then confirm it parses back
+        // bit-for-bit *and* the TCP checksum still validates — AE lives inside the checksummed TCP
+        // header, so it must be laid down before `emit` folds the checksum (unlike the IP ECN byte).
+        for ace in 0u8..8 {
+            let ae = ace & 0x04 != 0;
+            let mut flag_bits = TcpFlags::ACK;
+            if ace & 0x02 != 0 {
+                flag_bits |= TcpFlags::CWR;
+            }
+            if ace & 0x01 != 0 {
+                flag_bits |= TcpFlags::ECE;
+            }
+            let repr = TcpRepr {
+                src_port: 8080,
+                dst_port: 40000,
+                seq: SeqNumber::new(100),
+                ack: SeqNumber::new(200),
+                flags: TcpFlags(flag_bits),
+                window: 1000,
+                mss: None,
+                sack_permitted: false,
+                window_scale: None,
+                sack: SackBlocks::default(),
+                timestamps: None,
+                ae,
+            };
+            let mut buf = [0u8; 40];
+            let n = repr.emit(B, A, b"", &mut buf);
+            assert_eq!(n, 20, "no options: a plain 20-byte header");
+            let pkt = TcpPacket::new_checked(&buf[..n]).unwrap();
+            assert_eq!(pkt.data_offset(), 20, "the AE bit must not disturb the data offset");
+            assert_eq!(pkt.ae(), ae);
+            assert_eq!(pkt.flags().cwr(), ace & 0x02 != 0);
+            assert_eq!(pkt.flags().ece(), ace & 0x01 != 0);
+            let decoded = (u8::from(pkt.ae()) << 2) | (u8::from(pkt.flags().cwr()) << 1) | u8::from(pkt.flags().ece());
+            assert_eq!(decoded, ace, "the ACE field round-trips");
+            assert!(checksum::tcp_checksum_valid(B, A, pkt.as_bytes()), "AE is inside the checksummed header");
+        }
     }
 }
