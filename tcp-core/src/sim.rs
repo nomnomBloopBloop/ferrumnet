@@ -37,7 +37,8 @@ use crate::congestion::CcKind;
 use crate::iface::Endpoint;
 use crate::runtime::{MockDevice, Runtime};
 use crate::time::Instant;
-use crate::wire::{set_ecn, ECN_CE, ECN_ECT0, ECN_ECT1};
+use crate::seq::SeqNumber;
+use crate::wire::{set_ecn, Ipv4Packet, TcpPacket, ECN_CE, ECN_ECT0, ECN_ECT1, MAX_SACK_BLOCKS};
 use std::net::Ipv4Addr;
 
 /// SplitMix64 — a tiny, fast, well-distributed deterministic PRNG (Vigna). Seeded once per scenario;
@@ -532,6 +533,23 @@ fn secret_from(seed: u64, salt: u64) -> [u8; 16] {
 /// Run one scenario to completion (or to a finding). **Deterministic**: the same [`Scenario`]
 /// always returns the same [`Outcome`], so a failing seed is a complete, replayable repro.
 pub fn run(scn: &Scenario) -> Outcome {
+    run_collecting(scn, None)
+}
+
+/// Run a scenario and also collect the [`Coverage`] it exercises — the observable-behaviour signal
+/// the coverage-guided fuzzer steers on. Identical execution to [`run`] (same loop, same outcome);
+/// the only difference is that each emitted frame is fed to the collector before it hits the wire.
+pub fn run_with_coverage(scn: &Scenario) -> (Outcome, Coverage) {
+    let mut collector = CovCollector::new();
+    let outcome = run_collecting(scn, Some(&mut collector));
+    let cov = collector.finish(&outcome);
+    (outcome, cov)
+}
+
+/// The shared driver behind [`run`] and [`run_with_coverage`]. When `cov` is `Some`, every emitted
+/// frame is observed for coverage *before* the link mangles it; when `None` the collection is fully
+/// elided, so [`run`] (and the 1080-scenario suite) pays nothing for the instrumentation.
+fn run_collecting(scn: &Scenario, mut cov: Option<&mut CovCollector>) -> Outcome {
     // Two stacks + the bulk-transfer workload (server drains into `received`; client dials, sets
     // `connected`, streams the payload). `connected` gates completion so an empty (`bytes == 0`)
     // transfer is only reported `Completed` after a real handshake, never vacuously at step 0; a
@@ -549,11 +567,17 @@ pub fn run(scn: &Scenario) -> Outcome {
         client.turn(now).expect("mock device never errors");
         server.turn(now).expect("mock device never errors");
 
-        // 2. Put the egress on the wire, subject to the fault model.
+        // 2. Put the egress on the wire, subject to the fault model (observing it for coverage first).
         for f in client.device_mut().take_outbound() {
+            if let Some(c) = cov.as_deref_mut() {
+                c.observe(Side::ToServer, &f);
+            }
             link.enqueue(now, Side::ToServer, f);
         }
         for f in server.device_mut().take_outbound() {
+            if let Some(c) = cov.as_deref_mut() {
+                c.observe(Side::ToClient, &f);
+            }
             link.enqueue(now, Side::ToClient, f);
         }
 
@@ -597,9 +621,405 @@ pub fn run(scn: &Scenario) -> Outcome {
     }
 }
 
+// ── coverage-guided greybox fuzzing ──────────────────────────────────────────────────────────────
+//
+// The DST suite above runs a *fixed* grid of seeds. A greybox fuzzer instead steers the search with
+// feedback: it keeps the scenarios that exercise **new behaviour** and mutates them, so it spends its
+// budget reaching states a fixed grid would never stumble into (the AFL/libFuzzer discipline). Here
+// the feedback is read entirely **off the wire** — the sequence of segment-event classes the two
+// stacks emit (SYN, SYN-ACK, fresh data, retransmit, pure/duplicate/SACK ACK, FIN, RST, zero-window,
+// …), hashed pairwise the way AFL hashes basic-block transitions, plus a few run-outcome features.
+// So the coverage signal needs **no engine instrumentation**: the sans-IO core stays untouched and
+// `#![deny(unsafe_code)]`/zero-dep, and the whole fuzzer is a pure, deterministic function of its
+// seed — a discovered scenario is itself a replayable repro, exactly like the rest of the DST harness.
+
+const COV_BITS: usize = 2048;
+const COV_WORDS: usize = COV_BITS / 64;
+
+const CC_ALL: [CcKind; 4] = [CcKind::Reno, CcKind::Cubic, CcKind::Bbr, CcKind::Dctcp];
+
+/// A fixed-size behavioural-coverage bitmap (AFL-style edge coverage). Each set bit is one
+/// `(previous-event → this-event)` transition the run exercised, or one outcome feature — read off
+/// the emitted frames and the [`Outcome`], never from engine instrumentation. 2048 buckets hold a
+/// single connection's behaviour with collisions rare.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Coverage {
+    bits: [u64; COV_WORDS],
+}
+
+impl Coverage {
+    fn new() -> Self {
+        Coverage { bits: [0; COV_WORDS] }
+    }
+
+    #[inline]
+    fn set(&mut self, bucket: usize) {
+        let b = bucket & (COV_BITS - 1);
+        self.bits[b >> 6] |= 1u64 << (b & 63);
+    }
+
+    /// The number of distinct edges/features covered.
+    pub fn count(&self) -> u32 {
+        self.bits.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// Fold `other` into `self`; return how many buckets became newly set — `other`'s novelty.
+    fn merge(&mut self, other: &Coverage) -> u32 {
+        let mut new = 0;
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            new += (*b & !*a).count_ones();
+            *a |= *b;
+        }
+        new
+    }
+
+    /// Buckets set in `self` but not in `other` — coverage `self` reached that `other` missed.
+    pub fn extra_over(&self, other: &Coverage) -> u32 {
+        self.bits.iter().zip(other.bits.iter()).map(|(a, b)| (*a & !*b).count_ones()).sum()
+    }
+}
+
+impl core::fmt::Debug for Coverage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Coverage({} edges)", self.count())
+    }
+}
+
+/// Spreads a composite block id (event class + recovery depth + direction) across the coverage map
+/// (the AFL per-block hash).
+#[inline]
+fn cov_loc(id: usize) -> usize {
+    id.wrapping_mul(2_654_435_761) & (COV_BITS - 1)
+}
+
+/// `n`'s bit-length, capped — a coarse logarithmic bucket for magnitude features (fault counts,
+/// step/time totals) so "a few" and "many" land in different buckets without one bucket per value.
+#[inline]
+fn log_bucket(n: u64) -> usize {
+    (64 - n.leading_zeros()) as usize
+}
+
+/// Walks one run's emitted-frame stream and accumulates [`Coverage`]. Per-direction state lets it
+/// tell a retransmit from fresh data and a duplicate ACK from a fresh one — the events that actually
+/// separate the recovery paths — without reaching into the engine.
+struct CovCollector {
+    cov: Coverage,
+    prev: [usize; 2],          // AFL prev_loc, per side (the last edge endpoint)
+    prev2: [usize; 2],         // one more back, so the edge is a 3-event n-gram (richer than pairs)
+    last_ack: [Option<SeqNumber>; 2],
+    dup_run: [u32; 2],         // consecutive duplicate ACKs (fast-retransmit pressure), per side
+    hi_seq_end: [Option<SeqNumber>; 2], // highest seq+len emitted, per side (retransmit detection)
+    rtx_streak: [u32; 2],      // consecutive retransmits — *recovery depth*, per side
+}
+
+impl CovCollector {
+    fn new() -> Self {
+        CovCollector {
+            cov: Coverage::new(),
+            prev: [0; 2],
+            prev2: [0; 2],
+            last_ack: [None; 2],
+            dup_run: [0; 2],
+            hi_seq_end: [None; 2],
+            rtx_streak: [0; 2],
+        }
+    }
+
+    /// Classify a frame, record its edge from the previous frame on the same side, and set any
+    /// standalone feature buckets it triggers.
+    fn observe(&mut self, side: Side, frame: &[u8]) {
+        let i = side as usize;
+        let ip = match Ipv4Packet::new_checked(frame) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let tcp = match TcpPacket::new_checked(ip.payload()) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let flags = tcp.flags();
+        let payload_len = tcp.payload().len();
+        let seq = tcp.seq();
+        let ack = tcp.ack();
+        let window = tcp.window();
+        let mut blocks = [(SeqNumber::new(0), SeqNumber::new(0)); MAX_SACK_BLOCKS];
+        let sack_n = tcp.sack_blocks(&mut blocks);
+
+        // Retransmit: a data segment whose start lies below the high-water of what we have sent.
+        let is_rtx = payload_len > 0 && self.hi_seq_end[i].is_some_and(|hi| seq.lt(hi));
+        // Duplicate ACK: a pure ACK repeating the previous cumulative ack on this side.
+        let is_dup_ack = payload_len == 0
+            && !flags.syn()
+            && !flags.fin()
+            && self.last_ack[i] == Some(ack);
+
+        let ev: u8 = if flags.rst() {
+            0
+        } else if flags.syn() && flags.ack() {
+            1
+        } else if flags.syn() {
+            2
+        } else if flags.fin() {
+            3
+        } else if payload_len > 0 {
+            if is_rtx {
+                4
+            } else if flags.psh() {
+                5
+            } else {
+                6
+            }
+        } else if window == 0 {
+            7
+        } else if sack_n > 0 {
+            8
+        } else if is_dup_ack {
+            9
+        } else {
+            10
+        };
+        // Recovery depth: consecutive retransmits and consecutive duplicate ACKs on this side.
+        // Folding the depth into the location stratifies every event by *how deep into recovery* it
+        // happens — "a data segment at retransmit-streak 6" is a different bucket from "...at streak 1"
+        // — and those deep buckets need a specific high-loss input to reach, which is exactly what
+        // makes coverage feedback pay off over blind sampling.
+        if is_rtx {
+            self.rtx_streak[i] = self.rtx_streak[i].saturating_add(1);
+        } else if payload_len > 0 {
+            self.rtx_streak[i] = 0; // fresh data ends the retransmit run
+        }
+        if is_dup_ack {
+            self.dup_run[i] = self.dup_run[i].saturating_add(1);
+        } else if payload_len == 0 && !flags.syn() && !flags.fin() {
+            self.dup_run[i] = 0; // an advancing ACK ends the dup-ACK run
+        }
+        let depth = (log_bucket(self.rtx_streak[i] as u64) << 3) | log_bucket(self.dup_run[i] as u64);
+        let cur = cov_loc((ev as usize) | (depth << 5) | (i << 12));
+        // 3-event n-gram edge coverage: this location against the previous two on the same side.
+        self.cov.set(self.prev2[i].rotate_left(1) ^ self.prev[i] ^ cur);
+        self.prev2[i] = self.prev[i];
+        self.prev[i] = cur >> 1;
+
+        // Standalone feature buckets, so a rare option/flag/magnitude always registers regardless of
+        // its edge.
+        let feat = 1_600;
+        if sack_n > 0 {
+            self.cov.set(feat + sack_n); // 1..MAX_SACK_BLOCKS distinct
+        }
+        if window == 0 {
+            self.cov.set(feat + 8);
+        }
+        if flags.ece() {
+            self.cov.set(feat + 9 + i);
+        }
+        if tcp.timestamps().is_some() {
+            self.cov.set(feat + 12);
+        }
+        if tcp.window_scale().is_some() {
+            self.cov.set(feat + 13);
+        }
+        if matches!(ip.ecn(), ECN_ECT0 | ECN_ECT1) {
+            self.cov.set(feat + 14);
+        }
+        self.cov.set(feat + 16 + log_bucket(self.rtx_streak[i] as u64)); // recovery depth reached
+        self.cov.set(feat + 30 + log_bucket(self.dup_run[i] as u64));
+        if payload_len > 0 {
+            self.cov.set(feat + 44 + log_bucket(payload_len as u64)); // segment-size class
+        }
+
+        // Update per-side state.
+        if payload_len == 0 && !flags.syn() && !flags.fin() {
+            self.last_ack[i] = Some(ack);
+        }
+        if payload_len > 0 {
+            let end = seq + payload_len as u32;
+            // (`map_or(true, …)` not `is_none_or`: the latter is 1.82+, our MSRV is 1.75.)
+            if self.hi_seq_end[i].map_or(true, |hi| hi.lt(end)) {
+                self.hi_seq_end[i] = Some(end);
+            }
+        }
+    }
+
+    /// Fold the run outcome in as a final set of feature buckets and yield the coverage.
+    fn finish(mut self, outcome: &Outcome) -> Coverage {
+        let base = 1_700;
+        match outcome {
+            Outcome::Completed { steps, sim_time_us, dropped, duplicated, corrupted } => {
+                self.cov.set(base);
+                self.cov.set(base + 10 + log_bucket(*dropped));
+                self.cov.set(base + 30 + log_bucket(*duplicated));
+                self.cov.set(base + 50 + log_bucket(*corrupted));
+                self.cov.set(base + 70 + log_bucket(*steps));
+                self.cov.set(base + 90 + log_bucket(*sim_time_us / 1_000));
+            }
+            Outcome::IntegrityViolation { .. } => self.cov.set(base + 1),
+            Outcome::Stuck { .. } => self.cov.set(base + 2),
+            Outcome::Timeout { .. } => self.cov.set(base + 3),
+        }
+        self.cov
+    }
+}
+
+/// The result of a [`fuzz`] campaign: how many scenarios it ran, the corpus of distinct
+/// coverage-advancing scenarios it kept, the total behaviour covered, and any **findings** —
+/// scenarios that did not complete with integrity under a survivable link (each one a replayable bug,
+/// since the mutator never makes the link un-survivable, so a non-completion is always a real defect).
+#[derive(Clone, Debug)]
+pub struct FuzzReport {
+    pub iterations: u32,
+    pub corpus_size: usize,
+    pub edges: u32,
+    pub findings: Vec<Scenario>,
+    /// The union coverage the campaign reached (for comparison against a baseline).
+    pub coverage: Coverage,
+}
+
+/// Mutate a scenario by perturbing 1–3 of its dimensions, staying inside a **survivable** envelope
+/// (loss ≤ 12%, dup ≤ 8%, corrupt ≤ 2%, jitter ≤ 6 ms, ≤ 24 KB — all within the range the fixed DST
+/// suite already proves the stack survives), so any non-completion the fuzzer turns up is a genuine
+/// bug, never an un-survivably-hostile link.
+fn fuzz_mutate(rng: &mut Rng, s: &Scenario) -> Scenario {
+    let mut s = *s;
+    let n = 1 + rng.below(3);
+    for _ in 0..n {
+        match rng.below(6) {
+            0 => s.seed ^= 1u64 << rng.below(64),
+            1 => s.link.loss_ppm = rng.below(120_001) as u32,
+            2 => s.link.dup_ppm = rng.below(80_001) as u32,
+            3 => s.link.corrupt_ppm = rng.below(20_001) as u32,
+            4 => s.link.jitter_us = rng.below(6_001),
+            5 => s.cc = CC_ALL[rng.below(4) as usize],
+            _ => unreachable!(),
+        }
+    }
+    // bytes is perturbed on its own axis so the corpus spans short and long transfers.
+    if rng.below(2) == 0 {
+        s.bytes = 1_000 + rng.below(23_001) as usize;
+    }
+    s.link.min_delay_us = s.link.min_delay_us.max(1_000); // the link requires a ≥ 1 µs base delay
+    s
+}
+
+/// A fresh uniformly-random scenario in the same survivable envelope — the black-box baseline the
+/// coverage-guided search is measured against.
+fn fuzz_random_scenario(rng: &mut Rng) -> Scenario {
+    Scenario {
+        seed: rng.next_u64(),
+        link: LinkConfig {
+            loss_ppm: rng.below(120_001) as u32,
+            dup_ppm: rng.below(80_001) as u32,
+            corrupt_ppm: rng.below(20_001) as u32,
+            min_delay_us: 5_000,
+            jitter_us: rng.below(6_001),
+        },
+        bytes: 1_000 + rng.below(23_001) as usize,
+        cc: CC_ALL[rng.below(4) as usize],
+    }
+}
+
+/// The seed scenario every campaign starts from: a mild, definitely-survivable lossy link.
+fn fuzz_base() -> Scenario {
+    Scenario { seed: 1, link: LinkConfig::lossy(5), bytes: 8_000, cc: CcKind::Reno }
+}
+
+/// Run a **coverage-guided** fuzzing campaign of `iterations` scenarios, deterministically driven by
+/// `fuzz_seed`. It keeps every scenario that advances coverage and mutates the corpus, so it reaches
+/// behaviour a fixed grid never would — and it asserts nothing itself: the caller inspects the
+/// [`FuzzReport`] (its `findings` must be empty; its `coverage`/`edges` are the search's reach).
+pub fn fuzz(fuzz_seed: u64, iterations: u32) -> FuzzReport {
+    let mut rng = Rng::new(fuzz_seed ^ 0xF1F2_F3F4_F5F6_F7F8);
+    let mut global = Coverage::new();
+    let mut corpus: Vec<Scenario> = Vec::new();
+    let mut findings: Vec<Scenario> = Vec::new();
+
+    let base = fuzz_base();
+    let (o, c) = run_with_coverage(&base);
+    global.merge(&c);
+    corpus.push(base);
+    if !o.is_completed() {
+        findings.push(base);
+    }
+
+    for _ in 0..iterations {
+        let parent = corpus[rng.below(corpus.len() as u64) as usize];
+        let child = fuzz_mutate(&mut rng, &parent);
+        let (o, c) = run_with_coverage(&child);
+        if global.merge(&c) > 0 {
+            corpus.push(child); // it found new behaviour — keep it to mutate further
+        }
+        if !o.is_completed() {
+            findings.push(child);
+        }
+    }
+
+    FuzzReport { iterations, corpus_size: corpus.len(), edges: global.count(), findings, coverage: global }
+}
+
+/// The black-box baseline: `iterations` uniformly-random scenarios from the same envelope, with **no**
+/// coverage feedback (the corpus never grows). Used to show that the feedback in [`fuzz`] actually
+/// buys reach beyond blind sampling at an equal budget.
+pub fn fuzz_random_baseline(fuzz_seed: u64, iterations: u32) -> FuzzReport {
+    let mut rng = Rng::new(fuzz_seed ^ 0x0102_0304_0506_0708);
+    let mut global = Coverage::new();
+    let mut findings: Vec<Scenario> = Vec::new();
+    for _ in 0..iterations {
+        let scn = fuzz_random_scenario(&mut rng);
+        let (o, c) = run_with_coverage(&scn);
+        global.merge(&c);
+        if !o.is_completed() {
+            findings.push(scn);
+        }
+    }
+    FuzzReport { iterations, corpus_size: 0, edges: global.count(), findings, coverage: global }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Coverage-guided greybox fuzzing as a **correctness oracle**. Across a campaign of coverage-
+    /// steered mutations inside a survivable fault envelope, the stack must never violate an invariant
+    /// — every scenario the search turns up completes with full byte integrity (`findings` empty). And
+    /// the campaign is a pure function of its seed, so it replays bit-for-bit — a discovered scenario
+    /// is a complete repro. The coverage signal is read entirely off the wire (no engine
+    /// instrumentation), which is exactly what lets a sans-IO stack be fuzzed this way at all.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn coverage_guided_fuzzing_is_a_clean_deterministic_oracle() {
+        let a = fuzz(0xC0FFEE, 300);
+        assert!(
+            a.findings.is_empty(),
+            "fuzzing found a non-completing scenario under a survivable link — a real bug: {:?}",
+            a.findings
+        );
+        assert!(a.corpus_size > 50, "the campaign kept a substantial corpus: {}", a.corpus_size);
+        assert!(a.edges > 250, "and reached rich behavioural coverage: {} edges", a.edges);
+        // The whole campaign replays bit-for-bit from its seed.
+        let b = fuzz(0xC0FFEE, 300);
+        assert_eq!(a.edges, b.edges, "edge count must replay");
+        assert_eq!(a.corpus_size, b.corpus_size, "corpus must replay");
+        assert!(a.coverage == b.coverage, "coverage must replay bit-for-bit");
+    }
+
+    /// Coverage feedback earns its keep on **depth**, not breadth. Because every event is bucketed by
+    /// how deep into recovery it occurs (retransmit / dup-ACK streak length), the deep buckets need a
+    /// specific high-loss input to reach — so steering the budget toward the corpus members that
+    /// already reached recovery finds behaviour a uniform-random sampler at the same budget never does.
+    /// (Random samples configs more broadly, so neither strictly dominates *total* coverage; the point
+    /// is the guided-only behaviour — the deep tail the feedback buys.)
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn coverage_feedback_reaches_states_random_search_misses() {
+        let budget = 300;
+        let guided = fuzz(0x1234, budget);
+        let random = fuzz_random_baseline(0x1234, budget);
+        assert!(guided.findings.is_empty() && random.findings.is_empty(), "no findings either way");
+        let guided_only = guided.coverage.extra_over(&random.coverage);
+        assert!(
+            guided_only > 25,
+            "coverage feedback reaches behaviour random search misses at equal budget: {guided_only} guided-only edges"
+        );
+    }
 
     /// The headline DST property: across a wide spread of seeds and a hostile link (loss +
     /// duplication + reordering), the stack delivers **every byte intact and terminates, every
