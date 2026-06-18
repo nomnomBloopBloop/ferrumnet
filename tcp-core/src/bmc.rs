@@ -112,19 +112,48 @@ fn scoreboard_invariants(sb: &Scoreboard, una: SeqNumber, nxt: SeqNumber, smss: 
     Ok(())
 }
 
-/// Recursively enumerate every op sequence up to `depth` from the given state, checking the invariants
-/// after each op. The clone per branch is what turns this into a tree walk over all reachable states.
-fn explore(sb: &Scoreboard, una: SeqNumber, nxt: SeqNumber, alphabet: &[Op], depth: u32, smss: u32, report: &mut BmcReport) {
+/// A predicate the sweep evaluates after every op. The production checker passes [`scoreboard_invariants`];
+/// the negative-control test passes a deliberately-false one to prove the enumeration actually surfaces
+/// violations (so the proof can't silently degrade to checking nothing).
+type Invariant = fn(&Scoreboard, SeqNumber, SeqNumber, u32) -> Result<(), String>;
+
+/// The parameters fixed for one whole sweep — bundled so the recursive [`explore`] stays few-argument.
+struct Sweep<'a> {
+    alphabet: &'a [Op],
+    nxt: SeqNumber,
+    smss: u32,
+    inv: Invariant,
+}
+
+/// Recursively enumerate every op sequence up to `depth` from the given state, evaluating the sweep's
+/// invariant after each op. The clone per branch is what turns this into a tree walk over all reachable
+/// states.
+fn explore(ctx: &Sweep, sb: &Scoreboard, una: SeqNumber, depth: u32, report: &mut BmcReport) {
     if depth == 0 {
         return;
     }
-    for &op in alphabet {
+    for &op in ctx.alphabet {
         let mut next_sb = sb.clone();
         let mut next_una = una;
-        apply(&mut next_sb, op, &mut next_una, nxt);
-        report.check(scoreboard_invariants(&next_sb, next_una, nxt, smss));
-        explore(&next_sb, next_una, nxt, alphabet, depth - 1, smss, report);
+        apply(&mut next_sb, op, &mut next_una, ctx.nxt);
+        report.check((ctx.inv)(&next_sb, next_una, ctx.nxt, ctx.smss));
+        explore(ctx, &next_sb, next_una, depth - 1, report);
     }
+}
+
+/// Run the exhaustive scoreboard sweep evaluating `inv` after every op, at `base = 0` and at a base
+/// straddling the 2³² wrap. Factored out so the negative-control test can drive the *same* enumeration
+/// with a false invariant.
+fn run_scoreboard_sweep(n: u32, depth: u32, smss: u32, inv: Invariant) -> BmcReport {
+    let mut report = BmcReport::default();
+    for &base_raw in &[0u32, 0xFFFF_FFFFu32.wrapping_sub(n)] {
+        let base = SeqNumber::new(base_raw);
+        let nxt = base + n;
+        let alphabet = scoreboard_alphabet(base, n, nxt);
+        let ctx = Sweep { alphabet: &alphabet, nxt, smss, inv };
+        explore(&ctx, &Scoreboard::new(), base, depth, &mut report);
+    }
+    report
 }
 
 /// **Exhaustively** drive the SACK scoreboard through every operation sequence up to `depth` over a
@@ -132,15 +161,7 @@ fn explore(sb: &Scoreboard, una: SeqNumber, nxt: SeqNumber, alphabet: &[Op], dep
 /// so wrap-correctness is *proven*, not assumed. `smss` is the segment size the RFC 6675 predicates
 /// use. Returns the case count and any invariant violation (a correct scoreboard yields zero).
 pub fn check_scoreboard(n: u32, depth: u32, smss: u32) -> BmcReport {
-    let mut report = BmcReport::default();
-    for &base_raw in &[0u32, 0xFFFF_FFFFu32.wrapping_sub(n)] {
-        let base = SeqNumber::new(base_raw);
-        let nxt = base + n;
-        let alphabet = scoreboard_alphabet(base, n, nxt);
-        let sb = Scoreboard::new();
-        explore(&sb, base, nxt, &alphabet, depth, smss, &mut report);
-    }
-    report
+    run_scoreboard_sweep(n, depth, smss, scoreboard_invariants)
 }
 
 // ── TCP option walker ────────────────────────────────────────────────────────────────────────────
@@ -231,18 +252,28 @@ mod tests {
         assert_eq!(r2.violations, 0, "{:?}", r2.first_violation);
     }
 
-    /// A negative control proving the checker has teeth: a deliberately broken "scoreboard invariant"
-    /// (asserting the pipe is always zero) is caught on the very first non-trivial state, with a repro.
+    /// A negative control proving the checker has teeth — and, crucially, exercising the **real**
+    /// enumeration apparatus (`explore` → `inv` → report), not just the counter bookkeeping. It runs
+    /// the same exhaustive sweep with a deliberately-false invariant ("the scoreboard must never hold a
+    /// SACK run"); an `Update` op makes it false, so the sweep must surface violations with a repro. If
+    /// the enumeration or wiring ever silently broke (e.g. `explore` stopped recursing, the alphabet
+    /// emptied, or the real invariant always returned `Ok`), *this* test goes red — which the
+    /// always-zero-violations positive sweeps could not catch on their own.
     #[test]
+    #[cfg_attr(miri, ignore)] // drives the enumeration (~thousands of states) — too slow for Miri
     fn the_checker_catches_a_violation() {
-        // A tiny hand-driven board with one SACK block: a bogus invariant (pipe == 0) must trip.
-        let mut sb = Scoreboard::new();
-        let (una, nxt) = (SeqNumber::new(0), SeqNumber::new(4000));
-        sb.update(una, nxt, &[(SeqNumber::new(1000), SeqNumber::new(2000))]);
-        let mut report = BmcReport::default();
-        let bogus = if sb.pipe(una, nxt, 1000) == 0 { Ok(()) } else { Err("pipe is non-zero".to_string()) };
-        report.check(bogus);
-        assert_eq!(report.violations, 1, "the checker must flag a false invariant");
-        assert!(report.first_violation.is_some());
+        fn always_no_sack(sb: &Scoreboard, _: SeqNumber, _: SeqNumber, _: u32) -> Result<(), String> {
+            match sb.highest_sacked_edge() {
+                None => Ok(()),
+                Some(e) => Err(format!("a SACK run exists (edge {})", e.raw())),
+            }
+        }
+        let r = run_scoreboard_sweep(4, 2, 1, always_no_sack);
+        assert!(r.cases > 1_000, "the sweep must actually run: {} cases", r.cases);
+        assert!(r.violations > 0, "the real enumeration must flag the false invariant");
+        assert!(r.first_violation.is_some(), "...and produce a repro");
+        // Belt-and-braces: the *true* invariant over the very same sweep finds nothing.
+        let real = run_scoreboard_sweep(4, 2, 1, scoreboard_invariants);
+        assert_eq!(real.violations, 0, "the real invariant holds over the same states");
     }
 }

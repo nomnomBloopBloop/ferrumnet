@@ -314,6 +314,22 @@ mod tests {
         SeqNumber::new(v)
     }
 
+    /// The well-formedness predicate the bounded model checker relies on has teeth: it accepts a
+    /// sorted/disjoint/non-empty list and rejects every malformation (empty run, inverted run, out of
+    /// order, overlapping, adjacent-without-gap). So a regression that made `invariants_hold` a
+    /// tautology fails here, not silently.
+    #[test]
+    fn run_list_well_formed_has_teeth() {
+        assert!(run_list_well_formed(&[])); // vacuously well-formed
+        assert!(run_list_well_formed(&[(s(0), s(10))]));
+        assert!(run_list_well_formed(&[(s(0), s(10)), (s(20), s(30))])); // sorted, disjoint, a gap
+        assert!(!run_list_well_formed(&[(s(10), s(10))])); // empty run
+        assert!(!run_list_well_formed(&[(s(20), s(10))])); // inverted
+        assert!(!run_list_well_formed(&[(s(20), s(30)), (s(0), s(10))])); // out of order
+        assert!(!run_list_well_formed(&[(s(0), s(20)), (s(10), s(30))])); // overlapping
+        assert!(!run_list_well_formed(&[(s(0), s(10)), (s(10), s(20))])); // adjacent: must be coalesced
+    }
+
     #[test]
     fn update_validates_window() {
         let mut sb = Scoreboard::new();
