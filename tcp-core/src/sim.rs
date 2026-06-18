@@ -487,13 +487,17 @@ pub fn run_bottleneck(seed: u64, cfg: Bottleneck, bytes: usize, cc: CcKind) -> B
 /// field, exactly as L4S specifies (RFC 9331): a scalable sender (Prague) marks its data ECT and
 /// lands in the low-latency queue; a classic sender (Reno) is Not-ECT and lands in the deep queue.
 ///
-/// This isolates the two: the classic flow can bloat its *own* queue without inflating the L4S
-/// flow's latency, while the round-robin scheduler hands each class an equal share of the link, so
-/// the two flows get fair throughput — the headline L4S result a single shared FIFO cannot deliver
-/// (there one greedy classic flow bloats the queue for everyone). The simplification vs full dualPI2
-/// is the marking law: this uses each class's own native threshold (shallow-step for L4S, tail-drop
-/// for Classic) rather than dualPI2's *coupled* PI-controller probability (`p_L = k·p_C`); the
-/// dual-queue isolation + fair scheduling are the parts demonstrated here.
+/// This **isolates** the two: the classic flow can bloat its *own* deep queue without inflating the
+/// L4S flow's latency — the headline result a single shared FIFO cannot give (there one greedy classic
+/// flow's bloat is everyone's latency). The two flows also **coexist** — both complete, neither is
+/// starved. The per-class round-robin scheduler keeps either class from monopolising the link, but it
+/// does **not** by itself equalise *throughput*: a scalable L4S flow keeps its queue near-empty, so the
+/// L4S class is often idle and the scheduler hands that slack to the classic flow — the exact split
+/// therefore depends on the buffer/threshold balance (in the demo the classic flow finishes *faster*).
+/// Robust throughput *fairness* across RTT and config is precisely what dualPI2's *coupled* PI-controller
+/// marking law (`p_L ≈ √p_C`) adds, and is the documented refinement deferred here; this models the
+/// dual-queue structure (two class queues, per-class native marking — shallow-step for L4S, tail-drop
+/// for Classic — and a fair scheduler) and demonstrates the **latency isolation + coexistence** half.
 #[derive(Clone, Copy, Debug)]
 pub struct DualQueue {
     pub rate_bytes_per_sec: u64,
@@ -548,7 +552,11 @@ struct DqFlight {
     frame: Vec<u8>,
 }
 
-/// The dual-queue link. Index `[0]` is the L4S class, `[1]` the Classic class throughout.
+/// The dual-queue link. Stats arrays are indexed by **flow** (`[0]` = flow 0 / the scalable L4S sender,
+/// `[1]` = flow 1 / the classic sender), so each flow's queue / mark / drop stats are attributed
+/// exactly to that flow — even though a sender's occasional Not-ECT control frame (SYN / handshake ACK /
+/// FIN) is classified into the *other* class's queue (per-packet ECN classification is the correct L4S
+/// behaviour; only the *bookkeeping* is by flow). The L4S/Classic *queues* themselves stay ECN-classified.
 struct DualQueueLink {
     cfg: DualQueue,
     l4s: std::collections::VecDeque<DqQueued>,
@@ -558,7 +566,9 @@ struct DualQueueLink {
     /// When the shared link finishes serialising the frame it is currently sending.
     link_free_at: Instant,
     /// Round-robin pointer: when both class queues are backlogged, serve L4S iff this is true, then
-    /// flip — so the link alternates between the classes and each gets an equal share of the rate.
+    /// flip — so the link alternates between the classes and neither monopolises it. (This does *not*
+    /// by itself equalise throughput — a scalable flow leaves slack the classic flow takes; see
+    /// [`DualQueue`].)
     serve_l4s_next: bool,
     flight: Vec<DqFlight>,
     order: u64,
@@ -595,14 +605,14 @@ impl DualQueueLink {
         let len = frame.len() as u64;
         if frame_is_ect(&frame) {
             if self.l4s_bytes + len > self.cfg.l4s_buffer_bytes {
-                self.dropped[0] += 1;
+                self.dropped[flow] += 1; // a drop is charged to the flow that sent the frame
                 return;
             }
             self.l4s_bytes += len;
             self.l4s.push_back(DqQueued { arrival: now, flow, len, frame });
         } else {
             if self.classic_bytes + len > self.cfg.classic_buffer_bytes {
-                self.dropped[1] += 1;
+                self.dropped[flow] += 1;
                 return;
             }
             self.classic_bytes += len;
@@ -645,7 +655,6 @@ impl DualQueueLink {
                 self.classic_bytes -= self.classic.front().unwrap().len;
                 self.classic.pop_front().unwrap()
             };
-            let class = if serve_l4s { 0 } else { 1 };
             // The link starts serialising when it is free *and* the frame has arrived.
             let start = if self.link_free_at > f.arrival { self.link_free_at } else { f.arrival };
             let queue_us = start.saturating_micros_since(f.arrival);
@@ -657,11 +666,12 @@ impl DualQueueLink {
             // rather than dropped — the same mechanism as `Aqm::CeMark`, applied to the L4S class only.
             if serve_l4s && queue_us > self.cfg.l4s_threshold_us && frame_is_ect(&frame) {
                 set_ecn(&mut frame, ECN_CE);
-                self.marked[0] += 1;
+                self.marked[f.flow] += 1;
             }
-            self.sum_queue_us[class] += queue_us;
-            self.max_queue_us[class] = self.max_queue_us[class].max(queue_us);
-            self.delivered[class] += 1;
+            // Stats by flow (the frame's sender), so the per-flow attribution is exact.
+            self.sum_queue_us[f.flow] += queue_us;
+            self.max_queue_us[f.flow] = self.max_queue_us[f.flow].max(queue_us);
+            self.delivered[f.flow] += 1;
             let order = self.order;
             self.order += 1;
             self.flight.push(DqFlight {
@@ -709,17 +719,25 @@ impl DualQueueLink {
         }
     }
 
-    fn flow_result(&self, class: usize, completed: bool, bytes: usize, sim_time_us: u64) -> FlowResult {
+    fn flow_result(&self, flow: usize, completed: bool, bytes: usize, sim_time_us: u64) -> FlowResult {
         FlowResult {
             completed,
             bytes,
             sim_time_us,
-            mean_queue_us: if self.delivered[class] > 0 { self.sum_queue_us[class] / self.delivered[class] } else { 0 },
-            max_queue_us: self.max_queue_us[class],
-            marked: self.marked[class],
-            dropped: self.dropped[class],
+            mean_queue_us: if self.delivered[flow] > 0 { self.sum_queue_us[flow] / self.delivered[flow] } else { 0 },
+            max_queue_us: self.max_queue_us[flow],
+            marked: self.marked[flow],
+            dropped: self.dropped[flow],
         }
     }
+}
+
+/// A flow's [`FlowResult`], built honestly: `completed` is whether *this* flow delivered every byte
+/// intact (`received == payload`), independent of whether the other flow finished — and `sim_time_us`
+/// is the flow's own completion time when it finished, else the elapsed budget.
+fn flow_outcome(link: &DualQueueLink, flow: usize, pair: &Pair, done_at: Option<u64>, now: Instant) -> FlowResult {
+    let intact = *pair.received.borrow() == *pair.payload;
+    link.flow_result(flow, intact, pair.received.borrow().len(), done_at.unwrap_or(now.micros()))
 }
 
 /// Run two bulk transfers sharing one [`DualQueue`] bottleneck and return a per-flow result. Flow 0
@@ -727,7 +745,8 @@ impl DualQueueLink {
 /// flow 1 runs `classic_cc` (a loss-based, Not-ECT controller — its data lands in the deep Classic
 /// queue). Deterministic: each flow is an independent pair of single-connection runtimes, and the
 /// scheduler/propagation are ordered by explicit counters, so the run is a pure function of the
-/// inputs. The per-class queue stats map to the flows (flow 0 ↔ L4S class, flow 1 ↔ Classic class).
+/// inputs. Stats are attributed per **flow** (flow 0 / flow 1), not per class, so they are exact even
+/// for a sender's Not-ECT control frames (see [`DualQueueLink`]).
 pub fn run_dualqueue(seed: u64, cfg: DualQueue, bytes: usize, l4s_cc: CcKind, classic_cc: CcKind) -> (FlowResult, FlowResult) {
     let mut flows = vec![
         build_pair(seed, bytes, l4s_cc),
@@ -768,16 +787,14 @@ pub fn run_dualqueue(seed: u64, cfg: DualQueue, bytes: usize, l4s_cc: CcKind, cl
             }
         }
         if done_at.iter().all(|d| d.is_some()) {
-            let r0 = link.flow_result(0, *flows[0].received.borrow() == *flows[0].payload, bytes, done_at[0].unwrap());
-            let r1 = link.flow_result(1, *flows[1].received.borrow() == *flows[1].payload, bytes, done_at[1].unwrap());
-            return (r0, r1);
+            return (flow_outcome(&link, 0, &flows[0], done_at[0], now), flow_outcome(&link, 1, &flows[1], done_at[1], now));
         }
 
         steps += 1;
         if steps > MAX_STEPS || now.micros() > MAX_SIM_US {
-            let r0 = link.flow_result(0, false, flows[0].received.borrow().len(), done_at[0].unwrap_or(now.micros()));
-            let r1 = link.flow_result(1, false, flows[1].received.borrow().len(), done_at[1].unwrap_or(now.micros()));
-            return (r0, r1);
+            // Budget exhausted: report each flow's *own* status — a flow that finished intact before
+            // its peer wedged is still `completed`, not failed.
+            return (flow_outcome(&link, 0, &flows[0], done_at[0], now), flow_outcome(&link, 1, &flows[1], done_at[1], now));
         }
 
         let mut next = link.next_event_at();
@@ -788,9 +805,7 @@ pub fn run_dualqueue(seed: u64, cfg: DualQueue, bytes: usize, l4s_cc: CcKind, cl
             Some(t) if t > now => now = t,
             Some(_) => now = now.plus_micros(1),
             None => {
-                let r0 = link.flow_result(0, false, flows[0].received.borrow().len(), done_at[0].unwrap_or(now.micros()));
-                let r1 = link.flow_result(1, false, flows[1].received.borrow().len(), done_at[1].unwrap_or(now.micros()));
-                return (r0, r1);
+                return (flow_outcome(&link, 0, &flows[0], done_at[0], now), flow_outcome(&link, 1, &flows[1], done_at[1], now));
             }
         }
     }
@@ -1837,6 +1852,18 @@ mod tests {
         let hi = l4s.throughput_bytes_per_sec().max(classic.throughput_bytes_per_sec());
         assert!(lo > cfg.rate_bytes_per_sec / 5, "neither flow is starved: l4s {} vs classic {} B/s", l4s.throughput_bytes_per_sec(), classic.throughput_bytes_per_sec());
         assert!(hi < 3 * lo, "neither flow runs away with the link: {hi} vs {lo} B/s");
+
+        // Pin the measured split *direction*, per-flow: the polite L4S flow keeps its queue near-empty,
+        // so the round-robin scheduler hands its slack to the classic flow, which therefore finishes
+        // **sooner** (its own completion time is shorter). This single check has teeth two ways — it
+        // catches a scheduler that strict-prioritises L4S (which flips the split) and a regression that
+        // collapses the per-flow completion timing to the shared global end (which would make them equal).
+        assert!(
+            classic.sim_time_us < l4s.sim_time_us,
+            "the classic flow takes the L4S flow's slack and finishes sooner (per-flow timing): classic {} µs vs l4s {} µs",
+            classic.sim_time_us,
+            l4s.sim_time_us
+        );
     }
 
     /// Prague's loss response is the *classic* Reno fallback (the "be safe with drop-based traffic"

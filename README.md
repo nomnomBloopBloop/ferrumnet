@@ -198,13 +198,18 @@ bottleneck at 50 mbit (so the Linux qdisc does the CE marking), latency measured
 |---|---|---|
 | Reno  | 6.0 MB/s | 42 ms |
 | BBR   | 6.0 MB/s | 1.0 ms |
-| **DCTCP** | 6.0 MB/s | **0.95 ms** |
+| **DCTCP** (AccECN) | 6.0 MB/s | **1.14 ms** |
+| **Prague** (AccECN) | 6.0 MB/s | **0.92 ms** |
 
-Same goodput across the board; DCTCP holds the lowest queue — **sub-millisecond**, below even BBR's
-paced queue — a **~44× latency reduction** over loss-based Reno at identical throughput. The
-deterministic sim result carries through the real Linux forwarding path and qdisc, CE marks and AccECN
-feedback and all (verified on the wire with `tcpdump`). Both ends run DCTCP: there is no SYN ECN
-negotiation, a documented simplification since the two stacks are configured together.
+Same goodput across the board; the scalable controllers hold a **sub-millisecond** queue — below even
+BBR's paced queue — a **~46× latency reduction** over loss-based Reno at identical throughput, with
+**Prague** the lowest (0.92 ms; its gentler RTT-clamped step on this short-RTT path keeps the queue a
+hair shallower than DCTCP). Re-measured this session through the same `codel ce_threshold 1ms ecn` qdisc,
+now over the **AccECN** feedback path: the deterministic sim result carries through the real Linux
+forwarding path, exact CE counts and all. (DCTCP's 1.14 ms vs the earlier one-bit-echo 0.95 ms is the
+same exact-vs-over-counting tradeoff the sim shows — the higher figure is the *honest* operating point.)
+Both ends run the same controller: there is no SYN ECN negotiation, a documented simplification since the
+two stacks are configured together.
 
 **Exact CE feedback — AccECN (RFC 9768).** The feedback channel is the standard **ACE 3-bit counter**,
 not a one-bit echo: the receiver counts the CE-marked data packets it accepts and reflects that count

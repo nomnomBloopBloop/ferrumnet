@@ -567,11 +567,13 @@ tail-drop kept as the backstop) — makes it the DCTCP testbed (§5.5). On one 2
 bottleneck with a 1 ms threshold, an 8 MiB transfer paints the full ladder at the same goodput: **Reno
 ~102 ms, BBR ~6.7 ms, DCTCP ~0.64 ms** mean standing queue (the DCTCP figure with exact AccECN feedback,
 M16; the earlier ~0.5 ms was the one-bit echo's mark over-attribution biasing the queue low). The result
-carries to **real hardware** — the two-instance bench through a Linux `codel ce_threshold 1ms ecn` qdisc
-gives **Reno 42 ms, BBR 1.0 ms, DCTCP 0.95 ms** RTT-under-load at ~6 MB/s each (confirmed on the wire with
-`tcpdump`: the data leaves ECT(1), the qdisc rewrites it to CE, and the receiver reflects it through the
-AccECN ACE counter). The deterministic sim and the real Linux forwarding path agree — sub-millisecond,
-below even BBR's paced queue, at line rate.
+carries to **real hardware** — the two-instance bench through a Linux `codel ce_threshold 1ms ecn` qdisc,
+re-measured this session over the AccECN path, gives **Reno 42 ms, BBR 1.0 ms, DCTCP 1.14 ms, Prague
+0.92 ms** RTT-under-load at ~6 MB/s each (the data leaves ECT(1), the qdisc rewrites it to CE, and the
+receiver reflects it through the AccECN ACE counter; DCTCP's 1.14 ms vs the earlier one-bit-echo 0.95 ms
+is the exact-vs-over-counting tradeoff, the honest operating point — and **Prague**, the scalable
+controller, holds the lowest at 0.92 ms). The deterministic sim and the real Linux forwarding path agree
+— sub-millisecond, below even BBR's paced queue, at line rate, for both scalable controllers.
 
 **Coverage-guided greybox fuzzing (M15).** The DST suite above runs a *fixed* grid of seeds; the fuzzer
 adds feedback-driven search on top — keep the scenarios that exercise new behaviour, mutate them, reach
