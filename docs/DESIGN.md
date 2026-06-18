@@ -79,6 +79,8 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   sim          deterministic simulation testing: 2 stacks over a seeded   [M14,M15]
                fault link + finite-buffer bottleneck (CeMark/L4S AQM);
                a coverage-guided greybox fuzzer; a CEM trainer for Learned
+  bmc          bounded model checker: exhaustive SACK-scoreboard op-      [M15]
+               sequence + TCP-option-walker proofs (zero-dep, no Kani)
 tcp-tun/   (Linux-only backend + demo)
   sys          extern "C" ioctl/poll + repr(C) ifreq/pollfd            [M0]
   tun          TunDevice : Device (IFF_TUN|IFF_NO_PI, O_NONBLOCK)       [M0/M5]
@@ -540,6 +542,33 @@ result is reproducible from a fixed seed (`evolve(&train_set(), 30, 28, 0.25, 12
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
 
+### 5.11 Bounded model checking (`bmc`) — M15
+
+Where §5.10 *samples* the input space, this **exhausts** a bounded slice of it: a hand-rolled
+**bounded model checker** that enumerates *every* operation sequence (up to a small depth, over a small
+sequence-number window) the SACK scoreboard can be driven through, and *every* structured TCP-option
+string the walker can be handed, and confirms the invariants on **all** of them — a finite *proof* for
+that bound, not a sample. There is **no external model checker** (Kani, CBMC): just nested `std` loops,
+so it stays zero-dependency and runs anywhere the crate does, and — because the engine is sans-IO — it
+drives exactly the code paths the live stack runs.
+
+- **Scoreboard.** `check_scoreboard` does a depth-bounded tree walk (cloning the board at each branch)
+  over the operation alphabet (`update`/`mark_rexmit` with every window-point block — *including* empty,
+  inverted, and out-of-window ones — `trim`, and the recovery transitions), at `base = 0` **and** at a
+  base straddling the 2³² wrap, so wrap-correctness is proven not assumed. After every op it asserts:
+  the run lists stay sorted / disjoint-with-a-gap / non-empty (`Scoreboard::invariants_hold`); the RFC
+  6675 `pipe` never exceeds the bytes in flight; and `next_seg`, when it proposes a hole, proposes a
+  real unsacked/un-rexmitted one inside `[snd_una, snd_nxt)`. ~400 K reachable states, zero violations.
+- **Option walker.** `check_option_strings` exhausts every option layout up to two 32-bit words over
+  the bytes the TLV walker actually branches on (EOL/NOP, every option kind, the length boundaries, a
+  payload byte) — ~1.7 M layouts — confirming no accessor panics and the walk always terminates.
+- **Teeth.** A negative-control test runs the *same* enumeration with a deliberately-false invariant and
+  asserts it surfaces violations with a repro (so a silently-severed checker fails red, not green — a
+  gap the adversarial review caught and the fix closed); a `run_list_well_formed` unit test guards the
+  structural predicate from degrading to a tautology. Together with §5.10 this is the "**fuzz it *and*
+  prove it**" pair — the sampler reaches deep realistic states, the checker gives an exhaustive
+  guarantee over a complete small neighbourhood.
+
 ## 6. End-to-end data flow (one `curl` request)
 
 1. `curl` → kernel routes `10.0.0.2` to `tun0` → the IP datagram appears on our fd.
@@ -584,7 +613,7 @@ result is reproducible from a fixed seed (`evolve(&train_set(), 30, 28, 0.25, 12
 | M12 | folded checksum; `tcp-tun` client mode + two-instance-over-TUN benchmark (caught + fixed the run()-ordering and MSS-options bugs) | two userspace stacks: 125→300 MB/s match-MTU; 11.2 MB/s at +20 ms RTT (3.5× the 64 KiB cap) — window scaling on real hardware |
 | M13 | CUBIC (RFC 8312) + BBR v1 (model-paced, BBRv2 `inflight_hi`/`inflight_lo` bounds) + an ack-clocked go-back-N drain that un-sticks the post-RTO wedge for all controllers | Reno↔CUBIC↔BBR head-to-head over the two-instance bench; BBR ~3.5× lower latency on a bottleneck queue at equal goodput |
 | M14 | deterministic simulation testing (`sim`); **L4S/DCTCP** — ECN ECT/CE/ECE wiring + the DCTCP controller (α-EWMA proportional cut) + a `CeMark` AQM | 1080 adversarial DST scenarios all deliver intact; DCTCP holds a **sub-millisecond** queue (sim *and* hardware) where Reno bloats to tens of ms |
-| M15 | a **coverage-guided greybox fuzzer** (off-the-wire coverage, no engine instrumentation); an **evolved** `Learned` controller trained by a from-scratch CEM (zero ML libs) | fuzzer is a deterministic correctness oracle (zero findings); the evolved genome beats hand-tuned DCTCP on the held-out latency-throughput frontier |
+| M15 | a **coverage-guided greybox fuzzer** (off-the-wire coverage, no engine instrumentation); an **evolved** `Learned` controller trained by a from-scratch CEM (zero ML libs); a **bounded model checker** (exhaustive SACK / option proofs, no Kani) | fuzzer is a deterministic correctness oracle (zero findings); the evolved genome beats hand-tuned DCTCP on the held-out frontier; the BMC proves the scoreboard + option-walker invariants over ~400 K + ~1.7 M cases |
 
 ## 9. Environment
 

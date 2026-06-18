@@ -32,7 +32,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **five pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP / an
   **evolved** one), and a **two-stack userspace loopback** (two instances connecting to each other
-  entirely in memory). **197 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
+  entirely in memory). **201 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB, no
   leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -329,7 +329,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 197 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 201 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECN echo, alpha, CeMark AQM,
@@ -337,6 +337,7 @@ cargo test -p tcp-core      # 197 tests: unit + in-memory integration + loss/SAC
                             #            trainer, held-out frontier) + the ack-clocked go-back-N drain
                             #            + deterministic simulation testing (1080 adversarial seeds)
                             #            + a coverage-guided greybox fuzzer (off-the-wire coverage)
+                            #            + a bounded model checker (exhaustive SACK / option proofs)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -372,10 +373,14 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   three layers on top: a **bit-reproducible congestion-control testbed** (a virtual *bottleneck* +
   AQM, behind the DCTCP latency ladder), a **coverage-guided greybox fuzzer** (off-the-wire coverage,
   a deterministic correctness oracle that found zero invariant violations across thousands of
-  coverage-steered mutations), and the **CEM training ground** for the evolved controller. The natural
-  next rigor step is a **bounded checker** — exhaustively enumerate small SACK-scoreboard op-sequences
-  and wire-parser structural inputs and prove the invariants (zero-dep, no external model checker), so
-  the stack is one you can *fuzz, train against, and prove*.
+  coverage-steered mutations), and the **CEM training ground** for the evolved controller.
+- **Fuzz it *and* prove it — done (the `bmc` module).** Alongside the sampling fuzzer, a hand-rolled
+  **bounded model checker** (zero-dep, no Kani/CBMC — just exhaustive `std` loops) *exhausts* a small
+  but complete slice of the input space: every SACK-scoreboard operation sequence up to depth 3 over a
+  small window (~400 K reachable states, at sequence 0 *and* across the 2³² wrap) and every TCP option
+  layout up to two words (~1.7 M), confirming the scoreboard's structural invariants, the RFC 6675
+  `pipe ≤ inflight` bound, and the option walker's panic-freedom. So the stack is one you can *fuzz,
+  train against, and prove*.
 - **L4S — the ECN half is done; the scalable-CC frontier is next.** **DCTCP** (RFC 8257) + ECN
   marking/echo (RFC 3168) ship now, holding a sub-millisecond queue on a CE-marking bottleneck (sim
   *and* hardware, table above). The bleeding edge from here is the rest of **L4S** (RFC 9330–9332):
