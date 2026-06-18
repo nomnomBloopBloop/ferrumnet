@@ -752,9 +752,10 @@ mod tests {
         // A datacenter-like path (DCTCP's design point): 2.5 MB/s, a deep 512 KiB buffer, a 4 ms base
         // RTT (BDP ≈ 10 KiB), and an L4S AQM that marks CE once a frame's standing-queue delay tops
         // 1 ms. Reno/BBR send Not-ECT, so the AQM cannot mark them — they bloat exactly as they would
-        // under tail-drop; only DCTCP's ECT data is marked, and only DCTCP reacts to it.
+        // under tail-drop; only DCTCP's ECT data is marked, and only DCTCP reacts to it. The 8 MiB
+        // transfer is long enough that DCTCP's steady state (not its slow-start ramp) dominates.
         let bn = Bottleneck { rate_bytes_per_sec: 2_500_000, buffer_bytes: 512 * 1024, base_delay_us: 2_000, aqm: Aqm::CeMark { threshold_us: 1_000 } };
-        let bytes = 2 * 1024 * 1024;
+        let bytes = 8 * 1024 * 1024;
         let reno = run_bottleneck(7, bn, bytes, CcKind::Reno);
         let bbr = run_bottleneck(7, bn, bytes, CcKind::Bbr);
         let dctcp = run_bottleneck(7, bn, bytes, CcKind::Dctcp);

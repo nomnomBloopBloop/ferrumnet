@@ -102,13 +102,22 @@ pub struct Tcb {
     /// Our TSval to stamp on outgoing segments: the microsecond clock captured at the top of each
     /// `poll_transmit` (every `build` runs inside `poll_transmit`, so it is always fresh).
     cur_tsval: u32,
-    /// DCTCP/L4S (RFC 8257) congestion echo. A receiver sets this from the IPv4 CE codepoint of the
-    /// most recent data segment it accepted; [`Tcb::build`] then mirrors it as the TCP ECE flag on
-    /// our ACKs, so the sender learns the marked fraction. Active only on a DCTCP connection
-    /// ([`Tcb::ecn_enabled`]); inert (never read, never set) for every other controller, which keeps
-    /// the wire byte-identical for Reno/CUBIC/BBR. We deliberately echo the latest segment's mark
-    /// rather than run the full RFC 8257 §3.2 receiver state machine — a documented simplification
-    /// (both ends are configured DCTCP, so there is no ECN handshake either; see `ecn_enabled`).
+    /// DCTCP/L4S (RFC 8257) congestion echo — "was any data CE-marked since our last ACK?". A
+    /// receiver **ORs in** the IPv4 CE codepoint of each data segment it accepts; [`Tcb::build`]
+    /// mirrors it as the TCP ECE flag and then clears it, so the next ACK starts a fresh
+    /// accumulation. ORing (not overwriting) is load-bearing: under the every-other-segment delayed-
+    /// ACK rule, a CE mark on a deferred segment would otherwise be lost when the segment that
+    /// triggers the combined ACK is itself un-marked — which systematically under-counts the marked
+    /// fraction and lets the queue bloat. Active only on a DCTCP connection ([`Tcb::ecn_enabled`]);
+    /// inert (never read, never set) for every other controller, so the wire stays byte-identical
+    /// for Reno/CUBIC/BBR.
+    ///
+    /// This is the simplified "OR since the last ACK" receiver, not the full RFC 8257 §3.2 state
+    /// machine (which sends an immediate ACK on every CE-state change). The residual imprecision — a
+    /// single ACK that coalesces a marked/un-marked run boundary attributes its whole span as marked
+    /// — is the limit of one-bit ECN feedback and biases the queue *lower*, never dropping a signal;
+    /// AccECN (RFC 9768) is what conveys the exact per-byte mark count. There is likewise no SYN ECN
+    /// negotiation: both ends are configured DCTCP (see `ecn_enabled`).
     ece_echo: bool,
 
     // Receive sequence space.
@@ -592,10 +601,12 @@ impl Tcb {
         // out-of-order runs contiguous, which are then drained in). Out-of-order data — a gap
         // below it — is buffered for reassembly when SACK is enabled, instead of being dropped.
         if !payload.is_empty() {
-            // DCTCP/L4S receiver: record whether this accepted data carried a CE mark, to echo as
-            // ECE on our next ACK (see `build`). Inert unless this is a DCTCP connection.
+            // DCTCP/L4S receiver: OR this accepted segment's CE mark into the echo, to reflect on our
+            // next ACK (see `build`). ORing (not overwriting) keeps a mark on a segment that is then
+            // coalesced under a delayed ACK from being lost when the segment that triggers the
+            // combined ACK is itself un-marked. Inert unless this is a DCTCP connection.
             if self.ecn_enabled() {
-                self.ece_echo = ce;
+                self.ece_echo |= ce;
             }
             // Left-trim a segment overlapping the left window edge (seg_seq < RCV.NXT) so its
             // fresh in-order tail is delivered rather than dropped; an already-delivered prefix
@@ -1367,12 +1378,14 @@ impl Tcb {
         // delayed ACK — clear it so the delayed-ACK timer does not later fire a redundant one.
         self.delayed_ack_deadline = None;
         self.unacked_segs = 0;
-        // DCTCP/L4S: a receiver echoes congestion by setting ECE on its ACKs whenever the most
-        // recent data it accepted was CE-marked (RFC 3168 §6.1.2 / RFC 8257). `ece_echo` is only
-        // ever set on a DCTCP connection, so this OR is inert for every other controller.
+        // DCTCP/L4S: a receiver echoes congestion by setting ECE on an ACK whenever any data it
+        // accepted since its last ACK was CE-marked (RFC 3168 §6.1.2 / RFC 8257), then clears the
+        // accumulator so the next ACK starts fresh. `ece_echo` is only ever set on a DCTCP
+        // connection, so this is inert (no ECE, no clear) for every other controller.
         let mut flag_bits = extra_flags | TcpFlags::ACK;
         if self.ecn_enabled() && self.ece_echo {
             flag_bits |= TcpFlags::ECE;
+            self.ece_echo = false; // echoed: begin a fresh "CE since last ACK" accumulation
         }
         let flags = TcpFlags(flag_bits);
         // Encode the advertised window into the 16-bit field. The SYN-ACK's window is never
@@ -3036,5 +3049,57 @@ mod tests {
             deliver(&mut tcb, t, &inbound(cnxt, high, TcpFlags::ACK, 64000, None, b""));
         }
         assert_eq!(tcb.tx_free(), full, "pacing delivered the whole buffer without wedging");
+    }
+
+    /// DCTCP receiver echo (RFC 8257): a CE mark on a segment that is then coalesced under a delayed
+    /// ACK must NOT be lost. The receiver ORs marks since its last ACK, so even when an un-marked
+    /// segment triggers the combined ACK, the deferred segment's CE is still echoed as ECE — and the
+    /// echo is cleared once sent, so a later un-marked pair does not re-echo it. (Regression for the
+    /// overwrite bug the adversarial review caught: `ece_echo = ce` dropped ~half the marks under
+    /// coalescing, under-counting DCTCP's alpha and letting the queue bloat.)
+    #[test]
+    fn dctcp_receiver_echoes_a_coalesced_ce_mark() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 1000, 64000);
+        tcb.set_congestion_control(CcKind::Dctcp);
+
+        // First clean in-order segment is CE-marked and deferred; the second is un-marked and
+        // triggers the combined ACK. The ACK must still echo ECE (the deferred mark is not lost).
+        let mut s1 = inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"hello");
+        crate::wire::set_ecn(&mut s1, crate::wire::ECN_CE);
+        deliver(&mut tcb, now, &s1);
+        assert!(drain(&mut tcb, now).is_empty(), "the first clean in-order segment defers its ACK");
+
+        let s2 = inbound(cnxt + 5, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"world");
+        deliver(&mut tcb, now, &s2); // not CE; triggers the coalesced ACK
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1, "the second segment triggers the coalesced ACK");
+        assert_eq!(out[0].ack, cnxt + 10);
+        assert!(out[0].flags.ece(), "the coalesced ACK must echo the CE mark from the deferred segment");
+
+        // The echo is cleared once sent: a following un-marked pair must NOT re-echo ECE.
+        let s3 = inbound(cnxt + 10, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"12345");
+        deliver(&mut tcb, now, &s3);
+        let s4 = inbound(cnxt + 15, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"67890");
+        deliver(&mut tcb, now, &s4);
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].flags.ece(), "ECE clears after it is echoed — no CE since the last ACK");
+    }
+
+    /// The byte-identical guarantee at the wire level: a non-DCTCP (Reno) receiver never sets ECE,
+    /// even when the data it receives is CE-marked — ECN is entirely gated on the controller.
+    #[test]
+    fn non_dctcp_receiver_never_echoes_ece_even_for_ce_data() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 1000, 64000); // default Reno
+        let mut s1 = inbound(cnxt, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"hello");
+        crate::wire::set_ecn(&mut s1, crate::wire::ECN_CE);
+        deliver(&mut tcb, now, &s1);
+        let s2 = inbound(cnxt + 5, iss + 1, TcpFlags::ACK | TcpFlags::PSH, 64000, None, b"world");
+        deliver(&mut tcb, now, &s2);
+        let out = drain(&mut tcb, now);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].flags.ece(), "a non-DCTCP receiver must never echo ECE (byte-identical wire)");
     }
 }
