@@ -228,18 +228,22 @@ pub fn check_option_strings(alphabet: &[u8], len_words: usize) -> BmcReport {
 /// Prague reads RTT (delivered via [`CcEvent::Rtt`]), not this. Fixed, so the sweep is deterministic.
 const CC_NOW: Instant = Instant::ZERO;
 
-/// How much data a loss event reports in flight, as a fraction of the **current** congestion window —
-/// the TCB never reports more in flight than the window allows (`flight ∈ [0, cwnd]`), so this models
-/// the real contract the controller is driven under rather than an impossible `flight > cwnd`.
+/// The **FlightSize** a loss event reports — the bytes outstanding (`snd_nxt − snd_una`). The live TCB
+/// derives this *independently* of `cwnd` and never caps it to the window, so it **can exceed the
+/// current `cwnd`**: a controller cuts `cwnd` mid-flight (an ECN mark, or an RTO that collapses it to
+/// one segment) while the data already on the wire — and thus `snd_nxt` — stays put. Modelling flight
+/// as a fixed set of MSS-scaled byte counts (independent of `cwnd`) is therefore the *real* contract;
+/// an earlier version keyed it off the live `cwnd` and the adversarial review proved that under-modelled
+/// the stack — it hid exactly the `flight > cwnd` loss responses the live TCB reaches.
 #[derive(Clone, Copy)]
 enum Flight {
-    Full,
-    Half,
+    Small,  // 2·MSS
+    Window, // ≈ one initial window
+    Large,  // a big stale flight, well above a freshly-cut cwnd
 }
 
 /// One event the TCB can deliver to a [`CongestionControl`] — the alphabet the checker enumerates over.
-/// `Ack`/`Ecn` carry absolute byte counts (scaled to the MSS); the loss events carry a [`Flight`] that
-/// resolves against the live `cwnd`.
+/// `Ack`/`Ecn` carry absolute byte counts (scaled to the MSS); the loss events carry a [`Flight`].
 #[derive(Clone, Copy)]
 enum CcEvent {
     Ack(u32),
@@ -252,9 +256,10 @@ enum CcEvent {
 
 /// The bounded event alphabet at segment size `mss`: clean ACKs (none / one segment / a full initial
 /// window — enough to close an ECN observation window in one event), ECN rounds at no / light / full
-/// marking, a short and a long RTT sample (for Prague's RTT-independent step), and the four loss
-/// signals at full and half the current window. The walker only branches on these, so a sweep over them
-/// is exhaustive over the controller's actual decision space.
+/// marking, a short and a long RTT sample (for Prague's RTT-independent step), and the three loss
+/// signals at each of the three FlightSizes (including one **larger than any cwnd a short sequence can
+/// reach**, so the `flight > cwnd` loss response is actually exercised). The walker only branches on
+/// these, so a sweep over them is exhaustive over the controller's actual decision space.
 fn cc_alphabet(mss: u32) -> Vec<CcEvent> {
     let w = 10 * mss; // ≈ one RFC 6928 initial window — closes a DCTCP/Learned observation window
     vec![
@@ -266,64 +271,79 @@ fn cc_alphabet(mss: u32) -> Vec<CcEvent> {
         CcEvent::Ecn(w, w),
         CcEvent::Rtt(1_000),
         CcEvent::Rtt(200_000),
-        CcEvent::DupAck(Flight::Full),
-        CcEvent::DupAck(Flight::Half),
-        CcEvent::Rto(Flight::Full),
-        CcEvent::Rto(Flight::Half),
-        CcEvent::EnterRecovery(Flight::Full),
-        CcEvent::EnterRecovery(Flight::Half),
+        CcEvent::DupAck(Flight::Small),
+        CcEvent::DupAck(Flight::Window),
+        CcEvent::DupAck(Flight::Large),
+        CcEvent::Rto(Flight::Small),
+        CcEvent::Rto(Flight::Window),
+        CcEvent::Rto(Flight::Large),
+        CcEvent::EnterRecovery(Flight::Small),
+        CcEvent::EnterRecovery(Flight::Window),
+        CcEvent::EnterRecovery(Flight::Large),
     ]
 }
 
 #[inline]
-fn flight_bytes<C: CongestionControl>(c: &C, fl: Flight) -> u32 {
+fn flight_bytes(mss: u32, fl: Flight) -> u32 {
     match fl {
-        Flight::Full => c.cwnd(),
-        Flight::Half => c.cwnd() / 2,
+        Flight::Small => 2 * mss,
+        Flight::Window => 10 * mss,
+        Flight::Large => 40 * mss,
     }
 }
 
-/// Apply one event to the controller, returning whether it was a **loss** signal that actually engaged
-/// the loss response (a 1st/2nd duplicate ACK only counts toward the threshold and is not yet a loss).
-fn apply_cc<C: CongestionControl>(c: &mut C, ev: CcEvent) -> bool {
+/// Apply one event to the controller, returning `Some(flight)` if it was a **loss** signal that actually
+/// engaged the loss response (with the FlightSize it reported), else `None`. A 1st/2nd duplicate ACK only
+/// counts toward the threshold and is not yet a loss, so it returns `None`.
+fn apply_cc<C: CongestionControl>(c: &mut C, ev: CcEvent, mss: u32) -> Option<u32> {
     match ev {
         CcEvent::Ack(a) => {
             c.on_ack(CC_NOW, a);
-            false
+            None
         }
         CcEvent::Ecn(a, m) => {
             c.on_ecn(CC_NOW, a, m);
-            false
+            None
         }
         CcEvent::Rtt(s) => {
             c.on_rtt_sample(s);
-            false
+            None
         }
         CcEvent::DupAck(fl) => {
-            let f = flight_bytes(c, fl);
-            c.on_dup_ack(CC_NOW, f) // true only on the threshold (3rd) dup-ACK
+            let f = flight_bytes(mss, fl);
+            if c.on_dup_ack(CC_NOW, f) {
+                Some(f) // the threshold (3rd) dup-ACK engaged the loss response
+            } else {
+                None
+            }
         }
         CcEvent::Rto(fl) => {
-            let f = flight_bytes(c, fl);
+            let f = flight_bytes(mss, fl);
             c.on_rto(CC_NOW, f);
-            true
+            Some(f)
         }
         CcEvent::EnterRecovery(fl) => {
-            let f = flight_bytes(c, fl);
+            let f = flight_bytes(mss, fl);
             c.enter_recovery(CC_NOW, f);
-            true
+            Some(f)
         }
     }
 }
 
 /// The **safety envelope** a congestion controller must satisfy after every event — the machine-checked
-/// guarantees that make a *synthesised* (evolved) controller trustworthy regardless of its gains:
+/// guarantees that make a *synthesised* (evolved) controller trustworthy regardless of its gains. The
+/// loss clauses take the **FlightSize** the event reported (`loss_flight`), since the RFC 5681 loss
+/// response is defined in terms of the bytes actually in flight, not the (possibly already-cut) `cwnd`:
 ///
 /// 1. **Starvation-freedom** — `cwnd ≥ MSS`: the window never collapses below one segment (a controller
 ///    that drove `cwnd` to 0 would wedge the connection).
-/// 2. **No window growth on loss** — a loss signal never raises `cwnd` above `max(cwnd_before, 2·MSS)`.
-///    (The `2·MSS` floor is the legitimate RFC 5681 lower bound, so a loss may *raise* a sub-2·MSS
-///    window to the floor; what it must never do is *grow* the window as a response to loss.)
+/// 2. **Loss never inflates the window past the pipe** — a loss sets `cwnd ≤ max(FlightSize, 2·MSS)`. A
+///    correct response *cuts* the in-flight bytes (`cwnd ← FlightSize · β`, `β < 1`, RFC 5681 uses
+///    `β = ½`) with the `2·MSS` floor; it must never set `cwnd` *above* what was outstanding. This is
+///    exactly the clause an over-aggressive gain breaks: `md_loss > 1` makes `cwnd = FlightSize · md_loss`
+///    exceed `FlightSize`. (Note `FlightSize` can exceed `cwnd_before`, so this is *not* "no growth on
+///    loss" — a flight-based cut may legitimately raise a previously-collapsed `cwnd`; what it bounds is
+///    inflation past the real pipe.)
 /// 3. **ECN-monotonicity** — an ECN-marked round never grows `cwnd` (it cuts or holds).
 /// 4. **Clean-ACK monotonicity** — a clean ACK of new data never shrinks `cwnd`.
 /// 5. **`ssthresh` floor on loss** — after a loss, `ssthresh ≥ 2·MSS` (RFC 5681).
@@ -333,13 +353,18 @@ fn cc_safety_invariants(
     cwnd: u32,
     ssthresh: u32,
     mss: u32,
-    loss: bool,
+    loss_flight: Option<u32>,
 ) -> Result<(), String> {
     if cwnd < mss {
         return Err(format!("cwnd {cwnd} fell below one MSS {mss}"));
     }
-    if loss && cwnd > cwnd_before.max(2 * mss) {
-        return Err(format!("loss grew cwnd above the 2·MSS floor: {cwnd_before} -> {cwnd} (mss {mss})"));
+    if let Some(flight) = loss_flight {
+        if cwnd > flight.max(2 * mss) {
+            return Err(format!("loss inflated cwnd above the FlightSize: cwnd {cwnd} > max(flight {flight}, 2·MSS {})", 2 * mss));
+        }
+        if ssthresh < 2 * mss {
+            return Err(format!("ssthresh {ssthresh} below the 2·MSS floor {} after loss", 2 * mss));
+        }
     }
     if matches!(ev, CcEvent::Ecn(..)) && cwnd > cwnd_before {
         return Err(format!("an ECN mark grew cwnd: {cwnd_before} -> {cwnd}"));
@@ -347,16 +372,13 @@ fn cc_safety_invariants(
     if matches!(ev, CcEvent::Ack(a) if a > 0) && cwnd < cwnd_before {
         return Err(format!("a clean ACK shrank cwnd: {cwnd_before} -> {cwnd}"));
     }
-    if loss && ssthresh < 2 * mss {
-        return Err(format!("ssthresh {ssthresh} below the 2·MSS floor {} after loss", 2 * mss));
-    }
     Ok(())
 }
 
 /// A predicate the controller sweep evaluates after every event. The production checker passes
 /// [`cc_safety_invariants`]; the negative-control test passes a deliberately-false one to prove the
 /// enumeration apparatus actually surfaces violations (the same teeth-check the scoreboard sweep has).
-type CcInvariant = fn(CcEvent, u32, u32, u32, u32, bool) -> Result<(), String>;
+type CcInvariant = fn(CcEvent, u32, u32, u32, u32, Option<u32>) -> Result<(), String>;
 
 /// Recursively enumerate every event sequence up to `depth` from the controller's current state,
 /// evaluating `inv` after each event. The clone per branch makes it a tree walk over all reachable
@@ -368,8 +390,8 @@ fn explore_cc<C: CongestionControl + Clone>(alphabet: &[CcEvent], inv: CcInvaria
     for &ev in alphabet {
         let mut next = c.clone();
         let cwnd_before = next.cwnd();
-        let loss = apply_cc(&mut next, ev);
-        report.check(inv(ev, cwnd_before, next.cwnd(), next.ssthresh(), mss, loss));
+        let loss_flight = apply_cc(&mut next, ev, mss);
+        report.check(inv(ev, cwnd_before, next.cwnd(), next.ssthresh(), mss, loss_flight));
         explore_cc(alphabet, inv, mss, &next, depth - 1, report);
     }
 }
@@ -398,8 +420,9 @@ pub fn check_controller_safety<C: CongestionControl + Clone>(controller: C, mss:
 /// the bounded event sweep. The grid is not arbitrary: of the five envelope invariants, four hold
 /// *structurally* for **any** genome (the cut operations floor at `MSS` / `2·MSS`, the additive step
 /// floors at 1 byte, and the ECN cut is `clamp(…, 0, ecn_max)` so it can never be negative = growth);
-/// only "no growth on loss" depends on a gene (`md_loss`), and its binding worst case is the **maximum**
-/// `md_loss = 0.95` that the grid includes. So zero violations here is, together with that structural
+/// only "loss never inflates past the FlightSize" depends on a gene — `cwnd = FlightSize · md_loss`, so
+/// it needs `md_loss ≤ 1`, and the binding worst case is the **maximum** `md_loss = 0.95` the grid
+/// includes (sanitisation clamps it there). So zero violations here is, together with that structural
 /// argument, evidence that the *whole* sanitised genome box — everything the CEM search can synthesise —
 /// is safe over this bound: the "evolve **and** prove" guarantee. Returns the aggregate case count and
 /// the first violation, if any.
@@ -531,12 +554,13 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn the_controller_checker_has_teeth_and_proves_sanitize_load_bearing() {
         let mss = 1000u32;
+        // md_loss = 2.0 sets the loss window to FlightSize·2 > FlightSize — inflation past the pipe.
         let pathological = LearnedParams { ai_gain: 1.0, md_loss: 2.0, ecn_a: 0.5, ecn_b: 0.0, ecn_max: 0.5 };
         let unsafe_report = check_controller_safety(Learned::with_raw_params(mss as u16, pathological), mss, 3);
-        assert!(unsafe_report.violations > 0, "an unsanitised md_loss=2 genome must grow cwnd on loss");
+        assert!(unsafe_report.violations > 0, "an unsanitised md_loss=2 genome must inflate cwnd past the FlightSize on loss");
         assert!(
-            unsafe_report.first_violation.as_deref().unwrap_or("").contains("loss grew cwnd"),
-            "the violation is the loss-growth one: {:?}",
+            unsafe_report.first_violation.as_deref().unwrap_or("").contains("loss inflated cwnd"),
+            "the violation is the loss-inflation one: {:?}",
             unsafe_report.first_violation
         );
         // The SAME genome, sanitised (the production path), is safe — sanitize() clamps md_loss ≤ 0.95.
@@ -545,7 +569,7 @@ mod tests {
 
         // Apparatus teeth: a false invariant ("cwnd never exceeds the initial window") is surfaced by the
         // real enumeration on a stock controller (slow start grows past it).
-        fn never_grows(_: CcEvent, _: u32, cwnd: u32, _: u32, mss: u32, _: bool) -> Result<(), String> {
+        fn never_grows(_: CcEvent, _: u32, cwnd: u32, _: u32, mss: u32, _: Option<u32>) -> Result<(), String> {
             if cwnd > initial_window(mss) {
                 Err(format!("cwnd {cwnd} exceeded the initial window"))
             } else {

@@ -642,21 +642,30 @@ which closes the loop with the evolved `Learned` controller (§5.10): learned/RL
 research-grade but undeployable precisely because it is opaque and unsafe — operators can't trust a
 black box not to starve a flow or react perversely. `check_controller_safety` drives a controller
 through *every* event sequence up to depth 4 over a bounded alphabet (`on_ack` / `on_ecn` / `on_dup_ack`
-/ `on_rto` / `enter_recovery` / `on_rtt_sample`, with the loss flight bounded by the live `cwnd` — the
-TCB's real contract), asserting a five-clause **safety envelope** after each event: `cwnd ≥ MSS`
-(starvation-freedom), no window growth on loss above the `2·MSS` floor, an ECN mark never grows `cwnd`,
-a clean ACK never shrinks it, and `ssthresh ≥ 2·MSS` after loss. Reno, DCTCP, Prague, and the baked
-`Learned` genome all satisfy it exhaustively. `check_learned_genome_space` then sweeps the **whole
-sanitised genome grid** — all 243 genomes at each gene's min/mid/max, ~718 K controller states — with
-zero violations; four of the five invariants hold *structurally* for any genome (the cut operations
-floor at `MSS`/`2·MSS`, the additive step floors at 1 byte, and the ECN cut is `clamp(…, 0, ecn_max)` so
-it can never be negative), and the only gene-dependent one (`md_loss`, no-growth-on-loss) is binding at
-the maximum the grid includes — so the **entire family the CEM search can synthesise is bounded-proven
-safe**. The teeth are real: an *unsanitised* `md_loss = 2.0` genome (which sets the loss window to
-`flight·2 = 2·cwnd`) is caught growing `cwnd` on loss, and the same genome through `LearnedParams::
-sanitized` is safe — so the checker proves both the safety property *and* that the sanitiser is
-load-bearing. This is the **"evolve *and* prove"** guarantee: synthesis is confined to a region a
-machine has checked never violates the envelope — the safety assurance learned controllers usually lack.
+/ `on_rto` / `enter_recovery` / `on_rtt_sample`). The loss **FlightSize** is modelled *independently* of
+`cwnd` — as fixed MSS-scaled byte counts, one of them larger than any `cwnd` a short sequence reaches —
+because the live TCB derives `flight = snd_nxt − snd_una` without capping it to the window, so `flight >
+cwnd` is genuinely reachable (a controller cuts `cwnd` mid-flight on an ECN mark or an RTO while the data
+already on the wire stays outstanding). An earlier cut keyed flight off the live `cwnd`; the adversarial
+review proved that under-modelled the stack — it hid exactly those `flight > cwnd` loss responses — and
+the fix models flight independently so the proof holds over the *real* contract. The five-clause **safety
+envelope** asserted after each event: `cwnd ≥ MSS` (starvation-freedom); a loss never inflates `cwnd`
+above the FlightSize (`cwnd ≤ max(FlightSize, 2·MSS)` — the RFC 5681 response *cuts* the in-flight bytes
+by `β < 1`, it must never set `cwnd` above what was outstanding; note `FlightSize` can exceed `cwnd`, so
+this is *not* "no growth on loss" but "no inflation past the pipe"); an ECN mark never grows `cwnd`; a
+clean ACK never shrinks it; `ssthresh ≥ 2·MSS` after loss. Reno, DCTCP, Prague, and the baked `Learned`
+genome all satisfy it exhaustively. `check_learned_genome_space` then sweeps the **sanitised genome
+grid** — all 243 genomes at each gene's min/mid/max, ~1.3 M controller states — with zero violations;
+four of the five invariants hold *structurally* for any genome (the cuts floor at `MSS`/`2·MSS`, the
+additive step floors at 1 byte, and the ECN cut is `clamp(…, 0, ecn_max)` so it can never be negative),
+and the only gene-dependent one — loss-cut `= FlightSize · md_loss`, needing `md_loss ≤ 1` — is binding
+at the maximum `md_loss = 0.95` the grid includes; so the **whole continuous sanitised family** is safe
+by that argument, not just the grid points. The teeth are real: an *unsanitised* `md_loss = 2.0` genome
+(which sets the loss window to `FlightSize·2 > FlightSize`) is caught inflating `cwnd` past the pipe on
+loss, and the same genome through `LearnedParams::sanitized` is safe — so the checker proves both the
+safety property *and* that the sanitiser is load-bearing. This is the **"evolve *and* prove"** guarantee:
+synthesis is confined to a region a machine has checked never violates the envelope — the safety
+assurance learned controllers usually lack.
 
 ## 6. End-to-end data flow (one `curl` request)
 
@@ -706,7 +715,7 @@ machine has checked never violates the envelope — the safety assurance learned
 | M16 | **AccECN (RFC 9768)** — exact CE feedback via the 3-bit **ACE counter** (AE·CWR·ECE = `r.cep mod 8`), replacing the one-bit ECE-echo run-boundary approximation; the wire now carries the **AE bit** (byte-12 bit-0, old NS) | the sender recovers the *exact* per-packet CE count from the wrapping ACE delta; a delayed ACK coalescing a CE + non-CE segment conveys exactly one mark (no run-boundary over-count); DCTCP/`Learned` get exact `marked`, holding a 642 µs queue at comparable goodput |
 | M17 | **TCP Prague** (`Cc::Prague`) — the L4S scalable controller: DCTCP's proportional ECN response + an **RTT-independent** additive increase (per-RTT step scaled by `srtt / 25 ms`) + a classic Reno loss fallback; fed RTT via a no-op-default `on_rtt_sample` hook | holds a sub-millisecond queue end-to-end on the CE-marking bottleneck like DCTCP; growth *per second* is constant across RTT (unit-proven), the lever for fair L4S coexistence |
 | M18 | **Dual-queue L4S bottleneck** (`DualQueue` / `run_dualqueue`) — the dualPI2 structure: a multi-flow shared link, fair per-class round-robin scheduler, ECN-classified shallow (CE-marked) L4S queue vs deep (tail-drop) Classic queue | a Prague (L4S) + Reno (classic) pair coexist — both complete, neither starved — and the L4S flow holds a **sub-ms** queue while the classic flow bloats to **~90 ms** on the same link (latency isolation); coupled-PI marking for robust throughput fairness is the noted refinement |
-| M19 | **Provably-safe synthesised congestion control** (`bmc::check_controller_safety` / `check_learned_genome_space`) — turn the bounded model checker on the controllers: a 5-clause safety envelope (starvation-freedom, no-growth-on-loss, ECN/clean-ACK monotonicity, `ssthresh` floor) checked over every event sequence | Reno/DCTCP/Prague + the evolved genome all satisfy it exhaustively, and the **entire sanitised genome family** (~718 K states) is bounded-proven safe — the "evolve *and* prove" guarantee; an unsanitised `md_loss=2` genome is caught growing `cwnd` on loss, proving the sanitiser is load-bearing |
+| M19 | **Provably-safe synthesised congestion control** (`bmc::check_controller_safety` / `check_learned_genome_space`) — turn the bounded model checker on the controllers: a 5-clause safety envelope (starvation-freedom, loss never inflates `cwnd` past the FlightSize, ECN/clean-ACK monotonicity, `ssthresh` floor) over every event sequence, with FlightSize modelled independently of `cwnd` (`flight > cwnd` is reachable) | Reno/DCTCP/Prague + the evolved genome all satisfy it exhaustively, and the **whole sanitised genome family** (243-genome grid, ~1.3 M states, + a structural argument to the continuum) is bounded-proven safe — "evolve *and* prove"; an unsanitised `md_loss=2` genome is caught inflating `cwnd` past the pipe, proving the sanitiser is load-bearing; the adversarial review caught and fixed the original flight-model under-approximation |
 
 ## 9. Environment
 

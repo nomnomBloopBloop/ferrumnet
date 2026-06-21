@@ -411,14 +411,21 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   turned on the **controllers**, which closes the loop with the evolved `learned` one: learned/RL
   congestion control is undeployable precisely because it's an opaque black box no operator trusts not to
   misbehave. So a controller is driven through *every* event sequence (acks / ECN marks / losses / RTT
-  samples, with the loss flight bounded by the live window — the TCB's real contract) and a five-clause
-  **safety envelope** is asserted after each: never starve the window (`cwnd ≥ MSS`), never grow it on
-  loss, never grow it on an ECN mark, never shrink it on a clean ACK, keep `ssthresh ≥ 2·MSS` after loss.
-  Reno/DCTCP/Prague and the baked genome all satisfy it exhaustively — and so does the **entire sanitised
-  genome family** the evolutionary search can ever produce (~718 K controller states swept). An
-  *unsanitised* pathological genome is caught growing the window on loss, proving the safety clamp is
-  load-bearing. This is **"evolve *and* prove"**: a learned controller confined, by machine-checked
-  construction, to a region that can't misbehave — the safety guarantee learned controllers usually lack.
+  samples, the loss FlightSize modelled independently of `cwnd` — including larger than it, as the real
+  stack reaches when `cwnd` is cut mid-flight) and a five-clause **safety envelope** is asserted after
+  each: never starve the window (`cwnd ≥ MSS`); a loss never inflates `cwnd` above the FlightSize (it
+  *cuts* the in-flight bytes, RFC 5681 — `md_loss < 1`); an ECN mark never grows `cwnd`; a clean ACK never
+  shrinks it; `ssthresh ≥ 2·MSS` after loss. Reno/DCTCP/Prague and the baked genome all satisfy it
+  exhaustively, and so does the **sanitised genome grid** — all 243 genomes at each gene's min/mid/max
+  (~1.3 M controller states). Four of the five clauses hold *structurally* for any genome (the cuts floor
+  at MSS/2·MSS, the additive step floors at 1 byte, the ECN cut is `clamp(·, 0, ecn_max)`), and the only
+  gene-dependent one binds at the `md_loss` max the grid includes — so the **whole continuous sanitised
+  family** is safe by that argument. An *unsanitised* `md_loss = 2` genome is caught inflating `cwnd` past
+  the FlightSize on loss, proving the safety clamp is load-bearing. This is **"evolve *and* prove"**: a
+  learned controller confined, by machine-checked construction, to a region that can't *violate the safety
+  envelope* — the assurance learned controllers usually lack. (An adversarial review caught the first cut
+  of this modelling the FlightSize off the live `cwnd`, which hid exactly the `flight > cwnd` loss
+  responses; the fix models it independently and the proof now holds over the real contract.)
 - **L4S — ECN, exact feedback, the scalable controller, and the dual-queue all ship; the coupling is the
   last refinement.** **DCTCP** (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE
   counter for *exact* per-packet CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent**
