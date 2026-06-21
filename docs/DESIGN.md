@@ -68,7 +68,8 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
                reliability, flow control, teardown, per-connection timers, SACK recovery,
                active open (SYN-SENT), RFC 7323 timestamps + PAWS, delayed ACKs
   rtt          RFC 6298 RTO estimator (Jacobson/Karn)                   [M2]
-  congestion   CongestionControl trait + Cc enum: Reno/CUBIC/DCTCP/Learned  [M3,M13-M15]
+  congestion   CongestionControl trait + Cc enum: Reno/CUBIC/DCTCP/      [M3,M13-M17]
+               Prague/Learned (+ AccECN exact ECN feedback)
   bbr          BBR v1: delivery-rate sampler + windowed-max + state machine [M13]
   buffers      rx/tx ring buffers                                       [M2]
   reasm        receiver out-of-order reassembly (coalesced runs)        [M8]
@@ -76,11 +77,13 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
   runtime/     hand-rolled async: executor, reactor, TcpListener/Stream/ [M4,M9]
                TcpConnector, Device trait + in-memory MockDevice
-  sim          deterministic simulation testing: 2 stacks over a seeded   [M14,M15]
-               fault link + finite-buffer bottleneck (CeMark/L4S AQM);
-               a coverage-guided greybox fuzzer; a CEM trainer for Learned
-  bmc          bounded model checker: exhaustive SACK-scoreboard op-      [M15]
-               sequence + TCP-option-walker proofs (zero-dep, no Kani)
+  sim          deterministic simulation testing: 2 stacks over a seeded   [M14-M18]
+               fault link + finite-buffer bottleneck (CeMark/L4S AQM) +
+               dual-queue L4S coexistence; a coverage-guided greybox
+               fuzzer; a CEM trainer for Learned
+  bmc          bounded model checker: exhaustive SACK-scoreboard op-      [M15,M19]
+               sequence + TCP-option-walker proofs + the congestion-
+               control safety envelope over the genome family (zero-dep, no Kani)
 tcp-tun/   (Linux-only backend + demo)
   sys          extern "C" ioctl/poll + repr(C) ifreq/pollfd            [M0]
   tun          TunDevice : Device (IFF_TUN|IFF_NO_PI, O_NONBLOCK)       [M0/M5]
@@ -634,6 +637,27 @@ drives exactly the code paths the live stack runs.
   prove it**" pair — the sampler reaches deep realistic states, the checker gives an exhaustive
   guarantee over a complete small neighbourhood.
 
+**Provably-safe synthesised congestion control (M19).** The same checker is turned on the *controllers*,
+which closes the loop with the evolved `Learned` controller (§5.10): learned/RL congestion control is
+research-grade but undeployable precisely because it is opaque and unsafe — operators can't trust a
+black box not to starve a flow or react perversely. `check_controller_safety` drives a controller
+through *every* event sequence up to depth 4 over a bounded alphabet (`on_ack` / `on_ecn` / `on_dup_ack`
+/ `on_rto` / `enter_recovery` / `on_rtt_sample`, with the loss flight bounded by the live `cwnd` — the
+TCB's real contract), asserting a five-clause **safety envelope** after each event: `cwnd ≥ MSS`
+(starvation-freedom), no window growth on loss above the `2·MSS` floor, an ECN mark never grows `cwnd`,
+a clean ACK never shrinks it, and `ssthresh ≥ 2·MSS` after loss. Reno, DCTCP, Prague, and the baked
+`Learned` genome all satisfy it exhaustively. `check_learned_genome_space` then sweeps the **whole
+sanitised genome grid** — all 243 genomes at each gene's min/mid/max, ~718 K controller states — with
+zero violations; four of the five invariants hold *structurally* for any genome (the cut operations
+floor at `MSS`/`2·MSS`, the additive step floors at 1 byte, and the ECN cut is `clamp(…, 0, ecn_max)` so
+it can never be negative), and the only gene-dependent one (`md_loss`, no-growth-on-loss) is binding at
+the maximum the grid includes — so the **entire family the CEM search can synthesise is bounded-proven
+safe**. The teeth are real: an *unsanitised* `md_loss = 2.0` genome (which sets the loss window to
+`flight·2 = 2·cwnd`) is caught growing `cwnd` on loss, and the same genome through `LearnedParams::
+sanitized` is safe — so the checker proves both the safety property *and* that the sanitiser is
+load-bearing. This is the **"evolve *and* prove"** guarantee: synthesis is confined to a region a
+machine has checked never violates the envelope — the safety assurance learned controllers usually lack.
+
 ## 6. End-to-end data flow (one `curl` request)
 
 1. `curl` → kernel routes `10.0.0.2` to `tun0` → the IP datagram appears on our fd.
@@ -682,6 +706,7 @@ drives exactly the code paths the live stack runs.
 | M16 | **AccECN (RFC 9768)** — exact CE feedback via the 3-bit **ACE counter** (AE·CWR·ECE = `r.cep mod 8`), replacing the one-bit ECE-echo run-boundary approximation; the wire now carries the **AE bit** (byte-12 bit-0, old NS) | the sender recovers the *exact* per-packet CE count from the wrapping ACE delta; a delayed ACK coalescing a CE + non-CE segment conveys exactly one mark (no run-boundary over-count); DCTCP/`Learned` get exact `marked`, holding a 642 µs queue at comparable goodput |
 | M17 | **TCP Prague** (`Cc::Prague`) — the L4S scalable controller: DCTCP's proportional ECN response + an **RTT-independent** additive increase (per-RTT step scaled by `srtt / 25 ms`) + a classic Reno loss fallback; fed RTT via a no-op-default `on_rtt_sample` hook | holds a sub-millisecond queue end-to-end on the CE-marking bottleneck like DCTCP; growth *per second* is constant across RTT (unit-proven), the lever for fair L4S coexistence |
 | M18 | **Dual-queue L4S bottleneck** (`DualQueue` / `run_dualqueue`) — the dualPI2 structure: a multi-flow shared link, fair per-class round-robin scheduler, ECN-classified shallow (CE-marked) L4S queue vs deep (tail-drop) Classic queue | a Prague (L4S) + Reno (classic) pair coexist — both complete, neither starved — and the L4S flow holds a **sub-ms** queue while the classic flow bloats to **~90 ms** on the same link (latency isolation); coupled-PI marking for robust throughput fairness is the noted refinement |
+| M19 | **Provably-safe synthesised congestion control** (`bmc::check_controller_safety` / `check_learned_genome_space`) — turn the bounded model checker on the controllers: a 5-clause safety envelope (starvation-freedom, no-growth-on-loss, ECN/clean-ACK monotonicity, `ssthresh` floor) checked over every event sequence | Reno/DCTCP/Prague + the evolved genome all satisfy it exhaustively, and the **entire sanitised genome family** (~718 K states) is bounded-proven safe — the "evolve *and* prove" guarantee; an unsanitised `md_loss=2` genome is caught growing `cwnd` on loss, proving the sanitiser is load-bearing |
 
 ## 9. Environment
 

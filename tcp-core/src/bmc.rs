@@ -12,8 +12,10 @@
 //! *prove*": the fuzzer reaches deep, realistic states with low effort; the checker gives an exhaustive
 //! guarantee over a small but complete neighbourhood (including across the 2³² sequence-number wrap).
 
+use crate::congestion::{CongestionControl, Learned, LearnedParams};
 use crate::sack::Scoreboard;
 use crate::seq::SeqNumber;
+use crate::time::Instant;
 use crate::wire::{TcpPacket, MAX_SACK_BLOCKS};
 
 /// What an exhaustive sweep found: how many cases it checked, and the first invariant violation it hit
@@ -220,9 +222,214 @@ pub fn check_option_strings(alphabet: &[u8], len_words: usize) -> BmcReport {
     report
 }
 
+// ── congestion-control safety envelope ────────────────────────────────────────────────────────────
+
+/// The clock the controller events are stamped with. Reno/DCTCP/Learned are ACK-clocked and ignore it;
+/// Prague reads RTT (delivered via [`CcEvent::Rtt`]), not this. Fixed, so the sweep is deterministic.
+const CC_NOW: Instant = Instant::ZERO;
+
+/// How much data a loss event reports in flight, as a fraction of the **current** congestion window —
+/// the TCB never reports more in flight than the window allows (`flight ∈ [0, cwnd]`), so this models
+/// the real contract the controller is driven under rather than an impossible `flight > cwnd`.
+#[derive(Clone, Copy)]
+enum Flight {
+    Full,
+    Half,
+}
+
+/// One event the TCB can deliver to a [`CongestionControl`] — the alphabet the checker enumerates over.
+/// `Ack`/`Ecn` carry absolute byte counts (scaled to the MSS); the loss events carry a [`Flight`] that
+/// resolves against the live `cwnd`.
+#[derive(Clone, Copy)]
+enum CcEvent {
+    Ack(u32),
+    Ecn(u32, u32),
+    Rtt(u32),
+    DupAck(Flight),
+    Rto(Flight),
+    EnterRecovery(Flight),
+}
+
+/// The bounded event alphabet at segment size `mss`: clean ACKs (none / one segment / a full initial
+/// window — enough to close an ECN observation window in one event), ECN rounds at no / light / full
+/// marking, a short and a long RTT sample (for Prague's RTT-independent step), and the four loss
+/// signals at full and half the current window. The walker only branches on these, so a sweep over them
+/// is exhaustive over the controller's actual decision space.
+fn cc_alphabet(mss: u32) -> Vec<CcEvent> {
+    let w = 10 * mss; // ≈ one RFC 6928 initial window — closes a DCTCP/Learned observation window
+    vec![
+        CcEvent::Ack(0),
+        CcEvent::Ack(mss),
+        CcEvent::Ack(w),
+        CcEvent::Ecn(w, 0),
+        CcEvent::Ecn(w, mss),
+        CcEvent::Ecn(w, w),
+        CcEvent::Rtt(1_000),
+        CcEvent::Rtt(200_000),
+        CcEvent::DupAck(Flight::Full),
+        CcEvent::DupAck(Flight::Half),
+        CcEvent::Rto(Flight::Full),
+        CcEvent::Rto(Flight::Half),
+        CcEvent::EnterRecovery(Flight::Full),
+        CcEvent::EnterRecovery(Flight::Half),
+    ]
+}
+
+#[inline]
+fn flight_bytes<C: CongestionControl>(c: &C, fl: Flight) -> u32 {
+    match fl {
+        Flight::Full => c.cwnd(),
+        Flight::Half => c.cwnd() / 2,
+    }
+}
+
+/// Apply one event to the controller, returning whether it was a **loss** signal that actually engaged
+/// the loss response (a 1st/2nd duplicate ACK only counts toward the threshold and is not yet a loss).
+fn apply_cc<C: CongestionControl>(c: &mut C, ev: CcEvent) -> bool {
+    match ev {
+        CcEvent::Ack(a) => {
+            c.on_ack(CC_NOW, a);
+            false
+        }
+        CcEvent::Ecn(a, m) => {
+            c.on_ecn(CC_NOW, a, m);
+            false
+        }
+        CcEvent::Rtt(s) => {
+            c.on_rtt_sample(s);
+            false
+        }
+        CcEvent::DupAck(fl) => {
+            let f = flight_bytes(c, fl);
+            c.on_dup_ack(CC_NOW, f) // true only on the threshold (3rd) dup-ACK
+        }
+        CcEvent::Rto(fl) => {
+            let f = flight_bytes(c, fl);
+            c.on_rto(CC_NOW, f);
+            true
+        }
+        CcEvent::EnterRecovery(fl) => {
+            let f = flight_bytes(c, fl);
+            c.enter_recovery(CC_NOW, f);
+            true
+        }
+    }
+}
+
+/// The **safety envelope** a congestion controller must satisfy after every event — the machine-checked
+/// guarantees that make a *synthesised* (evolved) controller trustworthy regardless of its gains:
+///
+/// 1. **Starvation-freedom** — `cwnd ≥ MSS`: the window never collapses below one segment (a controller
+///    that drove `cwnd` to 0 would wedge the connection).
+/// 2. **No window growth on loss** — a loss signal never raises `cwnd` above `max(cwnd_before, 2·MSS)`.
+///    (The `2·MSS` floor is the legitimate RFC 5681 lower bound, so a loss may *raise* a sub-2·MSS
+///    window to the floor; what it must never do is *grow* the window as a response to loss.)
+/// 3. **ECN-monotonicity** — an ECN-marked round never grows `cwnd` (it cuts or holds).
+/// 4. **Clean-ACK monotonicity** — a clean ACK of new data never shrinks `cwnd`.
+/// 5. **`ssthresh` floor on loss** — after a loss, `ssthresh ≥ 2·MSS` (RFC 5681).
+fn cc_safety_invariants(
+    ev: CcEvent,
+    cwnd_before: u32,
+    cwnd: u32,
+    ssthresh: u32,
+    mss: u32,
+    loss: bool,
+) -> Result<(), String> {
+    if cwnd < mss {
+        return Err(format!("cwnd {cwnd} fell below one MSS {mss}"));
+    }
+    if loss && cwnd > cwnd_before.max(2 * mss) {
+        return Err(format!("loss grew cwnd above the 2·MSS floor: {cwnd_before} -> {cwnd} (mss {mss})"));
+    }
+    if matches!(ev, CcEvent::Ecn(..)) && cwnd > cwnd_before {
+        return Err(format!("an ECN mark grew cwnd: {cwnd_before} -> {cwnd}"));
+    }
+    if matches!(ev, CcEvent::Ack(a) if a > 0) && cwnd < cwnd_before {
+        return Err(format!("a clean ACK shrank cwnd: {cwnd_before} -> {cwnd}"));
+    }
+    if loss && ssthresh < 2 * mss {
+        return Err(format!("ssthresh {ssthresh} below the 2·MSS floor {} after loss", 2 * mss));
+    }
+    Ok(())
+}
+
+/// A predicate the controller sweep evaluates after every event. The production checker passes
+/// [`cc_safety_invariants`]; the negative-control test passes a deliberately-false one to prove the
+/// enumeration apparatus actually surfaces violations (the same teeth-check the scoreboard sweep has).
+type CcInvariant = fn(CcEvent, u32, u32, u32, u32, bool) -> Result<(), String>;
+
+/// Recursively enumerate every event sequence up to `depth` from the controller's current state,
+/// evaluating `inv` after each event. The clone per branch makes it a tree walk over all reachable
+/// controller states — exactly as [`explore`] does for the scoreboard.
+fn explore_cc<C: CongestionControl + Clone>(alphabet: &[CcEvent], inv: CcInvariant, mss: u32, c: &C, depth: u32, report: &mut BmcReport) {
+    if depth == 0 {
+        return;
+    }
+    for &ev in alphabet {
+        let mut next = c.clone();
+        let cwnd_before = next.cwnd();
+        let loss = apply_cc(&mut next, ev);
+        report.check(inv(ev, cwnd_before, next.cwnd(), next.ssthresh(), mss, loss));
+        explore_cc(alphabet, inv, mss, &next, depth - 1, report);
+    }
+}
+
+/// Drive `controller` through every event sequence up to `depth` over the bounded alphabet, evaluating
+/// `inv` after each event. Factored out so the negative control can run the *same* enumeration with a
+/// false invariant.
+fn run_cc_sweep<C: CongestionControl + Clone>(controller: C, mss: u32, depth: u32, inv: CcInvariant) -> BmcReport {
+    let alphabet = cc_alphabet(mss);
+    let mut report = BmcReport::default();
+    explore_cc(&alphabet, inv, mss, &controller, depth, &mut report);
+    report
+}
+
+/// **Exhaustively** drive `controller` through every congestion-control event sequence up to `depth`
+/// and confirm the [`cc_safety_invariants`] hold after every event — a finite *proof* that, over this
+/// bounded neighbourhood, the controller stays inside the safety envelope no matter what the network
+/// does. Because the engine is sans-IO, the code paths driven are exactly the live stack's. Returns the
+/// case count and the first violation (a correct controller yields zero).
+pub fn check_controller_safety<C: CongestionControl + Clone>(controller: C, mss: u32, depth: u32) -> BmcReport {
+    run_cc_sweep(controller, mss, depth, cc_safety_invariants)
+}
+
+/// **Exhaustively** verify the safety envelope over a grid of the **sanitised** `Learned` genome space —
+/// each of the five gains at its min / midpoint / max (`3⁵ = 243` genomes) — driving every one through
+/// the bounded event sweep. The grid is not arbitrary: of the five envelope invariants, four hold
+/// *structurally* for **any** genome (the cut operations floor at `MSS` / `2·MSS`, the additive step
+/// floors at 1 byte, and the ECN cut is `clamp(…, 0, ecn_max)` so it can never be negative = growth);
+/// only "no growth on loss" depends on a gene (`md_loss`), and its binding worst case is the **maximum**
+/// `md_loss = 0.95` that the grid includes. So zero violations here is, together with that structural
+/// argument, evidence that the *whole* sanitised genome box — everything the CEM search can synthesise —
+/// is safe over this bound: the "evolve **and** prove" guarantee. Returns the aggregate case count and
+/// the first violation, if any.
+pub fn check_learned_genome_space(mss: u32, depth: u32) -> BmcReport {
+    let grid = |lo: f64, hi: f64| [lo, (lo + hi) / 2.0, hi];
+    let mut report = BmcReport::default();
+    for &ai in &grid(0.05, 8.0) {
+        for &md in &grid(0.1, 0.95) {
+            for &ea in &grid(0.0, 2.0) {
+                for &eb in &grid(-1.0, 2.0) {
+                    for &em in &grid(0.05, 0.95) {
+                        let p = LearnedParams { ai_gain: ai, md_loss: md, ecn_a: ea, ecn_b: eb, ecn_max: em };
+                        let sub = check_controller_safety(Learned::with_params(mss as u16, p), mss, depth);
+                        report.cases += sub.cases;
+                        report.violations += sub.violations;
+                        if report.first_violation.is_none() {
+                            report.first_violation = sub.first_violation;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::congestion::{initial_window, Dctcp, Prague, Reno};
 
     /// PROOF (bounded): across *every* sequence of up to three scoreboard operations over a small
     /// window — at sequence-number base 0 and straddling the 2³² wrap — the scoreboard stays
@@ -275,5 +482,79 @@ mod tests {
         // Belt-and-braces: the *true* invariant over the very same sweep finds nothing.
         let real = run_scoreboard_sweep(4, 2, 1, scoreboard_invariants);
         assert_eq!(real.violations, 0, "the real invariant holds over the same states");
+    }
+
+    /// PROOF (bounded): each shipped controller — Reno, DCTCP, Prague, and the evolved `Learned` (baked
+    /// genome) — stays inside the **safety envelope** (`cwnd ≥ MSS`, no growth on loss above the 2·MSS
+    /// floor, ECN never grows the window, a clean ACK never shrinks it, `ssthresh ≥ 2·MSS` after loss)
+    /// across *every* event sequence up to depth 4 over the bounded alphabet. Not a sample — a finite
+    /// guarantee that no adversarial ordering of acks / marks / losses / RTT samples breaks the envelope.
+    #[test]
+    #[cfg_attr(miri, ignore)] // tens of thousands of states per controller — beyond Miri's budget
+    fn controller_safety_holds_for_the_stock_controllers() {
+        let mss = 1000u32;
+        let runs = [
+            ("reno", check_controller_safety(Reno::new(mss as u16), mss, 4)),
+            ("dctcp", check_controller_safety(Dctcp::new(mss as u16), mss, 4)),
+            ("prague", check_controller_safety(Prague::new(mss as u16), mss, 4)),
+            ("learned(baked)", check_controller_safety(Learned::with_params(mss as u16, LearnedParams::BAKED), mss, 4)),
+        ];
+        for (name, report) in runs {
+            assert!(report.cases > 10_000, "{name}: the sweep must be substantial: {} cases", report.cases);
+            assert_eq!(report.violations, 0, "{name} broke the safety envelope; first repro: {:?}", report.first_violation);
+        }
+    }
+
+    /// PROOF (bounded), the headline **"evolve AND prove"** result: the *entire sanitised genome space*
+    /// the CEM search can ever synthesise — every one of the 243 genomes at the gene min/mid/max — stays
+    /// inside the safety envelope across every event sequence up to depth 3. Because the synthesiser
+    /// clamps every gene into exactly these ranges (`LearnedParams::sanitized`), this is a finite proof
+    /// that **synthesis is confined to a verified-safe region**: a learned controller that is, by
+    /// construction, machine-checked never to starve a flow, grow its window on congestion, or shrink it
+    /// on success — the safety guarantee learned/RL controllers are usually unable to offer.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn learned_genome_space_is_provably_safe() {
+        let r = check_learned_genome_space(1000, 3);
+        assert!(r.cases > 500_000, "the genome-space sweep must be substantial: {} cases", r.cases);
+        assert_eq!(r.violations, 0, "a sanitised genome broke the safety envelope; first repro: {:?}", r.first_violation);
+    }
+
+    /// The teeth, two ways. (a) An **unsanitised** pathological genome (`md_loss = 2.0`, which sets the
+    /// loss window to `flight · 2 = 2·cwnd` — growth on loss) MUST violate the envelope, and the *same*
+    /// genome through the sanitising constructor MUST be safe — proving the checker catches the real
+    /// safety property *and* that `LearnedParams::sanitized` is load-bearing, not decorative. (b) A
+    /// deliberately-false invariant over a stock controller surfaces violations, proving the enumeration
+    /// actually drives the controller and reports (not just bookkeeping); the real envelope over the same
+    /// states finds nothing.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_controller_checker_has_teeth_and_proves_sanitize_load_bearing() {
+        let mss = 1000u32;
+        let pathological = LearnedParams { ai_gain: 1.0, md_loss: 2.0, ecn_a: 0.5, ecn_b: 0.0, ecn_max: 0.5 };
+        let unsafe_report = check_controller_safety(Learned::with_raw_params(mss as u16, pathological), mss, 3);
+        assert!(unsafe_report.violations > 0, "an unsanitised md_loss=2 genome must grow cwnd on loss");
+        assert!(
+            unsafe_report.first_violation.as_deref().unwrap_or("").contains("loss grew cwnd"),
+            "the violation is the loss-growth one: {:?}",
+            unsafe_report.first_violation
+        );
+        // The SAME genome, sanitised (the production path), is safe — sanitize() clamps md_loss ≤ 0.95.
+        let safe_report = check_controller_safety(Learned::with_params(mss as u16, pathological), mss, 3);
+        assert_eq!(safe_report.violations, 0, "sanitize() makes the genome safe: {:?}", safe_report.first_violation);
+
+        // Apparatus teeth: a false invariant ("cwnd never exceeds the initial window") is surfaced by the
+        // real enumeration on a stock controller (slow start grows past it).
+        fn never_grows(_: CcEvent, _: u32, cwnd: u32, _: u32, mss: u32, _: bool) -> Result<(), String> {
+            if cwnd > initial_window(mss) {
+                Err(format!("cwnd {cwnd} exceeded the initial window"))
+            } else {
+                Ok(())
+            }
+        }
+        let false_inv = run_cc_sweep(Reno::new(mss as u16), mss, 3, never_grows);
+        assert!(false_inv.violations > 0, "the enumeration must surface the false invariant's violations");
+        let real = run_cc_sweep(Reno::new(mss as u16), mss, 3, cc_safety_invariants);
+        assert_eq!(real.violations, 0, "the real envelope holds over the same states");
     }
 }

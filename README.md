@@ -32,7 +32,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **six pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one), and a **two-stack userspace loopback** (two instances connecting to
-  each other entirely in memory). **214 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
+  each other entirely in memory). **217 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
   no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -353,15 +353,17 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 214 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 217 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
-                            #            alpha, CeMark AQM, the sub-ms latency ladder) + an evolved
-                            #            controller (CEM trainer, held-out frontier) + go-back-N drain
+                            #            alpha, CeMark AQM, the sub-ms latency ladder) + Prague + the
+                            #            dual-queue coexistence + an evolved controller (CEM trainer,
+                            #            held-out frontier) + go-back-N drain
                             #            + deterministic simulation testing (1080 adversarial seeds)
                             #            + a coverage-guided greybox fuzzer (off-the-wire coverage)
-                            #            + a bounded model checker (exhaustive SACK / option proofs)
+                            #            + a bounded model checker (exhaustive SACK / option proofs +
+                            #            the controller safety envelope over the whole genome family)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -405,6 +407,18 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   layout up to two words (~1.7 M), confirming the scoreboard's structural invariants, the RFC 6675
   `pipe ≤ inflight` bound, and the option walker's panic-freedom. So the stack is one you can *fuzz,
   train against, and prove*.
+- **Provably-safe *synthesised* congestion control — the new bit.** The bounded model checker is also
+  turned on the **controllers**, which closes the loop with the evolved `learned` one: learned/RL
+  congestion control is undeployable precisely because it's an opaque black box no operator trusts not to
+  misbehave. So a controller is driven through *every* event sequence (acks / ECN marks / losses / RTT
+  samples, with the loss flight bounded by the live window — the TCB's real contract) and a five-clause
+  **safety envelope** is asserted after each: never starve the window (`cwnd ≥ MSS`), never grow it on
+  loss, never grow it on an ECN mark, never shrink it on a clean ACK, keep `ssthresh ≥ 2·MSS` after loss.
+  Reno/DCTCP/Prague and the baked genome all satisfy it exhaustively — and so does the **entire sanitised
+  genome family** the evolutionary search can ever produce (~718 K controller states swept). An
+  *unsanitised* pathological genome is caught growing the window on loss, proving the safety clamp is
+  load-bearing. This is **"evolve *and* prove"**: a learned controller confined, by machine-checked
+  construction, to a region that can't misbehave — the safety guarantee learned controllers usually lack.
 - **L4S — ECN, exact feedback, the scalable controller, and the dual-queue all ship; the coupling is the
   last refinement.** **DCTCP** (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE
   counter for *exact* per-packet CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent**

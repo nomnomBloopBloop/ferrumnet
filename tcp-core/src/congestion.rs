@@ -146,6 +146,7 @@ pub trait CongestionControl {
     fn on_rtt_sample(&mut self, _srtt_us: u32) {}
 }
 
+#[derive(Clone)]
 pub struct Reno {
     cwnd: u32,
     ssthresh: u32,
@@ -480,6 +481,7 @@ const DCTCP_G: f64 = 1.0 / 16.0;
 ///
 /// Everything is in **bytes** at the boundary; `α` is the only `f64`, updated with `+ − × ÷` alone
 /// (no transcendental intrinsics), so the controller is deterministic and Miri-clean like CUBIC/BBR.
+#[derive(Clone)]
 pub struct Dctcp {
     cwnd: u32,
     ssthresh: u32,
@@ -640,6 +642,7 @@ const PRAGUE_RTT_REF_US: f64 = 25_000.0;
 /// (dualPI2) an L4S Prague flow and a classic Reno flow get fair shares. `α` and the RTT scale are the
 /// only `f64`s, updated with `+ − × ÷`/comparisons alone (no transcendental intrinsics), so it stays
 /// deterministic and Miri-clean like the others.
+#[derive(Clone)]
 pub struct Prague {
     cwnd: u32,
     ssthresh: u32,
@@ -893,6 +896,7 @@ pub(crate) fn current_learned_params() -> LearnedParams {
 /// fixed and contains Reno and DCTCP as special genomes, which keeps *every* genome a stable controller;
 /// only the gains move. Everything is `+ − × ÷` and comparisons (no transcendental intrinsics), so it
 /// stays deterministic and Miri-clean.
+#[derive(Clone)]
 pub struct Learned {
     cwnd: u32,
     ssthresh: u32,
@@ -913,6 +917,14 @@ impl Learned {
     }
 
     pub fn with_params(mss: u16, p: LearnedParams) -> Self {
+        Learned::with_raw_params(mss, p.sanitized())
+    }
+
+    /// Build a `Learned` from a genome **without** [`LearnedParams::sanitized`] clamping it. The
+    /// production constructors always sanitise; this exists only so the bounded safety checker
+    /// ([`crate::bmc`]) can drive a deliberately-pathological *unsanitised* genome and prove the
+    /// safety envelope is violated — i.e. that `sanitized()` is load-bearing, not decorative.
+    pub(crate) fn with_raw_params(mss: u16, p: LearnedParams) -> Self {
         let mss = mss as u32;
         Learned {
             cwnd: initial_window(mss),
@@ -920,7 +932,7 @@ impl Learned {
             mss,
             ca_acc: 0,
             dup_acks: 0,
-            p: p.sanitized(),
+            p,
             alpha: 1.0,
             acked_in_window: 0,
             marked_in_window: 0,
