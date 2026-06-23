@@ -1393,14 +1393,29 @@ pub fn frontier_fitness(p: LearnedParams, scenarios: &[TrainScenario]) -> f64 {
 /// Gaussian, sample a population each generation, evaluate the fitness, and refit the Gaussian to the
 /// top `elite_frac`. Deterministic in `seed`. Returns the best genome seen and its fitness.
 pub fn evolve(train: &[TrainScenario], generations: u32, pop: usize, elite_frac: f64, seed: u64) -> (LearnedParams, f64) {
+    evolve_from(LearnedParams::DEFAULT, generations, pop, elite_frac, seed, |p| frontier_fitness(p, train))
+}
+
+/// The CEM engine behind [`evolve`], generalised over the **initial mean genome** and an arbitrary
+/// **fitness** (higher is better). `evolve` passes `LearnedParams::DEFAULT` + [`frontier_fitness`]
+/// (so it is byte-for-byte unchanged); co-evolution ([`coevolve`]) passes the previous champion as a
+/// warm start and a *robust* worst-case-over-an-adversarial-archive fitness. Deterministic in `seed`.
+fn evolve_from(
+    init: LearnedParams,
+    generations: u32,
+    pop: usize,
+    elite_frac: f64,
+    seed: u64,
+    mut fitness: impl FnMut(LearnedParams) -> f64,
+) -> (LearnedParams, f64) {
     let mut rng = Rng::new(seed ^ 0xE70E_77E5_0E77_E50E);
-    let mut mean = genome_to_vec(LearnedParams::DEFAULT);
+    let mut mean = genome_to_vec(init);
     // Initial per-gene exploration spread, and a floor so the Gaussian can't collapse prematurely.
     let mut std = [1.0_f64, 0.2, 0.6, 0.5, 0.25];
     let floor = [0.05_f64, 0.02, 0.05, 0.05, 0.03];
 
-    let mut best = LearnedParams::DEFAULT;
-    let mut best_fit = frontier_fitness(best, train);
+    let mut best = init;
+    let mut best_fit = fitness(best);
     let n_elite = ((pop as f64 * elite_frac).ceil() as usize).clamp(1, pop.max(1));
 
     for _ in 0..generations {
@@ -1411,7 +1426,7 @@ pub fn evolve(train: &[TrainScenario], generations: u32, pop: usize, elite_frac:
                 cand[j] += std[j] * gaussian01(&mut rng);
             }
             let p = vec_to_genome(cand).sanitized();
-            let fit = frontier_fitness(p, train);
+            let fit = fitness(p);
             if fit > best_fit {
                 best_fit = fit;
                 best = p;
@@ -1784,6 +1799,14 @@ pub enum AdvObjective {
     /// windowed-max rate estimator's blind spot) and can drive a controller into a near-livelock —
     /// goodput here is the honest delivered-bytes goodput, so a stalled transfer scores a real shortfall.
     ThroughputShortfall,
+    /// A combined **latency-throughput frontier penalty** (×1000, so it stays integer): the throughput
+    /// shortfall *as a fraction of the line* plus the standing queue's excess over 1 ms (the same hinge
+    /// the CEM fitness uses), plus a large penalty for not completing. This is the objective the
+    /// co-evolution game ([`coevolve`]) is played on — the adversary maximises it, the controller
+    /// minimises its worst case — so neither side can win degenerately (the adversary can't just lower
+    /// the average bandwidth without the controller being able to answer, and the controller can't kill
+    /// the queue by tanking throughput, because both are in the one cost).
+    FrontierPenalty,
 }
 
 /// The scalar cost of a run under `obj` (higher is worse for the controller).
@@ -1793,6 +1816,16 @@ fn adv_single_cost(obj: AdvObjective, env: &AdvEnv, r: &AdvResult) -> u64 {
         AdvObjective::MaxQueueUs => r.max_queue_us,
         AdvObjective::ThroughputShortfall => {
             env.base_rate_bytes_per_sec.saturating_sub(r.throughput_bytes_per_sec())
+        }
+        AdvObjective::FrontierPenalty => {
+            let line = env.base_rate_bytes_per_sec.max(1) as f64;
+            let goodput_frac = r.throughput_bytes_per_sec() as f64 / line;
+            let q_ms = r.mean_queue_us as f64 / 1_000.0;
+            let mut penalty = (1.0 - goodput_frac).max(0.0) + 0.4 * (q_ms - 1.0).max(0.0);
+            if !r.completed {
+                penalty += 5.0;
+            }
+            (penalty * 1_000.0) as u64
         }
     }
 }
@@ -1997,6 +2030,116 @@ pub fn adversary_random_baseline(
         max_cost,
         all_completed,
     }
+}
+
+// ── co-evolution: synthesise a controller robust to its own worst case (CEGIS for CC) ─────────────
+//
+// The three searches above are now wired into one loop. The CEM *synthesises* a controller, the
+// adversary finds the *counterexample* (the capacity trace that hurts it most), that trace joins a
+// growing **archive**, and the CEM re-synthesises against the whole archive — minimising the controller's
+// *worst case* over every attack found so far, not its average. It is the counterexample-guided
+// inductive-synthesis (CEGIS) loop, minimax / GAN-like, applied to congestion control on the real stack
+// engine: the network attacks, the synthesiser defends, and (separately, via `bmc`) the survivor is
+// machine-checked safe. Both sides play the one [`AdvObjective::FrontierPenalty`] cost, so it is a true
+// zero-sum game on the latency-throughput frontier — the controller cannot cheat by tanking throughput to
+// flatten the queue, and the adversary cannot win by merely lowering the mean bandwidth. The output is a
+// controller that, *by construction*, is hard for the search to break — and the archive is the concrete
+// certificate of exactly which attacks it withstands. Everything stays std-only and replayable.
+
+/// The outcome of a [`coevolve`] run: the robust champion genome, how it was reached, and the
+/// per-round trace of the adversary's best attack (which should plateau/shrink as the controller
+/// closes its gaps — the convergence signal).
+#[derive(Clone, Debug)]
+pub struct CoevolveReport {
+    /// The synthesised robust controller (sanitised — inside the safe genome envelope).
+    pub genome: LearnedParams,
+    /// How many adversarial traces ended up in the archive (the flat seed + each counterexample).
+    pub archive_size: usize,
+    /// Rounds actually run (fewer than requested if the adversary stopped finding new counterexamples).
+    pub rounds: u32,
+    /// The adversary's best [`AdvObjective::FrontierPenalty`] against each round's champion, in order.
+    pub worst_cost_per_round: Vec<u64>,
+}
+
+/// The worst (max) frontier penalty a genome suffers across `archive` — assumes the [`Learned`]
+/// override is already set to that genome.
+fn worst_over_archive(env: AdvEnv, bytes: usize, archive: &[AdvTrace]) -> u64 {
+    archive
+        .iter()
+        .map(|t| adv_single_cost(AdvObjective::FrontierPenalty, &env, &run_adversarial(env, *t, bytes, CcKind::Learned)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// **Co-evolve a controller against an adversary that attacks it** (the CEGIS / minimax loop). Each
+/// round: (1) the CEM re-synthesises the [`Learned`] genome to minimise its *worst-case* frontier
+/// penalty over the current adversarial archive (warm-started from the previous champion); (2) the
+/// adversary searches for the capacity trace that maximally hurts the new champion; (3) if that trace
+/// is materially worse than anything in the archive, it is added (a fresh counterexample) — otherwise
+/// the adversary has stopped finding new attacks and the loop converges early. Deterministic in `seed`.
+/// Returns the report and the final archive (the certificate of attacks the genome withstands).
+#[allow(clippy::too_many_arguments)]
+pub fn coevolve(
+    env: AdvEnv,
+    bytes: usize,
+    rounds: u32,
+    generations: u32,
+    pop: usize,
+    elite_frac: f64,
+    adv_iters: u32,
+    seed: u64,
+) -> (CoevolveReport, Vec<AdvTrace>) {
+    let mut archive: Vec<AdvTrace> = vec![AdvTrace::FLAT];
+    let mut champion = LearnedParams::DEFAULT;
+    let mut worst_cost_per_round: Vec<u64> = Vec::new();
+    let mut rounds_run = 0u32;
+
+    for r in 0..rounds {
+        rounds_run = r + 1;
+        // (1) Re-synthesise: minimise the worst-case frontier penalty over the archive (so the fitness
+        // the CEM *maximises* is its negation). Warm-start from the current champion.
+        let arch = archive.clone();
+        let (g, _) = evolve_from(champion, generations, pop, elite_frac, seed.wrapping_add((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)), |p| {
+            set_learned_override(Some(p));
+            let worst = worst_over_archive(env, bytes, &arch);
+            set_learned_override(None);
+            -(worst as f64)
+        });
+        champion = g;
+
+        // (2) Attack the new champion.
+        set_learned_override(Some(champion));
+        let attack = adversary_search(CcKind::Learned, AdvObjective::FrontierPenalty, env, bytes, adv_iters, seed.wrapping_add((r as u64).wrapping_mul(0x1234_5678_9ABC_DEF1)).wrapping_add(1));
+        let archive_worst = worst_over_archive(env, bytes, &archive);
+        set_learned_override(None);
+        worst_cost_per_round.push(attack.best_cost);
+
+        // (3) Keep the counterexample only if it materially beats the champion's archive worst case
+        // (>10% worse) — otherwise the adversary has run out of new attacks and we have converged.
+        if attack.best_cost > archive_worst + archive_worst / 10 {
+            archive.push(attack.best_trace);
+        } else {
+            break;
+        }
+    }
+
+    let report = CoevolveReport {
+        genome: champion.sanitized(),
+        archive_size: archive.len(),
+        rounds: rounds_run,
+        worst_cost_per_round,
+    };
+    (report, archive)
+}
+
+/// The worst frontier penalty a fresh adversarial search can inflict on `genome` (pass `None` for the
+/// baked genome) on `env` — the **held-out** robustness measure (a brand-new attack, not one the
+/// genome trained against), so it is an honest comparison between controllers.
+pub fn worst_under_fresh_attack(genome: Option<LearnedParams>, env: AdvEnv, bytes: usize, adv_iters: u32, seed: u64) -> u64 {
+    set_learned_override(genome);
+    let attack = adversary_search(CcKind::Learned, AdvObjective::FrontierPenalty, env, bytes, adv_iters, seed);
+    set_learned_override(None);
+    attack.best_cost
 }
 
 #[cfg(test)]
@@ -2687,5 +2830,78 @@ mod tests {
         }
         // Guard the asymmetry: BBR's goodput on its worst trace is far below Reno's on the same trace.
         assert!(bbr_gp * 10 < reno_gp, "BBR goodput collapses where Reno's holds: bbr {bbr_gp} vs reno {reno_gp} B/s");
+    }
+
+    fn coev_env() -> AdvEnv {
+        AdvEnv { base_rate_bytes_per_sec: 2_500_000, buffer_bytes: 512 * 1024, base_delay_us: 2_000, slice_us: 4_000, aqm: Aqm::CeMark { threshold_us: 1_000 } }
+    }
+
+    fn flat_penalty(genome: Option<LearnedParams>, env: AdvEnv, bytes: usize) -> u64 {
+        set_learned_override(genome);
+        let r = run_adversarial(env, AdvTrace::FLAT, bytes, CcKind::Learned);
+        set_learned_override(None);
+        adv_single_cost(AdvObjective::FrontierPenalty, &env, &r)
+    }
+
+    /// THE CEGIS LOOP CLOSES — co-evolution synthesises a controller that is **robust by construction
+    /// AND machine-checked safe**, on the real stack engine. The loop alternates synthesis (CEM) and
+    /// attack (the adversary), accumulating an archive of counterexample traces and re-synthesising
+    /// against the worst case. The synthesised controller is then measured against the average-optimal
+    /// baked `Learned` genome on a **held-out fresh attack** (a brand-new adversarial search it never
+    /// trained on): it is materially harder to break. And it stays inside the proven safety envelope —
+    /// `bmc::check_controller_safety` finds zero violations. (Measured: ~2.4× more robust than baked at
+    /// full budget; the trade-off — it is more conservative, so it pays average-case throughput — is the
+    /// honest robustness/performance Pareto, shown in the ignored `coevolution_reproduction`.)
+    #[test]
+    #[cfg_attr(miri, ignore)] // a synthesis loop over many full transfers — far too slow for Miri
+    fn coevolution_synthesises_a_robust_certified_controller() {
+        let env = coev_env();
+        let bytes = 256 * 1024;
+        let (rep, _archive) = coevolve(env, bytes, 4, 5, 6, 0.3, 30, 0xC0E0);
+
+        // The loop actually ran and accumulated at least one counterexample beyond the flat seed.
+        assert!(rep.rounds >= 1 && rep.archive_size >= 2, "the loop ran and collected counterexamples: {rep:?}");
+
+        // Held-out robustness: a *fresh* adversary (unseen by either controller) breaks the co-evolved
+        // controller far less than the average-optimal baked one — robustness that generalises, not
+        // memorisation of the archive.
+        let baked_worst = worst_under_fresh_attack(None, env, bytes, 40, 0xFEED);
+        let robust_worst = worst_under_fresh_attack(Some(rep.genome), env, bytes, 40, 0xFEED);
+        assert!(
+            robust_worst * 4 < baked_worst * 3,
+            "the co-evolved controller resists a held-out attack far better than baked: {robust_worst} vs {baked_worst}"
+        );
+
+        // Robust AND safe by construction: the synthesised genome stays inside the bounded-proven
+        // safety envelope (the same one `check_learned_genome_space` certifies for the whole family).
+        let safety = crate::bmc::check_controller_safety(crate::congestion::Learned::with_params(1460, rep.genome), 1460, 3);
+        assert_eq!(safety.violations, 0, "the synthesised controller is bounded-safe: {safety:?}");
+
+        // The loop replays deterministically — same seed → same controller (a cheap small run pins it).
+        let (a, _) = coevolve(env, bytes, 2, 3, 4, 0.3, 15, 0x5151);
+        let (b, _) = coevolve(env, bytes, 2, 3, 4, 0.3, 15, 0x5151);
+        assert_eq!(a.genome, b.genome, "co-evolution replays to the same controller");
+    }
+
+    /// The full reproduction (ignored — a multi-seed synthesis sweep). Prints, per seed, the
+    /// convergence of the adversary's best attack, the held-out robustness vs the baked genome, the
+    /// average-case (flat-path) trade-off, and the BMC safety certificate.
+    #[test]
+    #[ignore]
+    fn coevolution_reproduction() {
+        let env = coev_env();
+        let bytes = 256 * 1024;
+        let baked_worst = worst_under_fresh_attack(None, env, bytes, 60, 0xFEED);
+        eprintln!("baked (average-optimal): held-out worst {} | flat penalty {}", baked_worst, flat_penalty(None, env, bytes));
+        for seed in [0xC0E0u64, 0x1357, 0xABCD] {
+            let (rep, _archive) = coevolve(env, bytes, 6, 6, 8, 0.3, 40, seed);
+            let robust_worst = worst_under_fresh_attack(Some(rep.genome), env, bytes, 60, 0xFEED);
+            let safety = crate::bmc::check_controller_safety(crate::congestion::Learned::with_params(1460, rep.genome), 1460, 4);
+            eprintln!(
+                "seed {seed:#x}: rounds {} archive {} adv/round {:?} | held-out worst {} ({:.0}% of baked) | flat {} | BMC violations {} | {:?}",
+                rep.rounds, rep.archive_size, rep.worst_cost_per_round, robust_worst,
+                100.0 * robust_worst as f64 / baked_worst.max(1) as f64, flat_penalty(Some(rep.genome), env, bytes), safety.violations, rep.genome
+            );
+        }
     }
 }

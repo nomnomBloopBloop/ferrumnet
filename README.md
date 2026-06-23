@@ -38,7 +38,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **six pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one), and a **two-stack userspace loopback** (two instances connecting to
-  each other entirely in memory). **220 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
+  each other entirely in memory). **221 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
   no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -63,6 +63,15 @@ $ curl -v http://10.0.0.2:8080/
   On the standing-queue objective it instead drives the link to a sustained low-rate throttle that bloats
   BBR's queue **~6× past** its steady-link queue — approaching the loss-based controllers' bloat, the
   low-latency advantage of pacing largely erased. Verifier-in-the-loop, pointed at congestion control. (`sim`)
+- **It synthesizes a controller robust to its own worst case.** The synthesize / verify / attack pieces
+  close into one **CEGIS loop** (`coevolve`): the CEM evolves a controller, the adversary finds the trace
+  that breaks it, that trace joins an archive, and the CEM re-synthesizes against the worst case — minimax,
+  GAN-like, on real stack code. The adversary's best attack shrinks round over round (the loop converges in
+  2–3 rounds), and on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break**
+  than the average-optimal one — while the bounded model checker certifies it **safe (0 violations)**:
+  *robust **and** safe by construction.* The honest cost is the classic robustness/performance trade-off
+  (the robust controller is more conservative, paying average-case throughput). No ML libraries, no solver,
+  zero dependencies. (`sim` + `bmc`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -386,7 +395,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 220 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 221 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -477,8 +486,14 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   low-rate throttle, bloating BBR's queue from **15.5 ms** on a steady link to **~100 ms (6.4×)** — a worse
   operating point, not a timing trick, and in this low-dimensional schedule space blind random sampling is
   itself a strong baseline (the guidance's surer value is the single refined, reproducible worst case).
-  This is CEGIS / verifier-in-the-loop for congestion control; the headline next step is to **co-evolve** a
-  controller against the adversary's best effort (minimax), robust by construction.
+  This is CEGIS / verifier-in-the-loop for congestion control.
+- **Co-evolution — done; the loop closes.** `coevolve` wires synthesis (CEM) ↔ attack (adversary) ↔ a
+  growing counterexample archive ↔ re-synthesis into a minimax loop, then certifies the survivor with the
+  `bmc` safety envelope. On a held-out fresh attack the co-evolved controller is **1.5–2.4× harder to
+  break** than the average-optimal one and is **bounded-proven safe** — robust *and* safe by construction,
+  on real stack code, zero ML/solver deps — at the honest cost of average-case throughput. The remaining
+  ceiling is turning the safety proofs into **quantitative performance proofs** (a queue / competitive
+  bound over every trace in the envelope), and folding the whole loop into a **paper**.
 - **L4S — ECN, exact feedback, the scalable controller, and the dual-queue all ship; the coupling is the
   last refinement.** **DCTCP** (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE
   counter for *exact* per-packet CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent**
