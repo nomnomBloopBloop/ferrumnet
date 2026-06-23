@@ -77,10 +77,10 @@ tcp-core/  (device- & OS-agnostic, std-only, #![deny(unsafe_code)])
   iface        the sans-IO Stack: on_recv / on_timer / poll_transmit / poll_at  [M1-M3]
   runtime/     hand-rolled async: executor, reactor, TcpListener/Stream/ [M4,M9]
                TcpConnector, Device trait + in-memory MockDevice
-  sim          deterministic simulation testing: 2 stacks over a seeded   [M14-M18]
-               fault link + finite-buffer bottleneck (CeMark/L4S AQM) +
+  sim          deterministic simulation testing: 2 stacks over a seeded   [M14-M18,
+               fault link + finite-buffer bottleneck (CeMark/L4S AQM) +     M20]
                dual-queue L4S coexistence; a coverage-guided greybox
-               fuzzer; a CEM trainer for Learned
+               fuzzer; a CEM trainer; an adversarial worst-case search
   bmc          bounded model checker: exhaustive SACK-scoreboard op-      [M15,M19]
                sequence + TCP-option-walker proofs + the congestion-
                control safety envelope over the genome family (zero-dep, no Kani)
@@ -607,6 +607,37 @@ ECN response, `ecn_a ≈ 0.18` vs 0.5), and a queue ~9× below BBR and ~100× be
 frontier *point*, not strict Pareto domination, and it **generalises** to paths outside training. The
 result is reproducible from a fixed seed (`evolve(&train_set(), 30, 28, 0.25, 12345)`).
 
+**Adversarial worst-case discovery (M20).** The fuzzer searches for *coverage* and the CEM trainer for a
+*good controller*; this third search inverts the trainer to find the **network condition that maximally
+hurts a fixed controller**. The same deterministic sim that lets us fuzz for correctness lets us
+*minimax* for robustness. The searchable input is a **capacity trace** — the bottleneck's service rate
+follows a 16-slice schedule of per-slice multipliers (30–150 % of a base rate, cycled over the transfer),
+modelled by `run_adversarial` with an explicit byte-FIFO so the time-varying rate is exact per frame.
+`adversary_search` is a steady-state evolutionary maximiser: an elite corpus of the worst traces seen,
+mutated by point / block / nudge moves and **tournament-biased toward the worst-so-far** (with occasional
+random immigrants), driving a chosen cost — the mean or max standing queue, or the throughput shortfall.
+The envelope is **bounded** (capacity never falls below a floor) so every trace stays *survivable*: a
+transfer that fails to complete is a genuine finding, the same oracle the fuzzer uses — and a found trace
+replays bit-for-bit, so the output is a concrete *artefact* ("the trace that bloats BBR"), not an
+anecdote. It is compared to **blind random sampling of the same envelope at equal budget**, so beating the
+baseline shows the guidance found structure, not luck.
+
+Measured against BBR on a 2.5 MB/s / 1 MiB-buffer / 3 ms link (`Aqm::TailDrop`): the steady flat-rate link
+holds a **15.5 ms** mean standing queue; the adversary finds a capacity trace that bloats it to **~100 ms
+(6.4×)** — BBR's pacing advantage, its whole reason for being, *erased* by a link whose bandwidth simply
+moves under its windowed rate estimate — and the guided search meets-or-beats the worst of equal-budget
+random traces. Pointed at the *throughput* objective it surfaces a sharper finding: a specific trace
+(`[33,33,33,94,33,105,33,…] %`) on which **BBR's goodput collapses** to a sub-2 KB/s crawl — a near-
+livelock that *worsens* with transfer size (90 %+ progress then stalls; it is a budget timeout, never an
+integrity violation), while the **same trace** lets Reno/CUBIC/DCTCP complete at ~1 MB/s. That asymmetry
+is the tell that it is a real **BBR-specific** pathology under variable capacity (the link is
+controller-agnostic), found automatically. Loss-based controllers are already buffer-filling, so the queue
+lever against them is weaker (~3.4×), and under a plain tail-drop AQM the ECN controllers fall back to
+their loss response and bloat like Reno — BBR, the controller that *tries* to be clever about the
+bottleneck, is precisely the one with the exploitable gap. This is the verifier-in-the-loop / CEGIS
+discipline pointed at congestion control; the natural next step is to **co-evolve** a controller against
+the adversary's best machine-found effort (minimax / GAN-like), robust by construction.
+
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
 
@@ -716,6 +747,7 @@ assurance learned controllers usually lack.
 | M17 | **TCP Prague** (`Cc::Prague`) — the L4S scalable controller: DCTCP's proportional ECN response + an **RTT-independent** additive increase (per-RTT step scaled by `srtt / 25 ms`) + a classic Reno loss fallback; fed RTT via a no-op-default `on_rtt_sample` hook | holds a sub-millisecond queue end-to-end on the CE-marking bottleneck like DCTCP; growth *per second* is constant across RTT (unit-proven), the lever for fair L4S coexistence |
 | M18 | **Dual-queue L4S bottleneck** (`DualQueue` / `run_dualqueue`) — the dualPI2 structure: a multi-flow shared link, fair per-class round-robin scheduler, ECN-classified shallow (CE-marked) L4S queue vs deep (tail-drop) Classic queue | a Prague (L4S) + Reno (classic) pair coexist — both complete, neither starved — and the L4S flow holds a **sub-ms** queue while the classic flow bloats to **~90 ms** on the same link (latency isolation); coupled-PI marking for robust throughput fairness is the noted refinement |
 | M19 | **Provably-safe synthesised congestion control** (`bmc::check_controller_safety` / `check_learned_genome_space`) — turn the bounded model checker on the controllers: a 5-clause safety envelope (starvation-freedom, loss never inflates `cwnd` past the FlightSize, ECN/clean-ACK monotonicity, `ssthresh` floor) over every event sequence, with FlightSize modelled independently of `cwnd` (`flight > cwnd` is reachable) | Reno/DCTCP/Prague + the evolved genome all satisfy it exhaustively, and the **whole sanitised genome family** (243-genome grid, ~1.3 M states, + a structural argument to the continuum) is bounded-proven safe — "evolve *and* prove"; an unsanitised `md_loss=2` genome is caught inflating `cwnd` past the pipe, proving the sanitiser is load-bearing; the adversarial review caught and fixed the original flight-model under-approximation |
+| M20 | **Adversarial worst-case discovery** (`adversary_search` / `run_adversarial`) — invert the trainer into a minimax adversary: search a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base rate schedule) for the trajectory that maximises a controller's mean/max standing queue or throughput shortfall; a steady-state evolutionary maximiser over an elite corpus, equal-budget-compared to blind random sampling, every trace survivable and replayable bit-for-bit | against BBR the search bloats the mean standing queue from **15.5 ms (steady) to ~100 ms (6.4×)**, erasing its pacing advantage, and beats blind sampling at equal budget; the throughput objective surfaces a reproducible trace that **collapses BBR's goodput** to a sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — a BBR-specific pathology under variable capacity, found automatically; the verifier-in-the-loop step before co-evolving a robust controller |
 
 ## 9. Environment
 

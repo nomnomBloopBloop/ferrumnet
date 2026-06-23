@@ -46,6 +46,15 @@ $ curl -v http://10.0.0.2:8080/
   coverage signal is read *entirely off the wire* (the emitted segment-event sequence, AFL-hashed and
   stratified by recovery depth) — **no engine instrumentation** — so the sans-IO core stays untouched
   while a novelty search steers toward behaviour a fixed grid never reaches. (`sim`)
+- **It attacks its own controllers.** The same deterministic sim is turned into an **adversary**:
+  instead of steering for coverage, `adversary_search` hunts the **capacity trace that maximally hurts a
+  controller** — the reproducible bandwidth schedule that drives its standing queue highest or its
+  throughput lowest, found by a steady-state evolutionary maximiser and compared against blind sampling at
+  equal budget. Pointed at BBR it finds a bandwidth trajectory that bloats BBR's queue **~6× past** the
+  queue it holds on a steady link (its pacing advantage erased), and a specific trace on which **BBR's
+  goodput collapses** to a crawl while Reno/CUBIC/DCTCP sail through the *same* trace — a BBR-specific
+  weakness under variable capacity, found automatically and replayable bit-for-bit. Verifier-in-the-loop,
+  pointed at congestion control. (`sim`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -364,6 +373,8 @@ cargo test -p tcp-core      # 217 tests: unit + in-memory integration + loss/SAC
                             #            + a coverage-guided greybox fuzzer (off-the-wire coverage)
                             #            + a bounded model checker (exhaustive SACK / option proofs +
                             #            the controller safety envelope over the whole genome family)
+                            #            + an adversarial worst-case search (the capacity trace that
+                            #            bloats BBR's queue ~6x / collapses its goodput)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
@@ -426,6 +437,20 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   envelope* — the assurance learned controllers usually lack. (An adversarial review caught the first cut
   of this modelling the FlightSize off the live `cwnd`, which hid exactly the `flight > cwnd` loss
   responses; the fix models it independently and the proof now holds over the real contract.)
+- **Adversarial worst-case discovery — done; co-evolution is the next step.** The deterministic sim is
+  inverted into an **adversary** (`adversary_search`): instead of fuzzing for coverage or evolving a good
+  controller, it searches a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base-rate
+  schedule, cycled over the transfer) for the trajectory that maximises a controller's cost — mean/max
+  standing queue, or throughput shortfall — by a steady-state evolutionary maximiser (an elite corpus
+  mutated and tournament-biased toward the worst-so-far), compared against blind random sampling of the
+  same envelope at equal budget. Every trace stays survivable (so a non-completion is a real finding) and
+  replays bit-for-bit. Against **BBR** it bloats the mean standing queue from **15.5 ms** on a steady link
+  to **~100 ms (6.4×)** — pacing advantage erased — beating blind sampling at equal budget; on the
+  throughput objective it finds a reproducible trace that **collapses BBR's goodput** to a sub-2 KB/s crawl
+  while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s (a BBR-specific weakness under variable
+  capacity — the link is controller-agnostic). This is CEGIS / verifier-in-the-loop for congestion
+  control; the headline next step is to **co-evolve** a controller against the adversary's best effort
+  (minimax), robust by construction.
 - **L4S — ECN, exact feedback, the scalable controller, and the dual-queue all ship; the coupling is the
   last refinement.** **DCTCP** (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE
   counter for *exact* per-packet CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent**
