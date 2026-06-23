@@ -669,16 +669,22 @@ adversary's best attack **shrinks round over round** and the loop **converges in
 **held-out fresh attack** (a brand-new adversarial search the controller never trained on, so it tests
 generalisation not memorisation), the co-evolved controller's worst-case frontier penalty is **41–66 % of
 the average-optimal baked genome's** — roughly **1.5–2.4× harder to break** — and `bmc::check_controller_
-safety` certifies it with **zero violations** (it stays inside the proven genome envelope: *robust **and**
-safe by construction*). The honest cost is the classic **robustness/performance trade-off**: the co-evolved
-controllers are more conservative (a gentle ramp and/or a strong ECN response), so they pay average-case
-throughput on the benign flat path — and interestingly there is more than one robust strategy (a
-floor-gentle ramp, or an aggressive ramp paired with a very strong ECN cut). A fast test runs the loop end
-to end and asserts the held-out robustness + the safety certificate + determinism; the multi-seed
-convergence/trade-off sweep is the ignored `coevolution_reproduction`. The claim is bounded and stated as
-such: robust to *this* search within *this* envelope — not robustness in general — but it is, to our
-knowledge, the first time a congestion controller has been **synthesised against its own adversary and
-machine-checked safe in the same loop, on real stack code, with zero ML or solver dependencies**.
+safety` certifies it with **zero violations**. The two properties have different status, and the docs keep
+them apart: the controller is **safe *by construction*** (every genome is sanitised into the M19
+bounded-proven envelope, so the survivor is provably safe regardless of how the search turns out — and the
+model checker confirms it *separately*, after the loop, not as a loop step) and **empirically robust** (the
+loop *optimises* worst-case-over-archive, a heuristic, and we then *measure* it on a held-out attack). The
+honest cost is the classic **robustness/performance trade-off**: the co-evolved controllers are more
+conservative (a gentle ramp and/or a strong ECN response), so they pay average-case throughput on the
+benign flat path — and interestingly there is more than one robust strategy (a floor-gentle ramp, or an
+aggressive ramp paired with a very strong ECN cut). A fast test runs the loop end to end and asserts that
+the survivor beats its own warm start and the baked genome on a held-out attack, that the adversary's reach
+shrinks across rounds, the safety certificate, and determinism; the multi-seed convergence/trade-off sweep
+is the ignored `coevolution_reproduction`. The claim is bounded and stated as such: robust to *this* search
+within *this* envelope — not robustness in general. What is novel here is the *combination* — coupling
+counterexample-guided synthesis with a bounded-model-checked safety envelope for a congestion controller, on
+the real stack engine, with zero ML or solver dependencies — which we have not seen elsewhere, though we
+make no priority claim.
 
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
@@ -790,7 +796,7 @@ assurance learned controllers usually lack.
 | M18 | **Dual-queue L4S bottleneck** (`DualQueue` / `run_dualqueue`) — the dualPI2 structure: a multi-flow shared link, fair per-class round-robin scheduler, ECN-classified shallow (CE-marked) L4S queue vs deep (tail-drop) Classic queue | a Prague (L4S) + Reno (classic) pair coexist — both complete, neither starved — and the L4S flow holds a **sub-ms** queue while the classic flow bloats to **~90 ms** on the same link (latency isolation); coupled-PI marking for robust throughput fairness is the noted refinement |
 | M19 | **Provably-safe synthesised congestion control** (`bmc::check_controller_safety` / `check_learned_genome_space`) — turn the bounded model checker on the controllers: a 5-clause safety envelope (starvation-freedom, loss never inflates `cwnd` past the FlightSize, ECN/clean-ACK monotonicity, `ssthresh` floor) over every event sequence, with FlightSize modelled independently of `cwnd` (`flight > cwnd` is reachable) | Reno/DCTCP/Prague + the evolved genome all satisfy it exhaustively, and the **whole sanitised genome family** (243-genome grid, ~1.3 M states, + a structural argument to the continuum) is bounded-proven safe — "evolve *and* prove"; an unsanitised `md_loss=2` genome is caught inflating `cwnd` past the pipe, proving the sanitiser is load-bearing; the adversarial review caught and fixed the original flight-model under-approximation |
 | M20 | **Adversarial worst-case discovery** (`adversary_search` / `run_adversarial`) — invert the trainer into a minimax adversary: search a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base rate schedule) for the trajectory that maximises a controller's mean/max standing queue or throughput shortfall; a steady-state evolutionary maximiser over an elite corpus, equal-budget-compared to blind random sampling, every trace replayable bit-for-bit | the headline (CI-verified, baked discovered trace): a **time-varying** trace **collapses BBR's goodput** to a sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — a BBR-specific pathology (bandwidth under its windowed-max estimate; the link is controller-agnostic, so the asymmetry is BBR's doing). The standing-queue objective separately drives a sustained throttle that bloats BBR's queue **15.5 ms → ~100 ms (6.4×)**, largely erasing pacing's latency edge; the verifier-in-the-loop step before co-evolving a robust controller |
-| M21 | **Co-evolution / CEGIS for CC** (`coevolve`) — close the loop: the CEM synthesises a controller, the adversary finds the counterexample trace, it joins an archive, and the CEM re-synthesises against the worst case; a true zero-sum frontier-penalty game (minimax), the survivor `bmc`-certified safe — all on real stack code, zero ML/solver deps | the adversary's best attack **shrinks round over round** and the loop **converges in 2–3 rounds**; on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break** than the average-optimal baked genome (worst-case penalty 41–66 % of baked) and is **bounded-proven safe (0 violations)** — *robust **and** safe by construction* — at the honest cost of average-case throughput (the robustness/performance Pareto, found automatically) |
+| M21 | **Co-evolution / CEGIS for CC** (`coevolve`) — close the loop: the CEM synthesises a controller, the adversary finds the counterexample trace, it joins an archive, and the CEM re-synthesises against the worst case; a true zero-sum frontier-penalty game (minimax), the survivor `bmc`-certified safe — all on real stack code, zero ML/solver deps | the adversary's best attack **shrinks round over round** and the loop **converges in 2–3 rounds**; on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break** than the average-optimal baked genome (worst-case penalty 41–66 % of baked) and is **bounded-proven safe (0 violations)** — **safe by construction, empirically robust** — at the honest cost of average-case throughput (the robustness/performance Pareto, found automatically) |
 
 ## 9. Environment
 

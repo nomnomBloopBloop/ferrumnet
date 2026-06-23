@@ -2043,8 +2043,9 @@ pub fn adversary_random_baseline(
 // machine-checked safe. Both sides play the one [`AdvObjective::FrontierPenalty`] cost, so it is a true
 // zero-sum game on the latency-throughput frontier — the controller cannot cheat by tanking throughput to
 // flatten the queue, and the adversary cannot win by merely lowering the mean bandwidth. The output is a
-// controller that, *by construction*, is hard for the search to break — and the archive is the concrete
-// certificate of exactly which attacks it withstands. Everything stays std-only and replayable.
+// controller the search *optimises* to be hard to break — verified empirically on a held-out attack, not
+// guaranteed — that is **safe by construction** (every genome is sanitised into the bounded-proven M19
+// envelope); the archive is the concrete record of exactly which attacks it withstands. Std-only, replayable.
 
 /// The outcome of a [`coevolve`] run: the robust champion genome, how it was reached, and the
 /// per-round trace of the adversary's best attack (which should plateau/shrink as the controller
@@ -2843,15 +2844,16 @@ mod tests {
         adv_single_cost(AdvObjective::FrontierPenalty, &env, &r)
     }
 
-    /// THE CEGIS LOOP CLOSES — co-evolution synthesises a controller that is **robust by construction
-    /// AND machine-checked safe**, on the real stack engine. The loop alternates synthesis (CEM) and
-    /// attack (the adversary), accumulating an archive of counterexample traces and re-synthesising
-    /// against the worst case. The synthesised controller is then measured against the average-optimal
-    /// baked `Learned` genome on a **held-out fresh attack** (a brand-new adversarial search it never
-    /// trained on): it is materially harder to break. And it stays inside the proven safety envelope —
-    /// `bmc::check_controller_safety` finds zero violations. (Measured: ~2.4× more robust than baked at
-    /// full budget; the trade-off — it is more conservative, so it pays average-case throughput — is the
-    /// honest robustness/performance Pareto, shown in the ignored `coevolution_reproduction`.)
+    /// THE CEGIS LOOP CLOSES — co-evolution synthesises a controller that is **safe by construction and
+    /// empirically robust to a held-out attack**, on the real stack engine. The loop alternates synthesis
+    /// (CEM) and attack (the adversary), accumulating an archive of counterexample traces and
+    /// re-synthesising against the worst case. The synthesised controller is then measured on a **held-out
+    /// fresh attack** (a brand-new adversarial search it never trained on): it resists it better than its
+    /// own warm start *and* better than the average-optimal baked `Learned` genome. It is **safe by
+    /// construction** — sanitised into the bounded-proven envelope, so `bmc::check_controller_safety`
+    /// finds zero violations. (Measured: ~1.5–2.4× more robust than baked at full budget; the trade-off —
+    /// it is more conservative, so it pays average-case throughput — is the honest robustness/performance
+    /// Pareto, shown in the ignored `coevolution_reproduction`.)
     #[test]
     #[cfg_attr(miri, ignore)] // a synthesis loop over many full transfers — far too slow for Miri
     fn coevolution_synthesises_a_robust_certified_controller() {
@@ -2859,28 +2861,40 @@ mod tests {
         let bytes = 256 * 1024;
         let (rep, _archive) = coevolve(env, bytes, 4, 5, 6, 0.3, 30, 0xC0E0);
 
-        // The loop actually ran and accumulated at least one counterexample beyond the flat seed.
-        assert!(rep.rounds >= 1 && rep.archive_size >= 2, "the loop ran and collected counterexamples: {rep:?}");
+        // The loop actually ran and accumulated counterexamples beyond the flat seed (smoke check).
+        assert!(rep.rounds >= 2 && rep.archive_size >= 2, "the loop ran and collected counterexamples: {rep:?}");
 
-        // Held-out robustness: a *fresh* adversary (unseen by either controller) breaks the co-evolved
-        // controller far less than the average-optimal baked one — robustness that generalises, not
-        // memorisation of the archive.
-        let baked_worst = worst_under_fresh_attack(None, env, bytes, 40, 0xFEED);
         let robust_worst = worst_under_fresh_attack(Some(rep.genome), env, bytes, 40, 0xFEED);
+
+        // TEETH — co-evolution actually *did something*: the synthesised controller resists a held-out
+        // fresh attack better than its own **warm start** (the `DEFAULT` genome the loop began from). A
+        // broken loop that returned ~its start would fail this — unlike a comparison against the baked
+        // genome alone, which `DEFAULT` already clears (the average-optimal baked genome is itself
+        // fragile to capacity variation, so beating *it* does not prove the loop synthesised anything).
+        let default_worst = worst_under_fresh_attack(Some(crate::congestion::LearnedParams::DEFAULT), env, bytes, 40, 0xFEED);
+        assert!(robust_worst < default_worst, "co-evolution improved over its warm start: {robust_worst} vs default {default_worst}");
+
+        // ...and it is materially more robust than the average-optimal baked controller, on the held-out attack.
+        let baked_worst = worst_under_fresh_attack(None, env, bytes, 40, 0xFEED);
         assert!(
             robust_worst * 4 < baked_worst * 3,
             "the co-evolved controller resists a held-out attack far better than baked: {robust_worst} vs {baked_worst}"
         );
 
-        // Robust AND safe by construction: the synthesised genome stays inside the bounded-proven
-        // safety envelope (the same one `check_learned_genome_space` certifies for the whole family).
+        // Convergence: the adversary's best attack at the LAST round is materially below the FIRST
+        // round's — the controller is closing the gaps the adversary keeps probing (tolerant of the
+        // usual round-to-round wobble; it checks the trend, not strict monotonicity).
+        let w = &rep.worst_cost_per_round;
+        assert!(w.len() >= 2 && *w.last().unwrap() * 4 < w[0] * 3, "the adversary's reach shrinks across rounds: {w:?}");
+
+        // Safe *by construction*: the synthesised genome is sanitised into the bounded-proven genome
+        // envelope (the family `check_learned_genome_space` certifies), so the model checker finds none.
         let safety = crate::bmc::check_controller_safety(crate::congestion::Learned::with_params(1460, rep.genome), 1460, 3);
         assert_eq!(safety.violations, 0, "the synthesised controller is bounded-safe: {safety:?}");
 
-        // The loop replays deterministically — same seed → same controller (a cheap small run pins it).
-        let (a, _) = coevolve(env, bytes, 2, 3, 4, 0.3, 15, 0x5151);
-        let (b, _) = coevolve(env, bytes, 2, 3, 4, 0.3, 15, 0x5151);
-        assert_eq!(a.genome, b.genome, "co-evolution replays to the same controller");
+        // Determinism: the *exact same* run replays to the same controller, bit-for-bit.
+        let (again, _) = coevolve(env, bytes, 4, 5, 6, 0.3, 30, 0xC0E0);
+        assert_eq!(rep.genome, again.genome, "co-evolution replays to the same controller");
     }
 
     /// The full reproduction (ignored — a multi-seed synthesis sweep). Prints, per seed, the

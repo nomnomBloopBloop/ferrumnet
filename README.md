@@ -63,14 +63,16 @@ $ curl -v http://10.0.0.2:8080/
   On the standing-queue objective it instead drives the link to a sustained low-rate throttle that bloats
   BBR's queue **~6× past** its steady-link queue — approaching the loss-based controllers' bloat, the
   low-latency advantage of pacing largely erased. Verifier-in-the-loop, pointed at congestion control. (`sim`)
-- **It synthesizes a controller robust to its own worst case.** The synthesize / verify / attack pieces
-  close into one **CEGIS loop** (`coevolve`): the CEM evolves a controller, the adversary finds the trace
-  that breaks it, that trace joins an archive, and the CEM re-synthesizes against the worst case — minimax,
-  GAN-like, on real stack code. The adversary's best attack shrinks round over round (the loop converges in
-  2–3 rounds), and on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break**
-  than the average-optimal one — while the bounded model checker certifies it **safe (0 violations)**:
-  *robust **and** safe by construction.* The honest cost is the classic robustness/performance trade-off
-  (the robust controller is more conservative, paying average-case throughput). No ML libraries, no solver,
+- **It synthesizes a controller robust to its own worst case.** The synthesize ↔ attack pieces close into
+  one **CEGIS loop** (`coevolve`): the CEM evolves a controller, the adversary finds the trace that breaks
+  it, that trace joins an archive, and the CEM re-synthesizes against the worst case — minimax, GAN-like, on
+  real stack code; every genome is kept inside the bounded-proven safe envelope, and the survivor is then
+  `bmc`-certified separately (0 violations). On a **held-out fresh attack** the co-evolved controller
+  resists better than its own warm start *and* than the average-optimal one, and the adversary's best
+  attack shrinks across rounds — so it is **safe by construction and empirically robust**, at the honest
+  cost of average-case throughput (the robustness/performance trade-off). (Observed across seeds in the
+  ignored `coevolution_reproduction` — ~1.5–2.4× harder to break, converging in 2–3 rounds; the fast CI
+  test enforces a weaker bound and the warm-start/convergence/safety checks.) No ML libraries, no solver,
   zero dependencies. (`sim` + `bmc`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
@@ -488,12 +490,13 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   itself a strong baseline (the guidance's surer value is the single refined, reproducible worst case).
   This is CEGIS / verifier-in-the-loop for congestion control.
 - **Co-evolution — done; the loop closes.** `coevolve` wires synthesis (CEM) ↔ attack (adversary) ↔ a
-  growing counterexample archive ↔ re-synthesis into a minimax loop, then certifies the survivor with the
-  `bmc` safety envelope. On a held-out fresh attack the co-evolved controller is **1.5–2.4× harder to
-  break** than the average-optimal one and is **bounded-proven safe** — robust *and* safe by construction,
-  on real stack code, zero ML/solver deps — at the honest cost of average-case throughput. The remaining
-  ceiling is turning the safety proofs into **quantitative performance proofs** (a queue / competitive
-  bound over every trace in the envelope), and folding the whole loop into a **paper**.
+  growing counterexample archive ↔ re-synthesis into a minimax loop; the survivor is then certified by the
+  `bmc` safety envelope. On a held-out fresh attack the co-evolved controller resists better than its own
+  warm start and than the average-optimal one (~1.5–2.4× harder to break across seeds), and is **bounded-
+  proven safe** — **safe by construction, empirically robust**, on real stack code, zero ML/solver deps —
+  at the honest cost of average-case throughput. The remaining ceiling is turning the safety proofs into
+  **quantitative performance proofs** (a certified queue / competitive bound over an exhausted trace
+  envelope — the adversary as a *prover*), and folding the whole loop into a **paper**.
 - **L4S — ECN, exact feedback, the scalable controller, and the dual-queue all ship; the coupling is the
   last refinement.** **DCTCP** (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE
   counter for *exact* per-packet CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent**
