@@ -1,6 +1,10 @@
 # ferrumnet
 
 [![CI](https://github.com/nomnomBloopBloop/ferrumnet/actions/workflows/ci.yml/badge.svg)](https://github.com/nomnomBloopBloop/ferrumnet/actions/workflows/ci.yml)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.75-blue)](Cargo.toml)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![core: 100% safe Rust](https://img.shields.io/badge/core-100%25%20safe%20Rust-success)](tcp-core/src/lib.rs)
 
 A **userspace TCP/IP stack written from scratch in Rust** — kernel-bypass networking. It sits
 between a raw Linux **TUN** device and the application and does, in userspace, everything the
@@ -296,6 +300,22 @@ neither beats in-kernel loopback, which has neither a per-packet syscall nor a u
 (drain bytes to send), and `poll_at`/`on_timer` (timers). The reactor wires those to the device
 and wakes the async tasks.
 
+Because that core performs **no I/O and reads no clock**, the *same* engine that serves `curl` over a
+real TUN also runs against an in-memory device under a seeded virtual link — which turns it into a
+deterministic testbed you can fuzz, prove, evolve against, and attack:
+
+```mermaid
+flowchart TD
+    core["tcp-core — sans-IO TCP/IP engine<br/>(performs no I/O; time is a parameter)"]
+    core --> tun["Linux TUN backend<br/>real curl · io_uring"]
+    core --> mock["in-memory MockDevice"]
+    mock --> sim["deterministic sim<br/>two stacks · seeded virtual link · injected clock<br/>replays bit-for-bit from a seed"]
+    sim --> f["fuzz it<br/>DST 1080 seeds + coverage fuzzer<br/>→ 0 invariant violations"]
+    sim --> p["prove it<br/>bounded model checker, no Kani<br/>→ SACK + safety-envelope invariants"]
+    sim --> e["evolve against it<br/>CEM-trained controller, 0 ML deps<br/>→ beats hand-tuned DCTCP"]
+    sim --> a["attack it<br/>adversarial worst-case search<br/>→ the capacity trace that breaks BBR"]
+```
+
 > **The thinking lives in [`docs/DESIGN.md`](docs/DESIGN.md).** It's a component-by-component
 > walkthrough that, for each piece, lists the specific correctness traps it has to avoid —
 > sequence-number wraparound, the checksum carry-fold and pseudo-header, Karn's rule for RTT
@@ -488,3 +508,10 @@ the BBR congestion-control draft + Cheng/Cardwell delivery-rate estimation, RFC 
 (timestamps & window scaling), RFC 5961 + 6528 (blind-attack hardening); the cross-entropy method
 (Rubinstein) for the evolved controller and AFL-style coverage-guided fuzzing for the greybox search;
 W. R. Stevens, *TCP/IP Illustrated, Vol. 1*. Built milestone by milestone; see [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## License
+
+Dual-licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at
+your option. Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this work, as defined in the Apache-2.0 license, shall be dual-licensed as above, without
+any additional terms or conditions.
