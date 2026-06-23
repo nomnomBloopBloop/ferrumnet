@@ -1,0 +1,56 @@
+name: CI
+
+# The whole engine is zero-dependency std-only, so CI installs nothing but toolchains and runs the
+# exact gates the project is verified against locally: the test suite on the current stable and on the
+# 1.75 MSRV, clippy with warnings denied, and Miri over the sans-IO core for UB/leak checking.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The dev/stable toolchain and the declared MSRV (1.75, the version on the deploy VPS).
+        rust: ["1.92.0", "1.75.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      # --workspace also builds the Linux-only `tcp-tun` backend (it has no unit tests of its own,
+      # so this is a real compile check of the device code); --locked pins the (empty) dep graph.
+      - run: cargo test --workspace --locked
+
+  clippy:
+    name: clippy + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  miri:
+    name: miri (tcp-core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # Miri checks the sans-IO core for undefined behaviour and leaks; heavy multi-transfer tests
+      # are `#[cfg_attr(miri, ignore)]` so the run stays well under the job timeout.
+      - run: cargo miri test -p tcp-core

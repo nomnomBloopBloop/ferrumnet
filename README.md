@@ -1,5 +1,7 @@
 # ferrumnet
 
+[![CI](https://github.com/nomnomBloopBloop/ferrumnet/actions/workflows/ci.yml/badge.svg)](https://github.com/nomnomBloopBloop/ferrumnet/actions/workflows/ci.yml)
+
 A **userspace TCP/IP stack written from scratch in Rust** — kernel-bypass networking. It sits
 between a raw Linux **TUN** device and the application and does, in userspace, everything the
 kernel normally does invisibly: parse packets, run the TCP state machine, retransmit lost data,
