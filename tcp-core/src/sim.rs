@@ -1443,25 +1443,34 @@ pub fn evolve(train: &[TrainScenario], generations: u32, pop: usize, elite_frac:
 // control — and the natural escalation of the synthesise-and-verify loop the project already has.
 //
 // The searchable trace is a **capacity trajectory**: the bottleneck's service rate follows a
-// schedule of per-slice multipliers (percent of a base rate), cycled over the whole transfer. This
-// is the adversary congestion control actually fears — a link whose bandwidth moves underneath a
-// rate estimator (BBR remembers a stale max for ~10 RTTs, so a well-timed drop overshoots into a
-// standing queue) or a window that has already filled a buffer. Capacity variation, *not* loss, is
-// the lever: independent loss only triggers the loss response, whereas a capacity drop bloats a
-// queue. The envelope is **bounded** — the rate never falls below a floor — so every trace stays
-// *survivable*: the transfer must still complete with full byte integrity, and a non-completion is
-// itself a real bug (the same oracle the fuzzer relies on), never an un-survivably-hostile link.
+// schedule of per-slice multipliers (percent of a base rate), cycled over the whole transfer.
+// Capacity variation, *not* loss, is the lever (independent loss only triggers the loss response;
+// a capacity change bloats a queue), and which trace is worst depends on the objective:
+//   - For the **standing-queue** objective the search converges on a *sustained throttle* — a low
+//     near-constant rate — because mean sojourn is maximised by the slowest drain (every byte waits
+//     longer in a slow-emptying queue), compounded on a short transfer by the controller overshooting
+//     a link slower than its start-up probe expects. It is a worse *operating point*, not a timing
+//     trick: the winning trace is roughly flat-but-low.
+//   - For the **throughput** objective the search finds a genuinely *time-varying* trace — bandwidth
+//     moving underneath a windowed-max rate estimator (BBR remembers a stale max for ~10 RTTs, so a
+//     spike that primes the estimate high followed by a crash drives it into a deep queue). This is
+//     the real timing pathology, and it is BBR-specific (see `adversary_worst_case_report`).
+// The envelope is **bounded** — the rate never falls below a floor — so the *link* is always capable
+// of delivering the transfer. Two distinct non-completions can therefore occur, which the single
+// `completed` flag must not be allowed to conflate: a byte-integrity failure would be a real **stack
+// bug** (the fuzzer's oracle, and it never happens here), whereas a budget *timeout* under the
+// throughput objective is the adversary driving a controller into a near-livelock — a **controller**
+// finding, not a stack bug (the same trace completes fine under a loss-based controller).
 
 /// Slices in an adversarial capacity schedule. The schedule is *cycled* over the whole transfer, so a
 /// short fixed-size genome shapes an arbitrarily long run; 16 gives the search enough degrees of
 /// freedom to place a drop within a controller's probe cycle without an unwieldy search space.
 const ADV_SLICES: usize = 16;
-/// Per-slice capacity multiplier bounds, in **percent of the base rate**. The floor keeps every trace
-/// survivable (capacity never collapses to nothing); the ceiling above 100 lets the adversary build
-/// both bandwidth *drops* and *spikes* — a spike that primes a windowed-max rate estimator high
-/// followed by a crash is the worst pattern for an estimator-paced controller, and keeps the mean
-/// capacity of a random schedule near the base, so "worse than the flat path" is about *shape and
-/// timing*, not merely a lower average bandwidth.
+/// Per-slice capacity multiplier bounds, in **percent of the base rate**. The floor keeps the *link*
+/// always able to deliver the transfer (capacity never collapses to nothing); the ceiling above 100
+/// lets the adversary build both bandwidth *drops* and *spikes* — a spike that primes a windowed-max
+/// rate estimator high followed by a crash is the worst pattern for an estimator-paced controller
+/// (the throughput objective), while the standing-queue objective drives toward the floor instead.
 const ADV_MIN_PCT: u16 = 30;
 const ADV_MAX_PCT: u16 = 150;
 /// Fixed run seed for every adversarial evaluation: the bottleneck is deterministic and carries no
@@ -1494,18 +1503,35 @@ pub struct AdvTrace {
 
 impl AdvTrace {
     /// The unstressed reference: a constant base rate (every slice 100 %) — i.e. the ordinary
-    /// fixed-rate bottleneck, the controller's "average case" with no adversary acting.
+    /// fixed-rate bottleneck, the controller's steady operating point with no adversary acting.
     pub const FLAT: AdvTrace = AdvTrace { schedule: [100; ADV_SLICES] };
+
+    /// The **discovered worst case** — a concrete, named, re-runnable artefact. This is the genuinely
+    /// time-varying capacity trace that `adversary_search(Bbr, ThroughputShortfall, 1 MiB, 160, 0xCAFE)`
+    /// finds (reproduced in the ignored `adversary_worst_case_report`): on it BBR's goodput collapses
+    /// while a loss-based controller is unaffected. Baked here, exactly as the evolved controller's
+    /// genome is baked, so a fast test can exercise the headline without re-running the search.
+    pub const KNOWN_BBR_BREAKER: AdvTrace =
+        AdvTrace { schedule: [33, 33, 33, 94, 33, 105, 33, 33, 30, 42, 70, 33, 33, 33, 33, 33] };
 
     /// The raw per-slice multipliers (percent of base), for inspection / a repro.
     pub fn schedule(&self) -> &[u16] {
         &self.schedule
     }
 
-    /// True if any slice departs from the flat base — i.e. the adversary actually shaped the link
-    /// (a teeth check: a "worst case" that is just the flat path found nothing).
+    /// True if any slice departs from the flat base — i.e. the adversary moved the capacity off the
+    /// constant base line (throttled below it and/or spiked above it). A teeth check that the search
+    /// returned something other than the flat reference; note it does **not** imply *time variation*
+    /// within the trace (a sustained throttle, the mean-queue winner, is uniform-but-below-base — use
+    /// [`AdvTrace::time_varies`] when the claim is specifically about a moving bottleneck).
     pub fn is_varying(&self) -> bool {
         self.schedule.iter().any(|&p| p != 100)
+    }
+
+    /// True if the trace's rate genuinely **changes over time** (its slices are not all equal) — the
+    /// property that distinguishes a timing/shape pathology from a flat throttle.
+    pub fn time_varies(&self) -> bool {
+        self.schedule.iter().min() != self.schedule.iter().max()
     }
 
     /// The link's service rate (bytes/sec) at time `t`: the base rate scaled by the schedule slice
@@ -1661,10 +1687,17 @@ impl AdvLink {
 /// The result of an adversarial bottleneck run — the cost signals a search maximises.
 #[derive(Clone, Copy, Debug)]
 pub struct AdvResult {
-    /// Whether the transfer delivered every byte intact (the survivability oracle).
+    /// `true` only if the transfer delivered every requested byte intact. `false` is **either** a
+    /// byte-integrity failure (a stack bug — never seen) **or**, under the throughput objective, a
+    /// budget timeout (the controller crawled past the step/time budget without finishing — a
+    /// controller-collapse finding, not a stack bug; the data still delivered is `delivered_bytes`).
     pub completed: bool,
     pub sim_time_us: u64,
+    /// Bytes requested (the transfer size).
     pub bytes: usize,
+    /// Bytes actually delivered to the receiver by the time the run ended (= `bytes` on completion;
+    /// less on a timeout). Goodput is computed from this, so it is honest on a non-completing run.
+    pub delivered_bytes: usize,
     /// Mean standing-queue delay on the data direction (µs) — the bufferbloat cost.
     pub mean_queue_us: u64,
     pub max_queue_us: u64,
@@ -1673,10 +1706,11 @@ pub struct AdvResult {
 }
 
 impl AdvResult {
-    /// Goodput in bytes/second over the transfer.
+    /// Goodput in bytes/second: **delivered** bytes over the elapsed time (so a transfer that timed
+    /// out part-way reports the goodput it actually achieved, not the requested rate).
     pub fn throughput_bytes_per_sec(&self) -> u64 {
         if self.sim_time_us > 0 {
-            (self.bytes as u64).saturating_mul(1_000_000) / self.sim_time_us
+            (self.delivered_bytes as u64).saturating_mul(1_000_000) / self.sim_time_us
         } else {
             0
         }
@@ -1692,10 +1726,11 @@ pub fn run_adversarial(env: AdvEnv, trace: AdvTrace, bytes: usize, cc: CcKind) -
     let mut link = AdvLink::new(env, trace);
     let mut now = Instant::from_micros(0);
     let mut steps: u64 = 0;
-    let result = |completed, now: Instant, link: &AdvLink| AdvResult {
+    let result = |completed, now: Instant, delivered: usize, link: &AdvLink| AdvResult {
         completed,
         sim_time_us: now.micros(),
         bytes,
+        delivered_bytes: delivered,
         mean_queue_us: link.mean_queue_us(),
         max_queue_us: link.max_queue_us,
         dropped: link.dropped,
@@ -1718,19 +1753,19 @@ pub fn run_adversarial(env: AdvEnv, trace: AdvTrace, bytes: usize, cc: CcKind) -
 
         let got = received.borrow().len();
         if connected.get() && got >= bytes {
-            return result(*received.borrow() == *payload, now, &link);
+            return result(*received.borrow() == *payload, now, got, &link);
         }
 
         steps += 1;
         if steps > MAX_STEPS || now.micros() > MAX_SIM_US {
-            return result(false, now, &link);
+            return result(false, now, got, &link);
         }
 
         let next = [client.poll_at(), server.poll_at(), link.next_event_at()].into_iter().flatten().min();
         match next {
             Some(t) if t > now => now = t,
             Some(_) => now = now.plus_micros(1),
-            None => return result(false, now, &link),
+            None => return result(false, now, received.borrow().len(), &link),
         }
     }
 }
@@ -1738,12 +1773,16 @@ pub fn run_adversarial(env: AdvEnv, trace: AdvTrace, bytes: usize, cc: CcKind) -
 /// What the adversary maximises against a controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdvObjective {
-    /// The mean standing-queue delay (µs) — drive the bufferbloat as high as it goes.
+    /// The mean standing-queue delay (µs) — drive the bufferbloat as high as it goes. The search
+    /// converges on a *sustained throttle* (a low near-constant rate), since mean sojourn is maximised
+    /// by the slowest drain — a worse operating point, not a timing trick.
     MeanQueueUs,
     /// The worst single-frame standing-queue delay (µs) — the latency-spike cost.
     MaxQueueUs,
-    /// The throughput *shortfall* below the base line rate (B/s) — make the transfer as slow as the
-    /// envelope allows (higher cost = lower goodput).
+    /// The throughput *shortfall* below the base line rate (B/s): `base_rate − achieved goodput`, so a
+    /// higher cost is a slower transfer. This objective finds genuinely *time-varying* traces (a
+    /// windowed-max rate estimator's blind spot) and can drive a controller into a near-livelock —
+    /// goodput here is the honest delivered-bytes goodput, so a stalled transfer scores a real shortfall.
     ThroughputShortfall,
 }
 
@@ -1822,15 +1861,20 @@ struct AdvElite {
 /// and, each iteration, mutates one of them (with an occasional random restart for basin diversity),
 /// retaining any trace that beats the weakest elite — a steady-state evolutionary maximiser. The
 /// first evaluation is the flat reference, so its cost is returned as `flat_cost`. Runs exactly
-/// `iterations` evaluations (so it is an equal-budget comparison against [`adversary_random_baseline`])
-/// and is deterministic in `seed`. `eval` returns `(cost, completed)`.
+/// `iterations` evaluations (so it is an *equal-budget* comparison against
+/// [`adversary_random_baseline`] — though note ~1/4 of those evaluations are random immigrants, i.e.
+/// the same blind sampling, so the guidance's edge comes from the mutation/tournament fraction and is
+/// modest in this low-dimensional schedule space; its surer value is the single refined, reproducible
+/// worst case it returns). Deterministic in `seed`. `eval` returns `(cost, completed)`.
 ///
-/// Returns `(best_trace, best_cost, best_completed, flat_cost, corpus_len)`.
+/// Returns `(best_trace, best_cost, best_completed, flat_cost, corpus_len)`. `iterations` must be ≥ 1
+/// (else `flat_cost` is never measured and stays 0); callers pass a real budget.
 fn maximize_cost<F: FnMut(&AdvTrace) -> (u64, bool)>(
     iterations: u32,
     seed: u64,
     mut eval: F,
 ) -> (AdvTrace, u64, bool, u64, usize) {
+    debug_assert!(iterations >= 1, "the search needs at least one evaluation (the flat reference)");
     const CORPUS_MAX: usize = 16;
     let mut rng = Rng::new(seed ^ 0xAD7E_5A12_3456_789A);
     let mut corpus: Vec<AdvElite> = Vec::new(); // kept sorted by cost, descending
@@ -2458,18 +2502,20 @@ mod tests {
         AdvEnv { base_rate_bytes_per_sec: 2_500_000, buffer_bytes: 1024 * 1024, base_delay_us: 3_000, slice_us: 6_000, aqm: Aqm::TailDrop }
     }
 
-    /// THE ADVERSARY HAS TEETH. Pointed at BBR with the **mean-queue** objective, the search finds a
-    /// reproducible capacity trace that bloats BBR's standing queue **far past** the queue it holds on
-    /// the steady (flat-rate) link — its pacing advantage, the whole point of BBR, erased by a link
-    /// whose bandwidth simply moves underneath its rate estimate. And the guided search beats blind
-    /// sampling at equal budget: the worst trace it climbs to is at least as bad as the worst of the
-    /// same number of uniformly-random traces. The found trace is a concrete, re-runnable artefact —
-    /// it replays bit-for-bit — so this is "the trace that bloats BBR," not a statistical anecdote.
-    /// (Measured here: flat ≈ 7.9 ms, guided ≈ 26–32 ms — 3–4× — and the full 1 MiB reproduction in
-    /// the ignored `adversary_worst_case_report` reaches ~6–8× and a throughput *collapse*.)
+    /// THE ADVERSARY HAS TEETH (the standing-queue lever). Pointed at BBR with the **mean-queue**
+    /// objective, the search finds a reproducible capacity profile that bloats BBR's standing queue
+    /// **far past** the queue it holds on the steady (full-rate) link. For *this* objective the worst
+    /// case is a **sustained throttle** — a low near-constant rate (the search drives toward the
+    /// floor), since mean sojourn is maximised by the slowest drain, compounded on a short transfer by
+    /// BBR overshooting a link slower than its start-up probe expects. So the cost here is a worse
+    /// *operating point*, not a timing trick (the genuine timing pathology is the throughput objective;
+    /// see `adversary_breaks_bbr_specifically_on_a_time_varying_trace`). The worst trace replays
+    /// bit-for-bit, so it is a concrete artefact, not an anecdote. (Measured: flat ≈ 7.9 ms, guided
+    /// ≈ 26–32 ms — 3–4× — and the full 1 MiB reproduction in `adversary_worst_case_report` reaches
+    /// ~6×.)
     #[test]
-    #[cfg_attr(miri, ignore)] // a coverage search of dozens of full transfers — far too slow for Miri
-    fn adversary_finds_a_capacity_trace_that_bloats_bbr_past_its_steady_queue() {
+    #[cfg_attr(miri, ignore)] // a search over dozens of full transfers — far too slow for Miri
+    fn adversary_finds_a_capacity_profile_that_bloats_bbrs_queue() {
         let env = adv_env();
         let bytes = 192 * 1024;
         let budget = 56;
@@ -2477,36 +2523,41 @@ mod tests {
         let report = adversary_search(CcKind::Bbr, AdvObjective::MeanQueueUs, env, bytes, budget, seed);
         let baseline = adversary_random_baseline(CcKind::Bbr, AdvObjective::MeanQueueUs, env, bytes, budget, seed);
 
-        // Survivability oracle: the envelope only reshapes capacity within a floor, so every trace must
-        // still deliver every byte intact. A non-completion here would be a genuine bug (a wedge under
-        // capacity variation), exactly as a fuzzer finding is — not an un-survivably-hostile link.
+        // Survivability oracle (for THIS objective): the mean-queue search never rewards stalling, so
+        // every trace still delivers every byte intact. A non-completion here would be a genuine stack
+        // bug (a wedge under capacity variation), not an un-survivably-hostile link.
         assert!(report.best_completed, "the worst-case trace must still complete with integrity: {report:?}");
         assert!(baseline.all_completed, "every random trace completes too: {baseline:?}");
 
-        // Teeth as an executed invariant: the adversary actually shaped the link (a non-flat schedule)
-        // and climbed above the flat reference — it didn't just report the unstressed path.
-        assert!(report.best_trace.is_varying(), "the worst case is a non-trivial capacity schedule: {:?}", report.best_trace);
-        assert!(report.best_cost > report.flat_cost, "the search improved over the flat seed: {} vs {}", report.best_cost, report.flat_cost);
+        // The search machinery actually operated (the elite corpus filled — the analogue of the
+        // fuzzer's corpus-populated guard) and moved the capacity off the flat base line.
+        assert!(report.corpus_size >= 8, "the search kept a populated elite corpus: {}", report.corpus_size);
+        assert!(report.best_trace.is_varying(), "the worst case moved the capacity off the flat base: {:?}", report.best_trace);
 
-        // Headline: the found worst case bloats BBR's queue far past its steady-link average case...
+        // The load-bearing teeth: the found worst case bloats BBR's queue far past BOTH its steady
+        // full-rate queue AND the average random trace at equal budget (this margin is robust across
+        // seeds — guided/flat and guided/random-mean both ≈ 3–4×).
         assert!(
             report.best_cost > report.flat_cost * 2,
-            "the adversary bloats BBR's queue well past its steady-link queue: worst {} µs vs flat {} µs",
+            "the adversary bloats BBR's queue well past its steady full-rate queue: worst {} µs vs flat {} µs",
             report.best_cost,
             report.flat_cost
         );
-        // ...and guided search beats blind sampling at equal budget (≥ the random max, ≫ the random mean).
-        assert!(
-            report.best_cost >= baseline.max_cost,
-            "guided search ≥ blind sampling at equal budget: guided {} vs random-max {}",
-            report.best_cost,
-            baseline.max_cost
-        );
         assert!(
             report.best_cost > baseline.mean_cost * 2,
-            "guided worst ≫ the random-trace average (the controller's average case under variation): {} vs mean {}",
+            "guided worst ≫ the average random trace at equal budget: {} vs mean {}",
             report.best_cost,
             baseline.mean_cost
+        );
+        // Guidance is at least competitive with blind sampling's *best* at equal budget. (We don't
+        // claim it strictly dominates: this 16-slice space is low-dimensional, so blind sampling is a
+        // strong baseline — as with the coverage fuzzer, guidance's surer value is the single refined,
+        // reproducible artefact. This `>= max` holds at this seed; it is not asserted as a general law.)
+        assert!(
+            report.best_cost >= baseline.max_cost,
+            "guided meets-or-beats blind at this seed/budget: guided {} vs random-max {}",
+            report.best_cost,
+            baseline.max_cost
         );
 
         // The whole campaign and the worst trace replay bit-for-bit — a found seed is a complete repro.
@@ -2515,6 +2566,55 @@ mod tests {
         assert!(report.best_trace == again.best_trace, "...and the same worst trace");
         let replay = run_adversarial(env, report.best_trace, bytes, CcKind::Bbr);
         assert_eq!(replay.mean_queue_us, report.best_cost, "the worst trace replays bit-for-bit to its cost");
+    }
+
+    /// THE HEADLINE FINDING (CI-verified): a **time-varying** capacity trace the adversary discovered
+    /// — `AdvTrace::KNOWN_BBR_BREAKER`, the output of `adversary_search(Bbr, ThroughputShortfall, …)`
+    /// reproduced in the ignored report — **collapses BBR's goodput specifically**, while a loss-based
+    /// controller on the *same trace* is barely affected. This is the real timing pathology: bandwidth
+    /// moving underneath BBR's windowed-max rate estimate drives it into a near-livelock. The asymmetry
+    /// (BBR alone suffers) is the proof it is a genuine BBR weakness, not an artefact of the link model
+    /// — the link is controller-agnostic, so a controller-specific outcome is the controller's doing.
+    /// Baked as a constant (like the evolved genome), so this runs fast and deterministically without
+    /// re-running the search.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn adversary_breaks_bbr_specifically_on_a_time_varying_trace() {
+        let env = adv_env();
+        let trace = AdvTrace::KNOWN_BBR_BREAKER;
+        let bytes = 512 * 1024;
+
+        // It is a genuine *time-varying* trace (slices differ), not a flat throttle.
+        assert!(trace.time_varies(), "the discovered trace genuinely varies over time: {trace:?}");
+
+        let bbr = run_adversarial(env, trace, bytes, CcKind::Bbr);
+        let reno = run_adversarial(env, trace, bytes, CcKind::Reno);
+        let cubic = run_adversarial(env, trace, bytes, CcKind::Cubic);
+        let dctcp = run_adversarial(env, trace, bytes, CcKind::Dctcp);
+
+        // All deliver intact (the link is survivable for every controller) — BBR's problem is *speed*,
+        // not correctness.
+        assert!(bbr.completed && reno.completed && cubic.completed && dctcp.completed, "all complete intact: bbr {bbr:?} reno {reno:?}");
+
+        // The collapse is BBR-specific: on the SAME trace BBR's goodput is a fraction of the loss-based
+        // controllers' (measured ≈ 6× slower — 168 KB/s vs ~1 MB/s); a 3× gap leaves wide margin.
+        assert!(
+            bbr.throughput_bytes_per_sec() * 3 < reno.throughput_bytes_per_sec(),
+            "BBR's goodput collapses where Reno's does not: bbr {} B/s vs reno {} B/s",
+            bbr.throughput_bytes_per_sec(),
+            reno.throughput_bytes_per_sec()
+        );
+        // And it really is BBR-specific, not "loss-based vs scalable": CUBIC and DCTCP also sail through.
+        assert!(bbr.throughput_bytes_per_sec() * 3 < cubic.throughput_bytes_per_sec(), "...also far below CUBIC: {} vs {}", bbr.throughput_bytes_per_sec(), cubic.throughput_bytes_per_sec());
+        assert!(bbr.throughput_bytes_per_sec() * 3 < dctcp.throughput_bytes_per_sec(), "...and DCTCP: {} vs {}", bbr.throughput_bytes_per_sec(), dctcp.throughput_bytes_per_sec());
+
+        // The loss-based controllers are unaffected enough to roughly hold the line (a clear majority of
+        // the 2.5 MB/s base), so the trace isn't simply a slow link for everyone.
+        assert!(reno.throughput_bytes_per_sec() > 700_000, "Reno roughly holds the line on the same trace: {} B/s", reno.throughput_bytes_per_sec());
+
+        // Deterministic: the baked trace replays bit-for-bit to the same goodput.
+        let again = run_adversarial(env, trace, bytes, CcKind::Bbr);
+        assert_eq!(bbr.throughput_bytes_per_sec(), again.throughput_bytes_per_sec(), "replays bit-for-bit");
     }
 
     /// Correctness cross-check for the new time-varying link: on a **flat** trace (constant base rate)
@@ -2532,6 +2632,8 @@ mod tests {
         let bbr = run_adversarial(env, AdvTrace::FLAT, bytes, CcKind::Bbr);
         assert!(reno.completed && bbr.completed, "both deliver intact on the flat link: reno {reno:?} bbr {bbr:?}");
         assert_eq!(reno.dropped, 0, "Reno is window-limited under a buffer > rwnd — pure bufferbloat, no drops: {reno:?}");
+        // Measured: bbr ≈ 17.9 ms vs reno ≈ 42.4 ms (2.37×), so `bbr*2 < reno` captures "Reno bloats
+        // materially more than paced BBR" with margin (and is deterministic, so it cannot flake).
         assert!(
             bbr.mean_queue_us * 2 < reno.mean_queue_us,
             "paced BBR holds a far smaller standing queue than loss-based Reno: bbr {} µs vs reno {} µs",
@@ -2539,7 +2641,7 @@ mod tests {
             reno.mean_queue_us
         );
         // A flat trace does not vary — the reference, by construction.
-        assert!(!AdvTrace::FLAT.is_varying());
+        assert!(!AdvTrace::FLAT.is_varying() && !AdvTrace::FLAT.time_varies());
     }
 
     /// The full reproduction (ignored — dozens of 1 MiB searches). Prints, for each controller, the
@@ -2557,6 +2659,7 @@ mod tests {
         let budget = 160;
 
         eprintln!("== mean standing queue (µs) an adversary can inflict, 1 MiB, budget {budget} ==");
+        let bbr_q = adversary_search(CcKind::Bbr, AdvObjective::MeanQueueUs, env, mib, budget, 0xB0A7);
         for cc in [CcKind::Bbr, CcKind::Reno, CcKind::Cubic, CcKind::Dctcp, CcKind::Prague, CcKind::Learned] {
             let g = adversary_search(cc, AdvObjective::MeanQueueUs, env, mib, budget, 0xB0A7);
             let b = adversary_random_baseline(cc, AdvObjective::MeanQueueUs, env, mib, budget, 0xB0A7);
@@ -2565,16 +2668,24 @@ mod tests {
                 g.flat_cost, b.mean_cost, b.max_cost, g.best_cost, g.best_cost as f64 / g.flat_cost.max(1) as f64
             );
         }
+        // Guard the headline number so a regression that weakened it fails loudly (not just prints low).
+        assert!(bbr_q.best_cost > bbr_q.flat_cost * 5, "BBR mean queue bloats >5× flat: {} vs {}", bbr_q.best_cost, bbr_q.flat_cost);
 
         eprintln!("== the trace that breaks BBR (throughput-shortfall objective) ==");
         let g = adversary_search(CcKind::Bbr, AdvObjective::ThroughputShortfall, env, mib, budget, 0xCAFE);
         eprintln!("  worst trace {:?}  (BBR completed: {})", g.best_trace, g.best_completed);
+        let mut bbr_gp = 0u64;
+        let mut reno_gp = 0u64;
         for cc in [CcKind::Bbr, CcKind::Reno, CcKind::Cubic, CcKind::Dctcp] {
             let r = run_adversarial(env, g.best_trace, mib, cc);
+            if cc == CcKind::Bbr { bbr_gp = r.throughput_bytes_per_sec(); }
+            if cc == CcKind::Reno { reno_gp = r.throughput_bytes_per_sec(); }
             eprintln!(
                 "  {cc:>8?} on that trace: completed {:>5} | {:>4} s sim | goodput {:>8} B/s",
                 r.completed, r.sim_time_us / 1_000_000, r.throughput_bytes_per_sec()
             );
         }
+        // Guard the asymmetry: BBR's goodput on its worst trace is far below Reno's on the same trace.
+        assert!(bbr_gp * 10 < reno_gp, "BBR goodput collapses where Reno's holds: bbr {bbr_gp} vs reno {reno_gp} B/s");
     }
 }

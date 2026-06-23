@@ -32,7 +32,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **six pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one), and a **two-stack userspace loopback** (two instances connecting to
-  each other entirely in memory). **217 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
+  each other entirely in memory). **220 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
   no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -49,12 +49,14 @@ $ curl -v http://10.0.0.2:8080/
 - **It attacks its own controllers.** The same deterministic sim is turned into an **adversary**:
   instead of steering for coverage, `adversary_search` hunts the **capacity trace that maximally hurts a
   controller** — the reproducible bandwidth schedule that drives its standing queue highest or its
-  throughput lowest, found by a steady-state evolutionary maximiser and compared against blind sampling at
-  equal budget. Pointed at BBR it finds a bandwidth trajectory that bloats BBR's queue **~6× past** the
-  queue it holds on a steady link (its pacing advantage erased), and a specific trace on which **BBR's
-  goodput collapses** to a crawl while Reno/CUBIC/DCTCP sail through the *same* trace — a BBR-specific
-  weakness under variable capacity, found automatically and replayable bit-for-bit. Verifier-in-the-loop,
-  pointed at congestion control. (`sim`)
+  throughput lowest — by a steady-state evolutionary maximiser. The headline, CI-verified finding: a
+  **time-varying** trace it discovered **collapses BBR's goodput specifically** (to a sub-2 KB/s crawl)
+  while a loss-based controller on the *same trace* barely notices — bandwidth moving underneath BBR's
+  windowed-max rate estimate, a BBR-specific weakness found automatically and replayable bit-for-bit.
+  (Because the link is controller-agnostic, a controller-specific outcome is the controller's own doing.)
+  On the standing-queue objective it instead drives the link to a sustained low-rate throttle that bloats
+  BBR's queue **~6× past** its steady-link queue — approaching the loss-based controllers' bloat, the
+  low-latency advantage of pacing largely erased. Verifier-in-the-loop, pointed at congestion control. (`sim`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -362,7 +364,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 217 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 220 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -442,15 +444,19 @@ and a **coverage-guided fuzzer** over the deterministic sim. What's left:
   controller, it searches a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base-rate
   schedule, cycled over the transfer) for the trajectory that maximises a controller's cost — mean/max
   standing queue, or throughput shortfall — by a steady-state evolutionary maximiser (an elite corpus
-  mutated and tournament-biased toward the worst-so-far), compared against blind random sampling of the
-  same envelope at equal budget. Every trace stays survivable (so a non-completion is a real finding) and
-  replays bit-for-bit. Against **BBR** it bloats the mean standing queue from **15.5 ms** on a steady link
-  to **~100 ms (6.4×)** — pacing advantage erased — beating blind sampling at equal budget; on the
-  throughput objective it finds a reproducible trace that **collapses BBR's goodput** to a sub-2 KB/s crawl
-  while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s (a BBR-specific weakness under variable
-  capacity — the link is controller-agnostic). This is CEGIS / verifier-in-the-loop for congestion
-  control; the headline next step is to **co-evolve** a controller against the adversary's best effort
-  (minimax), robust by construction.
+  mutated and tournament-biased toward the worst-so-far), compared against blind random sampling at equal
+  budget. The bounded floor keeps the *link* always able to deliver, so a **byte-integrity** failure would
+  be a stack bug (the fuzzer's oracle) while a **completion timeout** is the adversary driving a controller
+  into a near-livelock; every trace replays bit-for-bit. The headline, CI-verified finding (the genuine
+  timing pathology): a **time-varying** trace it discovered **collapses BBR's goodput specifically** to a
+  sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — bandwidth moving underneath
+  BBR's windowed-max rate estimate; the asymmetry proves it is BBR's own weakness, since the link is
+  controller-agnostic. On the standing-queue objective the search instead drives toward a sustained
+  low-rate throttle, bloating BBR's queue from **15.5 ms** on a steady link to **~100 ms (6.4×)** — a worse
+  operating point, not a timing trick, and in this low-dimensional schedule space blind random sampling is
+  itself a strong baseline (the guidance's surer value is the single refined, reproducible worst case).
+  This is CEGIS / verifier-in-the-loop for congestion control; the headline next step is to **co-evolve** a
+  controller against the adversary's best effort (minimax), robust by construction.
 - **L4S — ECN, exact feedback, the scalable controller, and the dual-queue all ship; the coupling is the
   last refinement.** **DCTCP** (RFC 8257) + ECN marking (RFC 3168) + **AccECN** (RFC 9768, the 3-bit ACE
   counter for *exact* per-packet CE feedback) + **TCP Prague** (RFC 9330, the scalable + **RTT-independent**

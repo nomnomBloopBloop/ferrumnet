@@ -616,27 +616,40 @@ modelled by `run_adversarial` with an explicit byte-FIFO so the time-varying rat
 `adversary_search` is a steady-state evolutionary maximiser: an elite corpus of the worst traces seen,
 mutated by point / block / nudge moves and **tournament-biased toward the worst-so-far** (with occasional
 random immigrants), driving a chosen cost — the mean or max standing queue, or the throughput shortfall.
-The envelope is **bounded** (capacity never falls below a floor) so every trace stays *survivable*: a
-transfer that fails to complete is a genuine finding, the same oracle the fuzzer uses — and a found trace
-replays bit-for-bit, so the output is a concrete *artefact* ("the trace that bloats BBR"), not an
-anecdote. It is compared to **blind random sampling of the same envelope at equal budget**, so beating the
-baseline shows the guidance found structure, not luck.
+The envelope is **bounded** (capacity never falls below a floor) so the *link* is always capable of
+delivering the transfer — which means the single `completed` flag covers two distinct failures that must
+not be conflated: a **byte-integrity** failure would be a real stack bug (the fuzzer's oracle, and it never
+happens), whereas a **completion timeout** is the adversary driving a controller into a near-livelock — a
+controller finding, not a stack bug. A found trace replays bit-for-bit, so the output is a concrete
+*artefact*, not an anecdote, and is compared to **blind random sampling of the same envelope at equal
+budget**. (Caveat, kept honest: ~1/4 of the guided budget is itself random immigrants, and in this
+16-slice space blind sampling is a strong baseline, so the guidance's edge over blind is modest; its surer
+value is the single refined, reproducible worst case it returns.)
 
-Measured against BBR on a 2.5 MB/s / 1 MiB-buffer / 3 ms link (`Aqm::TailDrop`): the steady flat-rate link
-holds a **15.5 ms** mean standing queue; the adversary finds a capacity trace that bloats it to **~100 ms
-(6.4×)** — BBR's pacing advantage, its whole reason for being, *erased* by a link whose bandwidth simply
-moves under its windowed rate estimate — and the guided search meets-or-beats the worst of equal-budget
-random traces. Pointed at the *throughput* objective it surfaces a sharper finding: a specific trace
-(`[33,33,33,94,33,105,33,…] %`) on which **BBR's goodput collapses** to a sub-2 KB/s crawl — a near-
-livelock that *worsens* with transfer size (90 %+ progress then stalls; it is a budget timeout, never an
-integrity violation), while the **same trace** lets Reno/CUBIC/DCTCP complete at ~1 MB/s. That asymmetry
-is the tell that it is a real **BBR-specific** pathology under variable capacity (the link is
-controller-agnostic), found automatically. Loss-based controllers are already buffer-filling, so the queue
-lever against them is weaker (~3.4×), and under a plain tail-drop AQM the ECN controllers fall back to
-their loss response and bloat like Reno — BBR, the controller that *tries* to be clever about the
-bottleneck, is precisely the one with the exploitable gap. This is the verifier-in-the-loop / CEGIS
-discipline pointed at congestion control; the natural next step is to **co-evolve** a controller against
-the adversary's best machine-found effort (minimax / GAN-like), robust by construction.
+Which trace is worst depends on the objective, and the distinction matters:
+
+- **Standing queue.** The search converges on a *sustained throttle* — a low near-constant rate — because
+  mean sojourn is maximised by the slowest drain (every byte waits longer in a slow-emptying queue),
+  compounded on a short transfer by BBR overshooting a link slower than its start-up probe expects. So on a
+  2.5 MB/s / 1 MiB-buffer / 3 ms link (`Aqm::TailDrop`) the steady full-rate link holds a **15.5 ms** mean
+  queue and the adversary drives it to **~100 ms (6.4×)** — BBR's queue approaching the loss-based
+  controllers' bloat, the low-latency advantage of pacing largely erased. This is a worse *operating
+  point*, not a timing trick (the winning trace is roughly flat-but-low), and it is the honest framing.
+  (Loss-based controllers are already buffer-filling, so the lever against them is weaker, ~3.4×; under a
+  plain tail-drop AQM the ECN controllers fall back to their loss response and bloat like Reno.)
+- **Throughput — the headline, CI-verified finding.** Here the search finds a genuinely *time-varying*
+  trace (`AdvTrace::KNOWN_BBR_BREAKER` = `[33,33,33,94,33,105,33,…] %`) on which **BBR's goodput collapses**
+  to a sub-2 KB/s crawl — a near-livelock that worsens with transfer size (90 %+ progress then stalls; a
+  budget timeout, never an integrity violation) — while the **same trace** lets Reno/CUBIC/DCTCP complete
+  at ~1 MB/s. That asymmetry is the tell that it is a real **BBR-specific** pathology under variable
+  capacity: the link is controller-agnostic, so a controller-specific outcome is the controller's own
+  doing — bandwidth moving underneath BBR's windowed-max rate estimate. A fast test bakes the discovered
+  trace (exactly as the evolved genome is baked) and asserts the collapse and the asymmetry, so the
+  headline is enforced in CI; the full search reproduction is the ignored `adversary_worst_case_report`.
+
+This is the verifier-in-the-loop / CEGIS discipline pointed at congestion control; the natural next step is
+to **co-evolve** a controller against the adversary's best machine-found effort (minimax / GAN-like),
+robust by construction.
 
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
@@ -747,7 +760,7 @@ assurance learned controllers usually lack.
 | M17 | **TCP Prague** (`Cc::Prague`) — the L4S scalable controller: DCTCP's proportional ECN response + an **RTT-independent** additive increase (per-RTT step scaled by `srtt / 25 ms`) + a classic Reno loss fallback; fed RTT via a no-op-default `on_rtt_sample` hook | holds a sub-millisecond queue end-to-end on the CE-marking bottleneck like DCTCP; growth *per second* is constant across RTT (unit-proven), the lever for fair L4S coexistence |
 | M18 | **Dual-queue L4S bottleneck** (`DualQueue` / `run_dualqueue`) — the dualPI2 structure: a multi-flow shared link, fair per-class round-robin scheduler, ECN-classified shallow (CE-marked) L4S queue vs deep (tail-drop) Classic queue | a Prague (L4S) + Reno (classic) pair coexist — both complete, neither starved — and the L4S flow holds a **sub-ms** queue while the classic flow bloats to **~90 ms** on the same link (latency isolation); coupled-PI marking for robust throughput fairness is the noted refinement |
 | M19 | **Provably-safe synthesised congestion control** (`bmc::check_controller_safety` / `check_learned_genome_space`) — turn the bounded model checker on the controllers: a 5-clause safety envelope (starvation-freedom, loss never inflates `cwnd` past the FlightSize, ECN/clean-ACK monotonicity, `ssthresh` floor) over every event sequence, with FlightSize modelled independently of `cwnd` (`flight > cwnd` is reachable) | Reno/DCTCP/Prague + the evolved genome all satisfy it exhaustively, and the **whole sanitised genome family** (243-genome grid, ~1.3 M states, + a structural argument to the continuum) is bounded-proven safe — "evolve *and* prove"; an unsanitised `md_loss=2` genome is caught inflating `cwnd` past the pipe, proving the sanitiser is load-bearing; the adversarial review caught and fixed the original flight-model under-approximation |
-| M20 | **Adversarial worst-case discovery** (`adversary_search` / `run_adversarial`) — invert the trainer into a minimax adversary: search a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base rate schedule) for the trajectory that maximises a controller's mean/max standing queue or throughput shortfall; a steady-state evolutionary maximiser over an elite corpus, equal-budget-compared to blind random sampling, every trace survivable and replayable bit-for-bit | against BBR the search bloats the mean standing queue from **15.5 ms (steady) to ~100 ms (6.4×)**, erasing its pacing advantage, and beats blind sampling at equal budget; the throughput objective surfaces a reproducible trace that **collapses BBR's goodput** to a sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — a BBR-specific pathology under variable capacity, found automatically; the verifier-in-the-loop step before co-evolving a robust controller |
+| M20 | **Adversarial worst-case discovery** (`adversary_search` / `run_adversarial`) — invert the trainer into a minimax adversary: search a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base rate schedule) for the trajectory that maximises a controller's mean/max standing queue or throughput shortfall; a steady-state evolutionary maximiser over an elite corpus, equal-budget-compared to blind random sampling, every trace replayable bit-for-bit | the headline (CI-verified, baked discovered trace): a **time-varying** trace **collapses BBR's goodput** to a sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — a BBR-specific pathology (bandwidth under its windowed-max estimate; the link is controller-agnostic, so the asymmetry is BBR's doing). The standing-queue objective separately drives a sustained throttle that bloats BBR's queue **15.5 ms → ~100 ms (6.4×)**, largely erasing pacing's latency edge; the verifier-in-the-loop step before co-evolving a robust controller |
 
 ## 9. Environment
 
