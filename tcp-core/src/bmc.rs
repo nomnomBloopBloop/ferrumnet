@@ -330,6 +330,17 @@ fn apply_cc<C: CongestionControl>(c: &mut C, ev: CcEvent, mss: u32) -> Option<u3
     }
 }
 
+// The three *gain-dependent* clauses (2/3/4) each open their violation message with a stable tag below.
+// `crate::sim`'s CEGIS repair routes a counterexample to the matching response by `contains`-ing these
+// tags, so they are part of the cross-module contract: both sides reference these consts (not a literal
+// copy), so a reword is a single compile-coupled edit and the teeth tests pin that the message carries it.
+/// Violation-message tag for clause 2 (a loss inflated `cwnd` past the pipe).
+pub(crate) const CLAUSE_LOSS_INFLATED: &str = "loss inflated cwnd";
+/// Violation-message tag for clause 3 (an ECN mark grew `cwnd`).
+pub(crate) const CLAUSE_ECN_GREW: &str = "ECN mark grew cwnd";
+/// Violation-message tag for clause 4 (a clean ACK shrank `cwnd`).
+pub(crate) const CLAUSE_ACK_SHRANK: &str = "clean ACK shrank cwnd";
+
 /// The **safety envelope** a congestion controller must satisfy after every event — the machine-checked
 /// guarantees that make a *synthesised* (evolved) controller trustworthy regardless of its gains. The
 /// loss clauses take the **FlightSize** the event reported (`loss_flight`), since the RFC 5681 loss
@@ -360,17 +371,17 @@ fn cc_safety_invariants(
     }
     if let Some(flight) = loss_flight {
         if cwnd > flight.max(2 * mss) {
-            return Err(format!("loss inflated cwnd above the FlightSize: cwnd {cwnd} > max(flight {flight}, 2·MSS {})", 2 * mss));
+            return Err(format!("{CLAUSE_LOSS_INFLATED} above the FlightSize: cwnd {cwnd} > max(flight {flight}, 2·MSS {})", 2 * mss));
         }
         if ssthresh < 2 * mss {
             return Err(format!("ssthresh {ssthresh} below the 2·MSS floor {} after loss", 2 * mss));
         }
     }
     if matches!(ev, CcEvent::Ecn(..)) && cwnd > cwnd_before {
-        return Err(format!("an ECN mark grew cwnd: {cwnd_before} -> {cwnd}"));
+        return Err(format!("an {CLAUSE_ECN_GREW}: {cwnd_before} -> {cwnd}"));
     }
     if matches!(ev, CcEvent::Ack(a) if a > 0) && cwnd < cwnd_before {
-        return Err(format!("a clean ACK shrank cwnd: {cwnd_before} -> {cwnd}"));
+        return Err(format!("a {CLAUSE_ACK_SHRANK}: {cwnd_before} -> {cwnd}"));
     }
     Ok(())
 }
@@ -560,7 +571,7 @@ mod tests {
         let unsafe_report = check_controller_safety(Learned::with_raw_params(mss as u16, pathological), mss, 3);
         assert!(unsafe_report.violations > 0, "an unsanitised md_loss=2 genome must inflate cwnd past the FlightSize on loss");
         assert!(
-            unsafe_report.first_violation.as_deref().unwrap_or("").contains("loss inflated cwnd"),
+            unsafe_report.first_violation.as_deref().unwrap_or("").contains(CLAUSE_LOSS_INFLATED),
             "the violation is the loss-inflation one: {:?}",
             unsafe_report.first_violation
         );
@@ -619,7 +630,7 @@ mod tests {
         let r = check_controller_safety(Synth::with_program(mss as u16, p), mss, 4);
         assert!(r.violations > 0, "a negative-increase law must violate the envelope");
         assert!(
-            r.first_violation.as_deref().unwrap_or("").contains("clean ACK shrank cwnd"),
+            r.first_violation.as_deref().unwrap_or("").contains(CLAUSE_ACK_SHRANK),
             "the violation is the clean-ACK-shrink one: {:?}",
             r.first_violation
         );
@@ -630,7 +641,7 @@ mod tests {
         let r = check_controller_safety(Synth::with_program(mss as u16, p), mss, 4);
         assert!(r.violations > 0, "a negative-cut ECN law must violate the envelope");
         assert!(
-            r.first_violation.as_deref().unwrap_or("").contains("ECN mark grew cwnd"),
+            r.first_violation.as_deref().unwrap_or("").contains(CLAUSE_ECN_GREW),
             "the violation is the ECN-growth one: {:?}",
             r.first_violation
         );
@@ -641,7 +652,7 @@ mod tests {
         let r = check_controller_safety(Synth::with_program(mss as u16, p), mss, 4);
         assert!(r.violations > 0, "an inflating loss law must violate the envelope");
         assert!(
-            r.first_violation.as_deref().unwrap_or("").contains("loss inflated cwnd"),
+            r.first_violation.as_deref().unwrap_or("").contains(CLAUSE_LOSS_INFLATED),
             "the violation is the loss-inflation one: {:?}",
             r.first_violation
         );

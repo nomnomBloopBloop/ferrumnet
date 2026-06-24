@@ -103,12 +103,13 @@ $ curl -v http://10.0.0.2:8080/
   + CEM-constant hybrid. (`sim` + `bmc`)
 - **The verifier doesn't just reject — it *repairs* (CEGIS-with-repair).** The next turn of the same loop:
   instead of discarding an unsafe candidate, feed the `bmc`'s **counterexample** back as a repair signal —
-  it names the violated clause, so a targeted, structure-preserving projection heals just the offending
-  response (clamp the loss target to the pipe, floor the increase, restore the safe ECN baseline) and the
-  result is re-verified. So a near-safe-but-good law is *healed*, not thrown away. Honest measure: on the
-  held-out set the repaired search lands a safe law of comparable fitness (a hair better — 0.63× vs 0.61×
-  goodput at a slightly lower queue) while **discarding nothing**, and its loss response is the sensible
-  `½·FlightSize` rather than the filter's degenerate collapse-to-floor. (`sim` + `bmc`)
+  it names the violated clause, so a **sound, targeted** repair fixes just the offending response (the
+  loss/increase repairs clamp that response's output; the ECN repair resets it to the safe baseline) and
+  the result is re-verified. So a near-safe law is *healed*, not thrown away. The load-bearing measure
+  (single de-risk seed): repair **discards nothing** — it healed 46 candidates where the filter rejected 55
+  — and its survivor is `bmc`-safe and no worse than the seed. That's the win: **sample efficiency at equal
+  safety**, not a better law (on that seed its bred fitness was a hair *lower* and its held-out goodput a
+  hair higher — within noise; the constant-resolution ceiling from the GP synthesis still binds). (`sim` + `bmc`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.

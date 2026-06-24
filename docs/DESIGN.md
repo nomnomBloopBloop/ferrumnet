@@ -773,22 +773,32 @@ not yet asserted by an automated cross-platform golden.
 **The verifier as a repair operator, not just a filter — CEGIS-with-repair (M24).** The synthesis above uses
 the `bmc` as a *gate*: an unsafe candidate is discarded, throwing away the whole program — including its two
 safe responses — for one unsafe one. This turns the gate into **counterexample-guided repair**. `Synth`'s
-`bmc` violation messages name the offending clause, so `repair_to_safe` reads the counterexample and applies a
-**targeted, structure-preserving projection** to just the offending response — `repair_loss` caps the loss
-target at the FlightSize (`min(·, flight)`, provably ≤ pipe), `repair_increase` floors the increase at ½
-segment/RTT (`max(·, ½)`, provably > 0 so no shrink), `repair_ecn` restores the safe DCTCP baseline `α/2`
-(a clean `max(cut, 0)` is not expressible without a zero constant, so the baseline is the projection there) —
-then re-checks and iterates. The three gain clauses are independent and each repair is idempotent for its
-clause, so it converges in ≤ 3 steps (a defensive cap then falls back to the `bmc`-proven `AIMD`). The healed
-program is what gets scored and propagated, so the verifier actively shapes the population toward safety while
-keeping each candidate's already-safe responses. `evolve_control_law(repair=true)` selects this; `repair=false`
-is the original filter. The honest measure (`cegis_repair_vs_filter_derisk`, same seed and budget): repair
-**discards nothing** — where the filter rejected 55 candidates, repair healed 46 — and lands a safe law of
-comparable fitness that *generalises a hair better* on the held-out set (0.63× vs 0.61× goodput at a slightly
-lower queue), with a **less degenerate loss response** — the healed winner's loss law is the sensible
-`½·FlightSize` (Reno's MD) rather than the filter's collapse-to-the-floor. So the win is sample efficiency and
-a healthier law at equal safety, *not* a fitness breakthrough (the M23 constant-resolution ceiling still
-binds, so the tests assert "discards nothing + stays safe + no worse than the seed", not "beats the filter").
+`bmc` violation messages name the offending clause (via shared tag consts, so the cross-module coupling is
+compile-checked), so `repair_to_safe` reads the counterexample and applies a **sound, targeted** repair to
+just the offending response (the other two stay byte-identical) — `repair_loss` makes the loss output
+`min(·, flight)` (provably ≤ pipe), `repair_increase` makes the increase `max(·, ½)` (provably > 0 so no
+shrink), `repair_ecn` resets the ECN response to the safe DCTCP baseline `α/2` (a clean `max(cut, 0)` is not
+expressible without a zero constant). The repairs are **asymmetric, and the code/docs are precise about it**:
+the loss/increase repairs overwrite the offending response's *output instruction* with the clamp, so they are
+a faithful clamp of the discovered output only when that instruction was an identity carry — the seed shape,
+and the usual shape of the live search's output slot — and otherwise they discard the final op and clamp the
+prior register (still sound, not output-faithful); the ECN repair discards the discovered ECN law wholesale.
+The three gain clauses are independent and each repair is idempotent for its clause, so it converges in ≤ 3
+steps (a 4-iteration cap then falls back to `AIMD`, which is *independently* `bmc`-proven safe). The healed
+program is scored and propagated, so the verifier shapes the population toward safety while keeping each
+candidate's safe responses. `evolve_control_law(repair=true)` selects this; `repair=false` is the original
+filter. The **load-bearing, tested** result: repair **discards nothing** — on the de-risk seed it healed 46
+candidates where the filter rejected 55 — and its survivor is `bmc`-safe (re-checked one bound deeper) and no
+worse than the seed; that is the win — *sample efficiency at equal safety*, not a better law. Honestly on the
+quality axis (a **single** de-risk seed, `cegis_repair_vs_filter_derisk`, no seed sweep): repair's *bred*
+fitness was marginally **lower** (0.7519 vs 0.7546) while its held-out goodput was marginally higher (0.63× vs
+0.61×) — a ≈0.02× delta not shown to exceed seed-to-seed variance, i.e. within noise. The two winners' loss
+laws also differed (repair's was the seed-default `½·FlightSize`, the filter's collapsed to the floor), but
+that is *which genome each search converged to on this one seed*, **not** an effect of the repair operator —
+neither winner's loss law was ever repaired (both were already loss-safe). So M24 is a methodology result
+(verifier-in-the-loop as a repair operator, discards nothing, provably safe survivors), not a performance one;
+the M23 constant-resolution ceiling still binds, and the CI tests assert exactly that — "discards nothing +
+stays safe + no worse than the seed", never "beats the filter".
 
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
@@ -906,7 +916,7 @@ sweep alongside the stock controllers.
 | M21 | **Co-evolution / CEGIS for CC** (`coevolve`) — close the loop: the CEM synthesises a controller, the adversary finds the counterexample trace, it joins an archive, and the CEM re-synthesises against the worst case; a true zero-sum frontier-penalty game (minimax), the survivor `bmc`-certified safe — all on real stack code, zero ML/solver deps | the adversary's best attack **shrinks round over round** and the loop **converges in 2–3 rounds**; on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break** than the average-optimal baked genome (worst-case penalty 41–66 % of baked) and is **bounded-proven safe (0 violations)** — **safe by construction, empirically robust** — at the honest cost of average-case throughput (the robustness/performance Pareto, found automatically) |
 | M22 | **Bounded performance certificate** (`certify_worst`) — the adversary as a *prover*: exhaust the discretised capacity-trace envelope (every `n_slices`-periodic schedule over `n_levels` levels) and take the worst-case queue — a sound performance bound for that envelope, the model-checking discipline applied to performance not just safety; deterministic, zero-dep | discriminates controllers (**Prague 4.1 ms vs Reno 62 ms** certified worst-case queue; the co-evolved controller's is **26 % of baked's**); for AIMD/ECN controllers the worst case is — *observed exhaustively, not proven* — the minimum-rate trace and the bound **converges** across nested period granularities; for **BBR** it finds a **resonant timing pattern** (a spike priming the rate estimate) that beats both the floor and the sampling adversary (certified 50.9 ms vs sampled 44.5 ms) — exactly where exhaustion is needed; sound *over the discretised periodic envelope*, lifting to a continuum guarantee is the open ceiling |
 | M23 | **Verified GP synthesis of the control law** (`Synth` / `ControlProgram` / `evolve_control_law`) — synthesise the control *law*, not its gains: each response (increase/loss/ECN) is a small **SSA register-machine program** over the live signals, genetic-searched with the `bmc` safety checker as a **hard reject filter** ("synthesis modulo verification"), wired in **unsanitised** so the filter has real teeth; zero-transcendental, deterministic (CI-pinned pure function of its seed) | every survivor is **machine-checked safe by a bounded proof** (the guarantee learned/RL controllers lack); the discovered law is verified-safe (depth-4 `bmc`, 0 violations) and, **under the queue-penalised hinge fitness it was bred for**, ranks above **every hand-tuned** controller on the held-out set — but *not* a Pareto win (on raw goodput it loses to Reno/CUBIC/BBR, only out-goodputs DCTCP/Prague at a far lower queue) and it loses to the gene-tuned `Learned` on both axes. Its ECN response **rediscovers DCTCP's exact `α/2`** — a fixed point the search returns to (the sharp negative; a proven in-class optimum would need an exhaustive grammar sweep). The gap is a *characterised* constant-resolution limit (the grammar `{½,1,2}` can't build `Learned`'s finer `≈ α·0.185`), which motivates a GP-structure + CEM-constant hybrid |
-| M24 | **CEGIS-with-repair** (`repair_to_safe` / `ControlProgram::repair_*` / `evolve_control_law(repair=true)`) — turn the `bmc` from a reject *filter* into a counterexample-guided *repair operator*: the violation message names the offending clause, a targeted structure-preserving projection heals just that response (clamp loss to the pipe, floor the increase, restore the safe ECN baseline), re-check, iterate (≤ 3, converges); the *healed* program is scored and propagated | a near-safe-but-good law is **healed, not discarded** — same seed/budget, the filter rejected 55 candidates, repair healed 46 and threw away **none**, landing a safe law of comparable fitness that generalises a hair better on the held-out set (0.63× vs 0.61× goodput) with a **less degenerate loss response** (`½·FlightSize` vs the filter's collapse-to-floor). The win is sample efficiency + a healthier law at equal safety, not a fitness breakthrough (the M23 constant ceiling still binds; tests assert "discards nothing + stays safe", not "beats the filter") |
+| M24 | **CEGIS-with-repair** (`repair_to_safe` / `ControlProgram::repair_*` / `evolve_control_law(repair=true)`) — turn the `bmc` from a reject *filter* into a counterexample-guided *repair operator*: the violation message names the offending clause (shared tag consts, compile-coupled), a **sound, targeted** repair fixes just that response (loss/increase: clamp the output instruction — faithful to the discovered output only for identity-carry tails, else it discards the final op; ECN: reset to the safe baseline), re-check, iterate (≤ 3, converges; AIMD fallback at the cap); the *healed* program is scored and propagated | a near-safe law is **healed, not discarded** — on the de-risk seed the filter rejected 55 candidates, repair healed 46 and threw away **none**, and the survivor is `bmc`-safe one bound deeper and ≥ the seed. The win is **sample efficiency at equal safety, not a better law**: on that single seed repair's *bred* fitness was marginally lower (0.7519 vs 0.7546) and its held-out goodput marginally higher (0.63× vs 0.61×) — within noise, not swept; the loss-law difference is which genome each run converged to, not a repair effect. Tests assert "discards nothing + stays safe + ≥ seed", never "beats the filter" |
 
 ## 9. Environment
 

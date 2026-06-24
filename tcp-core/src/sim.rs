@@ -2319,15 +2319,19 @@ fn synth_crossover(rng: &mut Rng, a: ControlProgram, b: ControlProgram) -> Contr
 }
 
 /// **CEGIS repair** — project `prog` into the safety envelope, using the bmc's *counterexample* as the
-/// guide (not just its yes/no verdict): check; if unsafe, map the violated clause to a targeted repair
-/// (clamp the loss target to the pipe, floor the increase, or restore the safe ECN baseline — see
-/// [`ControlProgram::repair_loss`] etc.) and re-check; iterate. The three gain clauses are independent and
-/// each repair is idempotent for its clause, so this converges in ≤ 3 steps; a defensive cap then falls
-/// back to the bmc-proven-safe [`ControlProgram::AIMD`]. Returns the safe program (re-verified by the
-/// loop's own exit condition) and how many repairs were applied (0 if it was already safe). This is the
-/// "verifier in the loop as a repair operator, not just a filter": a near-safe-but-good program is
-/// *healed* — its safe responses preserved — instead of discarded.
+/// guide (not just its yes/no verdict): check; if unsafe, map the violated clause to a targeted repair of
+/// the response that owns it, re-check, iterate. The repairs are **sound but asymmetric** (see
+/// [`ControlProgram::repair_loss`]): the loss/increase repairs overwrite the offending response's *output
+/// instruction* with a clamp of the prior register (output-faithful when that instruction was an identity
+/// carry, else they replace the final computation with the clamp), and the ECN repair *resets* that
+/// response to the safe baseline. They touch only the offending response, leaving the other two
+/// byte-identical. The three gain clauses are independent and each repair is idempotent for its clause, so
+/// this converges in ≤ 3 steps; the 4-iteration cap then falls back to [`ControlProgram::AIMD`], which is
+/// **independently** bmc-proven safe (not re-verified here, and unreachable in practice). Returns the safe
+/// program and how many repairs were applied (0 if it was already safe). This is the verifier in the loop
+/// *as a repair operator, not just a filter*: a near-safe program is healed, not discarded.
 fn repair_to_safe(mut prog: ControlProgram, mss: u16, depth: u32) -> (ControlProgram, u32) {
+    use crate::bmc::{CLAUSE_ACK_SHRANK, CLAUSE_ECN_GREW, CLAUSE_LOSS_INFLATED};
     let mut repairs = 0u32;
     for _ in 0..4 {
         let report = crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, depth);
@@ -2335,14 +2339,14 @@ fn repair_to_safe(mut prog: ControlProgram, mss: u16, depth: u32) -> (ControlPro
             return (prog, repairs);
         }
         let why = report.first_violation.as_deref().unwrap_or("");
-        // The bmc's violation messages (stable, defined in `crate::bmc`) name the offending clause; map
-        // each to the response that owns it. The two structural clauses (cwnd ≥ MSS, ssthresh ≥ 2·MSS)
-        // never fire for `Synth` (its floors are structural), so the `else` is a defensive baseline reset.
-        prog = if why.contains("loss inflated cwnd") {
+        // The bmc's violation message names the offending clause via a shared tag const; map each to the
+        // response that owns it. The two structural clauses (cwnd ≥ MSS, ssthresh ≥ 2·MSS) never fire for
+        // `Synth` (its floors are structural), so the `else` is a defensive whole-program baseline reset.
+        prog = if why.contains(CLAUSE_LOSS_INFLATED) {
             prog.repair_loss()
-        } else if why.contains("ECN mark grew cwnd") {
+        } else if why.contains(CLAUSE_ECN_GREW) {
             prog.repair_ecn()
-        } else if why.contains("clean ACK shrank cwnd") {
+        } else if why.contains(CLAUSE_ACK_SHRANK) {
             prog.repair_increase()
         } else {
             ControlProgram::AIMD
@@ -2379,8 +2383,9 @@ pub struct SynthReport {
 /// - `repair = false` — **filter** mode: a candidate with any safety violation is *rejected* (fitness
 ///   [`SYNTH_REJECT`]) before it is ever scored, and discarded.
 /// - `repair = true` — **CEGIS-with-repair** mode: a candidate with a violation is instead *healed* by
-///   [`repair_to_safe`] (the bmc counterexample drives a targeted, structure-preserving repair) and the
-///   *repaired, safe* program is what is scored and propagated. Nothing is discarded.
+///   [`repair_to_safe`] (the bmc counterexample drives a targeted, sound repair of just the offending
+///   response — see [`repair_to_safe`] for the precise, asymmetric semantics) and the *repaired, safe*
+///   program is what is scored and propagated. Nothing is discarded.
 ///
 /// Either way the returned `best` is, by a bounded machine-checked proof, inside the safety envelope.
 /// Scoring is [`synth_frontier_fitness`] on `train`. Deterministic in `seed`.
@@ -2627,39 +2632,64 @@ mod tests {
 
     /// **CEGIS-with-repair: the verifier *heals* an unsafe law instead of discarding it.** Each of the
     /// three single-clause-unsafe programs (loss inflates / ECN grows / increase shrinks) is bmc-unsafe
-    /// before repair; `repair_to_safe` reads the counterexample and applies **exactly one targeted repair**,
-    /// leaving the other two responses byte-identical, and the result is machine-checked safe. AIMD needs
-    /// zero repairs. This is the verifier-in-the-loop *as a repair operator* — strictly more than a filter,
-    /// which would throw all three programs away wholesale.
+    /// before repair; `repair_to_safe` reads the counterexample and applies **exactly the targeted repair
+    /// that response owns** — the result equals `prog.repair_loss()/repair_ecn()/repair_increase()` and is
+    /// machine-checked safe. Asserting the *specific* repair (not merely "safe + others untouched") is what
+    /// gives this real teeth: a drift in the bmc↔repair message coupling would route to the `else`→AIMD
+    /// reset, which this would catch (the ECN case is built on a non-AIMD-but-safe base so an AIMD reset is
+    /// distinguishable there too). AIMD needs zero repairs.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn cegis_repair_heals_unsafe_laws_targeting_only_the_offending_response() {
         use crate::congestion::{Instr, SynthOp};
         let mss = 1000u16;
-        let with = |which: usize, first: Instr| {
+        // A safe but non-AIMD loss law (md = flight, i.e. no decrease — sound for clause 2), so the ECN
+        // case below differs from AIMD and an `else`→AIMD reset would change it (catching a coupling drift).
+        let safe_nonaimd_md = synth_sub_from(Instr::new(SynthOp::Min, 1, 1)); // min(flight, flight) = flight
+        let with_md = |which: usize, first: Instr, md: [Instr; ControlProgram::PROG_LEN]| {
             let mut p = ControlProgram::AIMD;
+            *p.sub_mut(1) = md;
             *p.sub_mut(which) = synth_sub_from(first);
             p
         };
-        // (response index, program): loss=1 inflates (flight×2), ecn=2 grows (cut=−0.5), inc=0 shrinks (step=−0.5).
+        // (name, offending response, program, expected repaired program).
+        let loss = with_md(1, Instr::new(SynthOp::Mul, 1, 7), ControlProgram::AIMD.md); // flight×2 inflates
+        let ecn = {
+            let mut p = ControlProgram::AIMD;
+            *p.sub_mut(1) = safe_nonaimd_md; // non-AIMD but safe base
+            *p.sub_mut(2) = synth_sub_from(Instr::new(SynthOp::Sub, 5, 6)); // cut = −0.5 grows
+            p
+        };
+        let inc = with_md(0, Instr::new(SynthOp::Sub, 5, 6), ControlProgram::AIMD.md); // step = −0.5 shrinks
         let cases = [
-            ("loss", 1usize, with(1, Instr::new(SynthOp::Mul, 1, 7))),
-            ("ecn", 2, with(2, Instr::new(SynthOp::Sub, 5, 6))),
-            ("inc", 0, with(0, Instr::new(SynthOp::Sub, 5, 6))),
+            ("loss", 1usize, loss, loss.repair_loss()),
+            ("ecn", 2, ecn, ecn.repair_ecn()),
+            ("inc", 0, inc, inc.repair_increase()),
         ];
-        for (name, offending, prog) in cases {
+        for (name, offending, prog, expected) in cases {
             let before = crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, 4);
             assert!(before.violations > 0, "{name}: must be unsafe before repair");
             let (safe, n) = repair_to_safe(prog, mss, 4);
             assert_eq!(n, 1, "{name}: one counterexample-guided repair suffices");
+            // The SPECIFIC targeted repair was applied (drift to the AIMD-reset else-branch would fail here).
+            assert_eq!(safe, expected, "{name}: the exact targeted repair was applied");
             let after = crate::bmc::check_controller_safety(Synth::with_program(mss, safe), mss as u32, 4);
             assert_eq!(after.violations, 0, "{name}: the repaired law is machine-checked safe: {:?}", after.first_violation);
-            for which in 0..ControlProgram::SUBS {
-                if which != offending {
-                    assert_eq!(safe.sub(which), prog.sub(which), "{name}: repair left response {which} untouched");
-                }
-            }
+            let _ = offending;
         }
+
+        // Non-identity-carry tail: the offending value is computed IN the output instruction, so the repair
+        // is SOUND (re-checks safe) but NOT output-faithful — it clamps OUT_PREV (an intron), discarding the
+        // final op. This locks in the honest, asymmetric behaviour the docs describe.
+        let mut md = synth_sub_from(Instr::new(SynthOp::Max, 6, 6));
+        md[ControlProgram::PROG_LEN - 1] = Instr::new(SynthOp::Mul, 1, 7); // output = 2·flight, in the last slot
+        let mut prog = ControlProgram::AIMD;
+        *prog.sub_mut(1) = md;
+        assert!(crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, 4).violations > 0);
+        let (safe, n) = repair_to_safe(prog, mss, 4);
+        assert_eq!(n, 1, "non-carry tail still heals in one repair");
+        assert_eq!(crate::bmc::check_controller_safety(Synth::with_program(mss, safe), mss as u32, 4).violations, 0, "and is sound");
+
         let (s, n) = repair_to_safe(ControlProgram::AIMD, mss, 4);
         assert_eq!(n, 0, "already-safe AIMD repairs in zero steps");
         assert_eq!(s, ControlProgram::AIMD, "...and is returned unchanged");
@@ -2681,15 +2711,16 @@ mod tests {
         let filt = evolve_control_law(&train, 4, 8, 3, 1460, 4, 0x9E27_1234, false);
         let rep = evolve_control_law(&train, 4, 8, 3, 1460, 4, 0x9E27_1234, true);
 
+        // The teeth: the filter discards (rejected > 0), repair heals the SAME unsafe candidates instead
+        // (repaired > 0), and repair's survivor is bmc-safe one bound deeper than the search filtered at.
         assert!(filt.rejected > 0 && filt.repaired == 0, "the pure filter discards unsafe candidates: {filt:?}");
-        assert!(rep.rejected == 0, "repair mode discards nothing: {rep:?}");
         assert!(rep.repaired > 0, "repair mode must actually heal some candidates: {rep:?}");
-        assert!(
-            rep.best_fit.is_finite() && rep.best_fit >= rep.seed_fit - 1e-9,
-            "repair's winner is a real, scored law ≥ the seed: {rep:?}"
-        );
         let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, rep.best), 1460, 5);
         assert_eq!(safety.violations, 0, "repair's winner stays safe one bound deeper: {:?}", safety.first_violation);
+        // The next two hold by construction (repair mode never increments rejected; best is the run-wide
+        // max over all scored candidates incl. the seed) — documenting the invariants, not testing repair.
+        assert_eq!(rep.rejected, 0, "repair mode discards nothing (structural): {rep:?}");
+        assert!(rep.best_fit.is_finite() && rep.best_fit >= rep.seed_fit - 1e-9, "the returned best is real and ≥ the seed: {rep:?}");
     }
 
     /// De-risk for CEGIS-with-repair (ignored — runs the full search twice): does *healing* unsafe
@@ -2722,11 +2753,19 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn synth_search_is_deterministic_in_its_seed() {
         let train = vec![TrainScenario { bn: cemark_bn(2_500_000, 2_000, 1_000), bytes: 256 * 1024, seed: 7 }];
+        // Filter mode.
         let a = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717, false);
         let b = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717, false);
         assert_eq!(a.best, b.best, "same seed must yield the identical genome");
         assert_eq!(a.best_fit.to_bits(), b.best_fit.to_bits(), "...and the identical fitness, bit-for-bit");
         assert_eq!(a.rejected, b.rejected, "...and the identical filter-rejection count");
+        // Repair mode is the new headline path and `repair_to_safe` consumes no RNG, so it must be equally
+        // deterministic — a future change that introduced nondeterminism into a repair would fail here.
+        let c = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717, true);
+        let d = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717, true);
+        assert_eq!(c.best, d.best, "repair mode is a pure function of its seed too");
+        assert_eq!(c.best_fit.to_bits(), d.best_fit.to_bits(), "...identical fitness");
+        assert_eq!(c.repaired, d.repaired, "...identical repair count");
     }
 
     /// **The synthesised law, headline result (fast — uses the baked discovery, no search).** Stated

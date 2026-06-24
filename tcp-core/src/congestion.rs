@@ -1227,36 +1227,46 @@ impl ControlProgram {
         }
     }
 
-    /// The register the output instruction reads when it is an identity carry — the second-to-last
-    /// register, where a safety clamp projects the discovered output. (Output = the last register.)
+    /// The second-to-last register — the register the output instruction reads *iff* that instruction is
+    /// an identity carry. The loss/increase repairs clamp this register. (Output = the last register.)
     const OUT_PREV: u8 = (SYNTH_REGS_IN + SYNTH_PROG_LEN - 2) as u8;
 
     // ── CEGIS repair primitives ─────────────────────────────────────────────────────────────────────
     //
-    // Each minimally projects ONE response back into the safety envelope in answer to a specific bmc
-    // counterexample, leaving the other two responses untouched. They are *sound* — the projected program
-    // provably satisfies the named clause — and structure-preserving where the grammar allows: the loss
-    // and increase repairs keep the discovered law and only clamp its output (so a program whose output
-    // already lies in the safe range is unchanged), by overwriting the output instruction with a clamp of
-    // the prior register. A clean `max(cut, 0)` for the ECN clause is not expressible without a zero
-    // constant in the signal vector, so there the projection restores the gentle DCTCP baseline `α/2`.
+    // Each projects ONE response back into the safety envelope in answer to a specific bmc counterexample,
+    // touching only that response (the other two stay byte-identical). All three are *sound* — the result
+    // provably satisfies the named clause regardless of the input — but they are NOT uniformly minimal, and
+    // the doc is precise about it:
+    //   - `repair_loss` / `repair_increase` overwrite the offending response's OUTPUT instruction with a
+    //     clamp of `OUT_PREV` (the second-to-last register). When the output instruction was an identity
+    //     carry — the seed shape, and the only shape the live search's output slot usually holds — `OUT_PREV`
+    //     IS the discovered output, so this is a faithful output clamp (an already-safe output is unchanged).
+    //     When the search has rerolled the output slot into a real op, that op is *discarded* and the clamp
+    //     is applied to `OUT_PREV` instead: still sound (the result is provably within the clause), but it is
+    //     no longer a clamp of the discovered output — so "structure-preserving" holds only in the carry case.
+    //   - `repair_ecn` is a wholesale RESET of the ECN response to the safe baseline `α/2` — NOT an output
+    //     clamp — because a clean `max(cut, 0)` is not expressible without a zero constant in the signal
+    //     vector. It discards the discovered ECN law.
 
-    /// Clause 2 (a loss must not inflate `cwnd` past the pipe): cap the loss target at the FlightSize, by
-    /// making the output `min(prior, flight_seg)` — provably `≤ flight_seg`, so `cwnd ≤ flight` on loss.
+    /// Clause 2 (a loss must not inflate `cwnd` past the pipe): overwrite the loss output instruction with
+    /// `min(OUT_PREV, flight_seg)` — provably `≤ flight_seg`, so `cwnd ≤ flight` on loss. A faithful clamp
+    /// of the discovered output only when the output instruction was an identity carry (see the note above).
     pub(crate) fn repair_loss(mut self) -> ControlProgram {
         self.md[SYNTH_PROG_LEN - 1] = Instr { op: SynthOp::Min, a: ControlProgram::OUT_PREV, b: R_FLIGHT };
         self
     }
 
-    /// Clause 4 (a clean ACK must not shrink `cwnd`): floor the per-RTT increase at half a segment, by
-    /// making the output `max(prior, ½)` — provably `> 0`, so the additive increase never shrinks `cwnd`.
+    /// Clause 4 (a clean ACK must not shrink `cwnd`): overwrite the increase output instruction with
+    /// `max(OUT_PREV, ½)` — provably `> 0`, so the additive increase never shrinks `cwnd`. Same carry-case
+    /// faithfulness caveat as [`ControlProgram::repair_loss`].
     pub(crate) fn repair_increase(mut self) -> ControlProgram {
         self.inc[SYNTH_PROG_LEN - 1] = Instr { op: SynthOp::Max, a: ControlProgram::OUT_PREV, b: R_HALF };
         self
     }
 
-    /// Clause 3 (an ECN mark must not grow `cwnd`): restore the safe DCTCP baseline `cut = α/2` (a clean
-    /// non-negativity clamp is not expressible without a zero constant, so the baseline is the projection).
+    /// Clause 3 (an ECN mark must not grow `cwnd`): RESET the whole ECN response to the safe DCTCP baseline
+    /// `cut = α/2`, discarding the discovered ECN law (a clean non-negativity clamp is not expressible
+    /// without a zero constant, so the baseline is the projection here).
     pub(crate) fn repair_ecn(mut self) -> ControlProgram {
         self.ecn = ControlProgram::AIMD.ecn;
         self
