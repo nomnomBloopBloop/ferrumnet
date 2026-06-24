@@ -1611,6 +1611,10 @@ impl Tcb {
         self.snd_nxt
     }
     #[cfg(test)]
+    fn snd_una_dbg(&self) -> SeqNumber {
+        self.snd_una
+    }
+    #[cfg(test)]
     fn in_sack_recovery_dbg(&self) -> bool {
         self.scoreboard.in_recovery()
     }
@@ -1821,6 +1825,44 @@ mod tests {
         deliver(&mut tcb, now, &inbound(cnxt, iss + 1 + 11, TcpFlags::ACK, 64000, None, b""));
         assert_eq!(tcb.tx_free(), full); // tx fully drained by the ACK
         assert!(drain(&mut tcb, now).is_empty());
+    }
+
+    /// **The sender under a misbehaving receiver: what the stack already defends, and the residual.** The
+    /// adversarial frame moves from the network to the *protocol peer*. Two receiver attacks that try to
+    /// make the sender over-trust / over-send:
+    /// 1. **ACK above SND.NXT** (acking data never sent — an "optimistic" ACK that overshoots): the RFC 793
+    ///    §3.9 acceptability test drops it. SND.UNA does not advance and no tx is freed — *defended*.
+    /// 2. **Optimistic ACK of in-flight data** (acking ≤ SND.NXT before it could have been delivered): it
+    ///    looks exactly like a genuine ACK, so the TCB accepts it — SND.UNA advances and the retransmit
+    ///    buffer for that (undelivered) data is freed. This is the **residual** threat: byte counting (which
+    ///    defeats ACK division, see `bmc::byte_counting_neutralises_ack_division`) and the SND.NXT check do
+    ///    not catch a premature-but-in-window ACK. Detecting it needs a *receipt nonce* (RFC 3540-style) the
+    ///    receiver cannot forge for data it never got — characterised here, not yet built.
+    #[test]
+    fn misbehaving_receiver_optimistic_ack_defended_above_nxt_residual_in_flight() {
+        let now = Instant::from_millis(0);
+        let (mut tcb, iss, cnxt) = established(now, 1000, 64000);
+        let full = tcb.tx_free();
+        // Send three segments' worth; they go "on the wire" but no receiver has confirmed delivery yet.
+        assert_eq!(tcb.send(&vec![0x5a; 3000]), 3000);
+        let _ = drain(&mut tcb, now);
+        let snd_nxt = tcb.snd_nxt_dbg();
+        assert!(tcb.tx_free() < full, "the sent-but-unacked data is held for retransmit");
+        let una_before = tcb.snd_una_dbg();
+
+        // (1) An ACK *above* SND.NXT (data never sent) is dropped — SND.UNA does not move, tx not freed.
+        deliver(&mut tcb, now, &inbound(cnxt, snd_nxt + 4000, TcpFlags::ACK, 64000, None, b""));
+        assert_eq!(tcb.snd_una_dbg(), una_before, "an ACK above SND.NXT must be rejected (not advance SND.UNA)");
+        assert!(tcb.tx_free() < full, "...and must not free the retransmit buffer");
+
+        // (2) An optimistic ACK of the in-flight data (≤ SND.NXT) is indistinguishable from a genuine one,
+        // so it is accepted: SND.UNA jumps to SND.NXT and the retransmit buffer is freed — the residual.
+        let cwnd_before = tcb.cwnd_dbg();
+        deliver(&mut tcb, now, &inbound(cnxt, snd_nxt, TcpFlags::ACK, 64000, None, b""));
+        assert_eq!(tcb.snd_una_dbg(), snd_nxt, "an in-window optimistic ACK advances SND.UNA (the residual threat)");
+        assert_eq!(tcb.tx_free(), full, "...and frees the (undelivered) data from the retransmit buffer");
+        assert!(tcb.cwnd_dbg() >= cwnd_before, "...and grows the window on the premature ACK");
+        let _ = iss;
     }
 
     #[test]

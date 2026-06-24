@@ -460,6 +460,67 @@ pub fn check_learned_genome_space(mss: u32, depth: u32) -> BmcReport {
     report
 }
 
+// ── misbehaving-receiver defence: ACK-division invariance ────────────────────────────────────────
+//
+// The adversary so far has been the *network* (the capacity trace) and the *synthesiser* (the program).
+// This points it at the **protocol peer**. A misbehaving *receiver* can subvert a *sender*'s congestion
+// control — most classically by **ACK division** (Savage et al., "TCP Congestion Control with a Misbehaving
+// Receiver", 1999): on receiving one segment it returns many ACKs, each advancing the cumulative ACK by a
+// sub-MSS fraction, so a sender that grows its window *per ACK* inflates it far past what the delivered data
+// warrants. The defence is **byte counting** — grow as a function of bytes acknowledged, not ACK count —
+// and every controller in this stack does exactly that. We turn the bmc into the prover again: exhaust
+// every way to split a window of new data across ACKs and prove the window never grows past the bytes
+// acked, so ACK division buys the attacker nothing. (Two further receiver attacks are addressed elsewhere:
+// an ACK *above* `SND.NXT` — acking data never sent — is dropped by the TCB's RFC 793 §3.9 acceptability
+// test; and an **optimistic ACK** of in-flight-but-undelivered data is the residual threat, demonstrated
+// and characterised in `tcb`'s `misbehaving_receiver_*` tests — it needs a receipt nonce, not byte counting.)
+
+/// `f` over every ordered composition of `n` into parts each `≥ 1`, with at most `max_parts` parts.
+fn for_each_composition(n: u32, max_parts: u32, prefix: &mut Vec<u32>, f: &mut impl FnMut(&[u32])) {
+    if n == 0 {
+        f(prefix);
+        return;
+    }
+    if prefix.len() as u32 == max_parts {
+        return; // out of parts before consuming n — not a ≤max_parts composition
+    }
+    for first in 1..=n {
+        prefix.push(first);
+        for_each_composition(n - first, max_parts, prefix, f);
+        prefix.pop();
+    }
+}
+
+/// **Exhaustively prove byte counting neutralises the ACK-division misbehaving receiver.** Drive a fresh
+/// `controller` (in slow start) through **every** way of splitting `total_units · unit` bytes of new data
+/// into `1..=max_acks` ACKs (each a positive multiple of `unit`), and confirm the window never grows by
+/// more than the **total bytes acknowledged** — so window growth is a function of bytes, not ACK count, and
+/// no split speeds it up. Use a sub-MSS `unit` (e.g. `MSS/4`) so the sub-MSS division the attack relies on
+/// is covered. A naive `cwnd += MSS`-per-ACK controller grows by `n_acks · MSS` and so violates this for
+/// any split finer than one ACK (the negative-control test drives exactly such a controller and shows it
+/// caught). Drives whatever regime `controller` is already in — pass a fresh one for slow start, or one
+/// already cut into congestion avoidance, to cover both. Returns the case count and the first violation (a
+/// byte-counting controller yields zero).
+pub fn check_ack_split_invariance<C: CongestionControl + Clone>(controller: &C, total_units: u32, unit: u32, max_acks: u32) -> BmcReport {
+    let mut report = BmcReport::default();
+    let total_bytes = total_units * unit;
+    let mut prefix = Vec::new();
+    for_each_composition(total_units, max_acks, &mut prefix, &mut |parts| {
+        let mut c = controller.clone();
+        let before = c.cwnd();
+        for &p in parts {
+            c.on_ack(CC_NOW, p * unit);
+        }
+        let growth = c.cwnd().saturating_sub(before);
+        report.check(if growth > total_bytes {
+            Err(format!("ACK-split inflated the window: {} ACKs grew cwnd by {growth} > {total_bytes} bytes acked", parts.len()))
+        } else {
+            Ok(())
+        });
+    });
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +716,80 @@ mod tests {
             r.first_violation.as_deref().unwrap_or("").contains(CLAUSE_LOSS_INFLATED),
             "the violation is the loss-inflation one: {:?}",
             r.first_violation
+        );
+    }
+
+    /// A deliberately-vulnerable strawman controller: it grows `cwnd` by one MSS **per ACK**, ignoring how
+    /// many bytes the ACK actually delivered — the exact design the ACK-division misbehaving receiver
+    /// exploits. Test-only; it exists so the invariance proof's negative control has real teeth.
+    #[derive(Clone)]
+    struct PerAckMss {
+        cwnd: u32,
+        mss: u32,
+    }
+    impl CongestionControl for PerAckMss {
+        fn cwnd(&self) -> u32 {
+            self.cwnd
+        }
+        fn ssthresh(&self) -> u32 {
+            u32::MAX
+        }
+        fn on_ack(&mut self, _now: Instant, acked: u32) {
+            if acked > 0 {
+                self.cwnd = self.cwnd.saturating_add(self.mss); // VULNERABLE: per-ACK, ignores byte count
+            }
+        }
+        fn on_dup_ack(&mut self, _now: Instant, _flight: u32) -> bool {
+            false
+        }
+        fn enter_recovery(&mut self, _now: Instant, _flight: u32) {}
+        fn on_rto(&mut self, _now: Instant, _flight: u32) {}
+        fn set_mss(&mut self, mss: u16) {
+            self.mss = mss as u32;
+        }
+    }
+
+    /// PROOF (bounded), the **ACK-division defence**: every byte-counting controller in the stack — Reno,
+    /// DCTCP, the evolved `Learned`, and the synthesised `Synth` — has window growth bounded by the BYTES
+    /// acknowledged, across *every* way of splitting a window of new data into ACKs (down to sub-MSS
+    /// granularity). So a misbehaving receiver that floods the sender with many tiny ACKs gains nothing —
+    /// the window grows with delivered data, not ACK count. The negative control proves the property has
+    /// teeth: a per-ACK `cwnd += MSS` controller (the vulnerable design) is caught inflating its window past
+    /// the bytes acked on exactly the finely-split traces the attack uses.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn byte_counting_neutralises_ack_division() {
+        let mss = 1000u32;
+        let unit = mss / 4; // sub-MSS granularity — the lever ACK division pulls
+
+        // Put a controller into congestion avoidance: a triple dup-ACK loss sets cwnd = ssthresh, so the
+        // next ACK is no longer in slow start. Covers the second regime, where growth is byte-counted too.
+        let ca_reno = {
+            let mut c = Reno::new(mss as u16);
+            c.on_dup_ack(CC_NOW, 10 * mss);
+            c.on_dup_ack(CC_NOW, 10 * mss);
+            c.on_dup_ack(CC_NOW, 10 * mss); // 3rd dup-ACK → fast recovery, cwnd = ssthresh → CA
+            c
+        };
+        let runs = [
+            ("reno/slowstart", check_ack_split_invariance(&Reno::new(mss as u16), 6, unit, 6)),
+            ("reno/ca", check_ack_split_invariance(&ca_reno, 6, unit, 6)),
+            ("dctcp", check_ack_split_invariance(&Dctcp::new(mss as u16), 6, unit, 6)),
+            ("learned", check_ack_split_invariance(&Learned::with_params(mss as u16, LearnedParams::BAKED), 6, unit, 6)),
+            ("synth", check_ack_split_invariance(&Synth::with_program(mss as u16, ControlProgram::BAKED_SYNTH), 6, unit, 6)),
+        ];
+        for (name, report) in runs {
+            assert!(report.cases > 10, "{name}: the split enumeration must be substantial: {} cases", report.cases);
+            assert_eq!(report.violations, 0, "{name}: ACK division inflated the window; repro: {:?}", report.first_violation);
+        }
+        // Negative control: the per-ACK strawman IS caught — splitting one window into many sub-MSS ACKs
+        // grows its window past the bytes acked.
+        let naive = check_ack_split_invariance(&PerAckMss { cwnd: initial_window(mss), mss }, 6, unit, 6);
+        assert!(naive.violations > 0, "the per-ACK strawman must be caught inflating the window");
+        assert!(
+            naive.first_violation.as_deref().unwrap_or("").contains("ACK-split inflated"),
+            "the violation is the ACK-split inflation one: {:?}",
+            naive.first_violation
         );
     }
 }

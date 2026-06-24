@@ -38,7 +38,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **seven pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one / a **GP-synthesised** one), and a **two-stack userspace loopback** (two
-  instances connecting to each other entirely in memory). **234 tests**, green on Rust 1.92 and the 1.75
+  instances connecting to each other entirely in memory). **236 tests**, green on Rust 1.92 and the 1.75
   MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -110,6 +110,15 @@ $ curl -v http://10.0.0.2:8080/
   — and its survivor is `bmc`-safe and no worse than the seed. That's the win: **sample efficiency at equal
   safety**, not a better law (on that seed its bred fitness was a hair *lower* and its held-out goodput a
   hair higher — within noise; the constant-resolution ceiling from the GP synthesis still binds). (`sim` + `bmc`)
+- **It points the adversary at the *protocol peer*, not just the network.** A misbehaving *receiver* can
+  try to subvert a sender's congestion control. Classic **ACK division** (Savage et al.) floods the sender
+  with many tiny sub-MSS ACKs so a per-ACK-growing sender over-inflates its window — and the `bmc` *proves*
+  this stack is immune: exhaust **every** way of splitting a window of new data across ACKs and the window
+  never grows past the **bytes** acked (a per-ACK `cwnd += MSS` strawman is caught on the same traces), so
+  byte counting neutralises the attack. An ACK *above* `SND.NXT` is dropped by the RFC 793 acceptability
+  check. The honest residual: an **optimistic ACK** of in-flight-but-undelivered data is indistinguishable
+  from a genuine one, so it's accepted — defeating it needs a receipt nonce the receiver can't forge, which
+  is characterised (a tcb test demonstrates the gap), not yet built. (`bmc` + `tcb`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -433,7 +442,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 234 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 236 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -448,6 +457,7 @@ cargo test -p tcp-core      # 234 tests: unit + in-memory integration + loss/SAC
                             #            bloats BBR's queue ~6x / collapses its goodput)
                             #            + GP control-law synthesis (bmc as a hard reject filter)
                             #            + CEGIS-with-repair (bmc counterexample heals the law)
+                            #            + misbehaving-receiver defence (ACK-division invariance proof)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
