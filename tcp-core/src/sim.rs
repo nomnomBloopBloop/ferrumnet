@@ -2463,17 +2463,19 @@ pub fn evolve_control_law(
     SynthReport { best: best.0, best_fit: best.1, seed_fit, rejected, repaired, evaluated }
 }
 
-// ── exhaustive verified synthesis: a PROVEN in-class optimum ──────────────────────────────────────
+// ── exhaustive verified synthesis: a PROVEN optimum over a single-response subproblem ─────────────
 //
 // `evolve_control_law` *searches* the program space, so M23's "the GP keeps returning to `α/2`" is an
-// *observed* fixed point, not a proof that nothing safe beats it. This closes that gap for one response by
-// *exhausting* a small grammar instead of searching it — the same discipline the performance certificate
-// uses on the trace envelope. The class: every ECN response of the form `cut = op(r[a], r[b])` (a single
-// machine operation over the input registers — signals and the `½/1/2` constants), `6 · REGS_IN²` programs.
-// Each is paired with AIMD's increase/loss, driven through the `bmc` safety filter, and the safe ones scored
-// on the frontier; the max is a **proven** optimum over the class — no safe single-op ECN response scores
-// higher. It is a *bounded* theorem (this grammar, this train set), exactly as the bmc and the certificate
-// are bounded — but it is a proof, not an artefact, and it upgrades M23's observation accordingly.
+// *observed* fixed point, not a proof that nothing safe beats it (and M23 names this sweep as the way to
+// settle it). This runs it for one response by *exhausting* a small grammar instead of searching — the same
+// discipline the performance certificate uses on the trace envelope. The class: every ECN response of the
+// form `cut = op(r[a], r[b])` (a single machine op over the input registers — signals and the `½/1/2`
+// constants), `6 · REGS_IN²` programs, **with the increase and loss responses held fixed at AIMD's**. Each is
+// driven through the `bmc` safety filter, and the safe ones scored; the max is a **proven** optimum over that
+// class — no safe single-op ECN scores higher *for this increase/loss*. It is a *bounded* theorem (this
+// grammar, AIMD increase/loss, this train set). It confirms M23's flag (`α/2` is not the optimum here) — but
+// the responses interact, so this is settling a *different corner* of the space (the AIMD-increase family),
+// NOT exhaustion out-searching the GP: the winning delay law is *worse* than `α/2` for the GP's own increase.
 
 /// What the exhaustive single-op ECN-response synthesis found.
 #[derive(Clone, Copy, Debug)]
@@ -2487,10 +2489,10 @@ pub struct ExhaustReport {
     pub safe: u32,
 }
 
-/// **Exhaustively synthesise the frontier-optimal single-operation ECN response, modulo verification.**
-/// Enumerate every `cut = op(r[a], r[b])` over the six ops and the input registers, build each with AIMD's
-/// increase/loss, reject any the `bmc` finds unsafe at `bmc_depth`, score the rest on `train`, and return
-/// the max. The winner is a **proven** in-class optimum (the class was enumerated, not sampled).
+/// **Exhaustively synthesise the frontier-optimal single-operation ECN response (given AIMD increase/loss),
+/// modulo verification.** Enumerate every `cut = op(r[a], r[b])` over the six ops and the input registers,
+/// build each with AIMD's increase/loss **fixed**, reject any the `bmc` finds unsafe at `bmc_depth`, score
+/// the rest on `train`, and return the max — a **proven** optimum over that class (enumerated, not sampled).
 /// Deterministic; the cost is one frontier evaluation per safe candidate.
 pub fn exhaust_ecn_response(train: &[TrainScenario], mss: u16, bmc_depth: u32) -> ExhaustReport {
     let regs = ControlProgram::REGS_IN as u8;
@@ -2913,13 +2915,13 @@ mod tests {
         }
     }
 
-    /// **Exhaustive synthesis beats the heuristic GP (fast — uses the baked optimum).** The single-op ECN
-    /// optimum found by *exhausting* the class — the delay-based `cut = srtt/rtt_min − 1`
-    /// (`ControlProgram::EXHAUSTED_ECN_OPTIMUM`) — is (1) machine-checked safe at depth 4, and (2) scores
-    /// **strictly higher** on the training frontier than DCTCP's `α/2` (which the heuristic GP got *stuck*
-    /// at, M23). So exhaustion found a safe response the search missed — `α/2` was a search artefact, not the
-    /// in-class optimum. (The full proof that it is THE optimum over all 384 single-op responses is the
-    /// ignored `exhaust_ecn_response_derisk`.)
+    /// **Exhaustive synthesis: the optimal single-op ECN (given AIMD increase/loss) is delay-based, not α/2
+    /// (fast — uses the baked optimum).** The optimum found by *exhausting* the class — the delay-based
+    /// `cut = srtt/rtt_min − 1` (`ControlProgram::EXHAUSTED_ECN_OPTIMUM`) — is (1) machine-checked safe at
+    /// depth 4, and (2) scores **strictly higher** on the training frontier than DCTCP's `α/2` *with AIMD's
+    /// increase* — confirming M23's flag that `α/2` was only an unproven fixed point. (Necessary conditions
+    /// for "it is THE optimum"; the full enumeration over all 384 is the now-assertive ignored
+    /// `exhaust_ecn_response_derisk`.)
     #[test]
     #[cfg_attr(miri, ignore)]
     fn exhausted_ecn_optimum_beats_alpha_half_and_is_safe() {
@@ -2934,20 +2936,29 @@ mod tests {
         assert!(fit_opt > fit_alpha, "the delay-based optimum beats DCTCP's α/2 on the frontier: {fit_opt:.4} vs {fit_alpha:.4}");
     }
 
-    /// De-risk for **exhaustive verified synthesis** (ignored — scores every safe member of the class).
-    /// Enumerate every single-op ECN response, prove the frontier-optimal safe one, and report whether it
-    /// is DCTCP's `α/2` (upgrading M23's *observed* fixed point to a *proven* in-class optimum) or something
-    /// the heuristic GP missed. Run with `--ignored --nocapture`.
+    /// The full enumeration for **exhaustive verified synthesis** (ignored — scores every safe member of the
+    /// class, ~minutes). Asserts the load-bearing M26 facts (384 in class, 352 safe, the proven optimum is
+    /// exactly the delay law `srtt − 1`, strictly above `α/2` for AIMD's increase), and prints the held-out
+    /// frontier. This is what backs the M26 docs; the fast tests only pin the baked constant's necessary
+    /// conditions. Run with `--ignored --nocapture`.
     #[test]
     #[ignore]
     fn exhaust_ecn_response_derisk() {
+        use crate::congestion::ControlProgram;
         let train = train_set();
         let r = exhaust_ecn_response(&train, 1460, 4);
         let (_, _, ecn) = crate::congestion::synth_describe(&r.best);
-        let aimd_fit = synth_frontier_fitness(crate::congestion::ControlProgram::AIMD, &train);
+        let aimd_fit = synth_frontier_fitness(ControlProgram::AIMD, &train);
         eprintln!("EXHAUSTIVE single-op ECN synthesis: {} in class, {} safe", r.total, r.safe);
         eprintln!("  proven optimum:  cut = {ecn}   (train-fitness {:.4})", r.best_fit);
-        eprintln!("  AIMD/DCTCP α/2:  train-fitness {aimd_fit:.4}   (is the optimum α/2? {})", r.best == crate::congestion::ControlProgram::AIMD);
+        eprintln!("  AIMD/DCTCP α/2:  train-fitness {aimd_fit:.4}", );
+        // The load-bearing facts the M26 docs assert (this ignored test is what backs them — it runs the
+        // full enumeration, ~minutes; the fast tests only pin the baked constant's necessary conditions).
+        assert_eq!(r.total, 384, "the class is 6 ops × 8 × 8 input registers");
+        assert_eq!(r.safe, 352, "352 of the 384 single-op ECN responses pass the bmc safety filter");
+        assert_eq!(r.best, ControlProgram::EXHAUSTED_ECN_OPTIMUM, "the proven optimum is the baked delay law srtt−1");
+        assert!(r.best != ControlProgram::AIMD, "...and it is NOT DCTCP's α/2");
+        assert!(r.best_fit > aimd_fit, "...and it strictly beats α/2 with AIMD's increase: {:.4} vs {aimd_fit:.4}", r.best_fit);
         let test = heldout_set();
         set_program_override(Some(r.best));
         let (g, q) = synth_frontier_of(&test);

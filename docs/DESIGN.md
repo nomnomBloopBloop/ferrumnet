@@ -760,14 +760,15 @@ asserts the full honest picture: under the **latency-throughput hinge fitness it
 a queue penalty past a 1 ms budget) it ranks above *every hand-tuned* controller — but only because the
 loss-based ones bury themselves in ~90 ms of standing queue; on **raw goodput** it *loses* to Reno/CUBIC/BBR
 and only out-goodputs DCTCP/Prague (it Pareto-dominates none — it trades goodput for a far lower queue). And
-it loses to the gene-tuned `Learned` on **both** axes. The gap *looked* like a constant-resolution one —
-`Learned` wins with a gentler `ecn_a ≈ 0.185`, a constant the discrete grammar `{½, 1, 2}` cannot build — and
-M23 framed it that way. **M26 (below) revises that read**: exhausting the single-op ECN grammar finds it
-*does* contain a response that beats `α/2` and out-goodputs `Learned` — a *delay-based* `cut = srtt/rtt_min −
-1` the GP never tried — so the GP's `α/2` was a **search artefact (a local optimum), not the grammar's true
-optimum**, and the binding constraint was search coverage, not constant resolution. The honest residual is
-still that the discrete constants block the *exact* `α·0.185`, so a **GP-for-structure + CEM-for-constants
-hybrid** (ephemeral evolvable constants) remains a real next step. Everything is std-only, zero-transcendental
+it loses to the gene-tuned `Learned` on **both** axes — at `Learned`'s sub-ms operating point — and the gap
+there is a constant-resolution one: `Learned` wins with a gentler `ecn_a ≈ 0.185`, a constant the discrete
+grammar `{½, 1, 2}` cannot build, so a **GP-for-structure + CEM-for-constants hybrid** (ephemeral evolvable
+constants) is the real next step. Its ECN response is `α/2` — which M23 honestly flags as an *unproven search
+fixed point* (a heuristic search cannot prove optimality) and points at the exhaustive sweep to settle.
+**M26 (below) runs that sweep and confirms it: `α/2` is not the in-class optimum** — for AIMD's increase a
+delay-based `cut = srtt/rtt_min − 1` beats it. (Note the responses interact: that delay law is *worse* than
+`α/2` for the increase the GP actually evolved, so M26 confirms `α/2` is suboptimal *for the AIMD family*, it
+does not show the GP "missed" a universally-better ECN.) Everything is std-only, zero-transcendental
 and deterministic (a CI test pins the search is a pure
 function of its seed); the Windows-discovered `BAKED_SYNTH` reappeared bit-identically when the de-risk was
 re-run on the Linux VPS — an observation consistent with the transcendental-free IEEE-754 arithmetic, though
@@ -803,27 +804,35 @@ neither winner's loss law was ever repaired (both were already loss-safe). So M2
 the M23 constant-resolution ceiling still binds, and the CI tests assert exactly that — "discards nothing +
 stays safe + no worse than the seed", never "beats the filter".
 
-**Exhaustive verified synthesis — the search becomes a proof, and beats the heuristic (M26).** M23's GP
-*observed* that it kept returning to DCTCP's `α/2`; it never *proved* nothing safe beats it (a heuristic
-search can only ever report a fixed point). M26 closes that for one response by *exhausting* the grammar
-instead of searching it — the same discipline the performance certificate (M22) applies to the trace
-envelope. `exhaust_ecn_response` enumerates **every** single-operation ECN response `cut = op(r[a], r[b])`
-(the six ops over the input registers — signals and the `½/1/2` constants), `6 · 8² = 384` programs; it
-pairs each with AIMD's increase/loss, drives it through the `bmc` safety filter (352 of the 384 pass), scores
-the safe ones on the frontier, and takes the max — a **proven** in-class optimum, because the class was
-enumerated, not sampled. **The result revises M23.** The optimum is **not** `α/2`: it is a *delay-based*
-response, `cut = srtt/rtt_min − 1` (back off in proportion to the measured queuing delay, ignoring the ECN
-fraction `α` entirely), which scores strictly above `α/2` on the training frontier (0.783 vs 0.740) and on
-held-out recovers far more goodput (0.92× line vs DCTCP's 0.56× and `Learned`'s 0.81×) at a ~1.4 ms standing
-queue. So the GP was **stuck in a local optimum**, and M23's "constant-resolution ceiling" was *not* the
-binding constraint — the single-op grammar already contained a response (`srtt − 1`) that beats `α/2` and
-out-goodputs the gene-tuner; the GP simply never explored the delay signal. (The honest scope, as ever: it
-is a *bounded* theorem — optimal over the *single-op* grammar on this train set — and it is a different
-frontier *point*, more goodput at more queue, not a Pareto or hinge win over `Learned` on held-out; baking it
-as the shipped controller is deferred because of the higher queue. What it proves is the methodological
-point: **exhaustion finds what heuristic search misses, with a proof attached.**) The discovery
-(`ControlProgram::EXHAUSTED_ECN_OPTIMUM`) is baked and a fast test pins that it is safe, is the delay law,
-and beats `α/2`; the full enumeration is the ignored `exhaust_ecn_response_derisk`.
+**Exhaustive verified synthesis — the search becomes a proof (M26).** M23's GP *observed* that it kept
+returning to DCTCP's `α/2`; it never *proved* nothing safe beats it (a heuristic search can only report a
+fixed point), and M23 explicitly named the exhaustive sweep as the way to settle it. M26 runs that sweep for
+one response by *exhausting* the grammar instead of searching it — the same discipline the performance
+certificate (M22) applies to the trace envelope. `exhaust_ecn_response` enumerates **every** single-operation
+ECN response `cut = op(r[a], r[b])` (the six ops over the input registers — signals and the `½/1/2`
+constants), `6 · 8² = 384` programs; it **fixes the increase and loss responses at AIMD's** and varies only
+the ECN cut, drives each through the `bmc` safety filter (352 of the 384 pass), scores the safe ones on the
+frontier, and takes the max — a **proven** optimum over that class, because it was enumerated, not sampled.
+**The optimum is not `α/2`.** It is a *delay-based* response, `cut = srtt/rtt_min − 1` (back off in proportion
+to the measured queuing delay, ignoring the ECN fraction `α` entirely), which scores strictly above `α/2`
+*with AIMD's increase/loss* (0.783 vs 0.740) and on held-out recovers far more goodput (0.92× line vs DCTCP's
+0.56× and `Learned`'s 0.81×) at a ~1.4 ms standing queue. So M26 **confirms** M23's flag: `α/2` is not the
+in-class optimum.
+
+The honest framing of the GP relationship is precise, because the responses **interact and are not
+separable**: `srtt − 1` is optimal *only paired with AIMD's increase*. Plugged into the GP's own evolved
+increase (`max(0.5, α, acked_seg)`), `α/2` (0.7546) **beats** `srtt − 1` (0.7025) — so for the controller the
+GP actually built, `α/2` was the locally-correct ECN choice, and adopting the delay law would have made it
+*worse*. M26 therefore is **not** "exhaustion out-searching the GP" or "the GP missed a universally-better
+ECN" — it is exhaustion settling a *different* corner of the space (the AIMD-increase family), where the
+optimum happens to be delay-based. The bounded, honest statement: *given AIMD's increase/loss, the optimal
+single-op ECN response is `srtt − 1`, not `α/2`* — a real proven result, a different (higher-goodput,
+higher-queue) frontier point than `Learned`'s sub-ms one (not a Pareto or hinge win, and not shipped because
+of the queue). M26 does **not** refute M23's constant-resolution observation either: that still characterises
+the GP-vs-`Learned` gap *at `Learned`'s operating point*; M26 reaches higher goodput at a different point. The
+discovery (`ControlProgram::EXHAUSTED_ECN_OPTIMUM`) is baked; fast tests pin that it is safe, is the delay
+law, and beats `α/2`, and the (ignored, but now assertive) `exhaust_ecn_response_derisk` checks the full
+enumeration — 384 in class, 352 safe, the max is exactly `srtt − 1`.
 
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
@@ -939,9 +948,10 @@ real congestion-control and protocol code, each piece zero-dependency and CI-enf
   bounded worst-case latency, with the continuum lift characterised as an honest open obstruction.
 - **Synthesise it** (M23) — GP discovers the control *law itself* (not its gains) with the safety checker as
   a hard filter — "synthesis modulo verification"; the GP keeps returning to DCTCP's `α/2`.
-- **Prove the synthesis optimal** (M26) — *exhaust* the single-op ECN grammar instead of searching it, and
-  the proven in-class optimum turns out *not* to be `α/2` but a **delay-based** `srtt − 1` that beats it: the
-  search was stuck, exhaustion found the better response, with a proof attached.
+- **Prove a synthesis subproblem optimal** (M26) — *exhaust* the single-op ECN grammar (with increase/loss
+  fixed at AIMD's) instead of searching it, and the proven optimum is *not* `α/2` but a **delay-based**
+  `srtt − 1` — confirming M23's flag that `α/2` was only an unproven fixed point. (Honest: the responses
+  interact, so this settles a *different* corner of the space, it does not show the GP out-searched.)
 - **Repair it** (M24) — the verifier stops being a gate and becomes a *repair operator*: its counterexample
   heals an unsafe law instead of discarding it (sample efficiency at equal safety).
 - **Defend it** (M25) — the adversary moves from the network to the *protocol peer*: an exhaustive proof of
@@ -950,11 +960,12 @@ real congestion-control and protocol code, each piece zero-dependency and CI-enf
 The thread is **the verifier-in-the-loop discipline applied to a live network stack**: synthesise *and*
 prove, attack *and* certify, and — the house rule that makes the rest trustworthy — **claim exactly what is
 proven and characterise the rest** (every milestone above carries its honest negative: the BBR loss residual,
-the continuum obstruction, the GP stuck at a local optimum until exhaustion beat it, repair's
-no-fitness-breakthrough, the per-RTT-ABC and receipt-nonce residuals). Each was specified by an adversarial
-design pass and re-checked by a multi-agent adversarial review of the finished diff before commit — which
-caught an over-claim *every single time* (including, on this very arc, "neutralises ACK division" → a byte
-bound, and "α/2 is the optimum" → only a search fixed point that exhaustion then beat).
+the continuum obstruction, `α/2` only a search fixed point exhaustion then disproved (for AIMD's increase),
+repair's no-fitness-breakthrough, the per-RTT-ABC and receipt-nonce residuals). Each was specified by an
+adversarial design pass and re-checked by a multi-agent adversarial review of the finished diff before commit
+— which caught an over-claim *every single time* (including, on this very arc, "neutralises ACK division" → a
+byte bound, and "exhaustion beat the GP" → exhaustion settled a *different* corner where the responses
+interact, not a head-to-head the GP lost).
 
 ## 6. End-to-end data flow (one `curl` request)
 
@@ -1008,10 +1019,10 @@ bound, and "α/2 is the optimum" → only a search fixed point that exhaustion t
 | M20 | **Adversarial worst-case discovery** (`adversary_search` / `run_adversarial`) — invert the trainer into a minimax adversary: search a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base rate schedule) for the trajectory that maximises a controller's mean/max standing queue or throughput shortfall; a steady-state evolutionary maximiser over an elite corpus, equal-budget-compared to blind random sampling, every trace replayable bit-for-bit | the headline (CI-verified, baked discovered trace): a **time-varying** trace **collapses BBR's goodput** to a sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — a BBR-specific pathology (bandwidth under its windowed-max estimate; the link is controller-agnostic, so the asymmetry is BBR's doing). The standing-queue objective separately drives a sustained throttle that bloats BBR's queue **15.5 ms → ~100 ms (6.4×)**, largely erasing pacing's latency edge; the verifier-in-the-loop step before co-evolving a robust controller |
 | M21 | **Co-evolution / CEGIS for CC** (`coevolve`) — close the loop: the CEM synthesises a controller, the adversary finds the counterexample trace, it joins an archive, and the CEM re-synthesises against the worst case; a true zero-sum frontier-penalty game (minimax), the survivor `bmc`-certified safe — all on real stack code, zero ML/solver deps | the adversary's best attack **shrinks round over round** and the loop **converges in 2–3 rounds**; on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break** than the average-optimal baked genome (worst-case penalty 41–66 % of baked) and is **bounded-proven safe (0 violations)** — **safe by construction, empirically robust** — at the honest cost of average-case throughput (the robustness/performance Pareto, found automatically) |
 | M22 | **Bounded performance certificate** (`certify_worst`) — the adversary as a *prover*: exhaust the discretised capacity-trace envelope (every `n_slices`-periodic schedule over `n_levels` levels) and take the worst-case queue — a sound performance bound for that envelope, the model-checking discipline applied to performance not just safety; deterministic, zero-dep | discriminates controllers (**Prague 4.1 ms vs Reno 62 ms** certified worst-case queue; the co-evolved controller's is **26 % of baked's**); for AIMD/ECN controllers the worst case is — *observed exhaustively, not proven* — the minimum-rate trace and the bound **converges** across nested period granularities; for **BBR** it finds a **resonant timing pattern** (a spike priming the rate estimate) that beats both the floor and the sampling adversary (certified 50.9 ms vs sampled 44.5 ms) — exactly where exhaustion is needed; sound *over the discretised periodic envelope*, lifting to a continuum guarantee is the open ceiling |
-| M23 | **Verified GP synthesis of the control law** (`Synth` / `ControlProgram` / `evolve_control_law`) — synthesise the control *law*, not its gains: each response (increase/loss/ECN) is a small **SSA register-machine program** over the live signals, genetic-searched with the `bmc` safety checker as a **hard reject filter** ("synthesis modulo verification"), wired in **unsanitised** so the filter has real teeth; zero-transcendental, deterministic (CI-pinned pure function of its seed) | every survivor is **machine-checked safe by a bounded proof** (the guarantee learned/RL controllers lack); the discovered law is verified-safe (depth-4 `bmc`, 0 violations) and, **under the queue-penalised hinge fitness it was bred for**, ranks above **every hand-tuned** controller on the held-out set — but *not* a Pareto win (on raw goodput it loses to Reno/CUBIC/BBR, only out-goodputs DCTCP/Prague at a far lower queue) and it loses to the gene-tuned `Learned` on both axes. Its ECN response **rediscovers DCTCP's exact `α/2`** — a fixed point the search returns to. **M26 revises the read**: that `α/2` is a *search artefact* (a local optimum), not the grammar's true optimum — exhausting the single-op ECN grammar finds a delay-based `srtt−1` that beats it. So the GP wins on *structure + safety-by-construction* but its convergence to `α/2` was limited by search coverage, not (as M23 first framed it) constant resolution |
+| M23 | **Verified GP synthesis of the control law** (`Synth` / `ControlProgram` / `evolve_control_law`) — synthesise the control *law*, not its gains: each response (increase/loss/ECN) is a small **SSA register-machine program** over the live signals, genetic-searched with the `bmc` safety checker as a **hard reject filter** ("synthesis modulo verification"), wired in **unsanitised** so the filter has real teeth; zero-transcendental, deterministic (CI-pinned pure function of its seed) | every survivor is **machine-checked safe by a bounded proof** (the guarantee learned/RL controllers lack); the discovered law is verified-safe (depth-4 `bmc`, 0 violations) and, **under the queue-penalised hinge fitness it was bred for**, ranks above **every hand-tuned** controller on the held-out set — but *not* a Pareto win (on raw goodput it loses to Reno/CUBIC/BBR, only out-goodputs DCTCP/Prague at a far lower queue) and it loses to the gene-tuned `Learned` on both axes. Its ECN response **rediscovers DCTCP's exact `α/2`** — a fixed point the search returns to (an *unproven* fixed point; M23 names the exhaustive sweep as the way to settle optimality, which **M26 runs**: `α/2` is confirmed not the in-class optimum for AIMD's increase). The GP-vs-`Learned` gap *at `Learned`'s sub-ms point* is a constant-resolution one (the grammar `{½,1,2}` can't build `Learned`'s `≈ α·0.185`) → motivates a GP-structure + CEM-constant hybrid |
 | M24 | **CEGIS-with-repair** (`repair_to_safe` / `ControlProgram::repair_*` / `evolve_control_law(repair=true)`) — turn the `bmc` from a reject *filter* into a counterexample-guided *repair operator*: the violation message names the offending clause (shared tag consts, compile-coupled), a **sound, targeted** repair fixes just that response (loss/increase: clamp the output instruction — faithful to the discovered output only for identity-carry tails, else it discards the final op; ECN: reset to the safe baseline), re-check, iterate (≤ 3, converges; AIMD fallback at the cap); the *healed* program is scored and propagated | a near-safe law is **healed, not discarded** — on the de-risk seed the filter rejected 55 candidates, repair healed 46 and threw away **none**, and the survivor is `bmc`-safe one bound deeper and ≥ the seed. The win is **sample efficiency at equal safety, not a better law**: on that single seed repair's *bred* fitness was marginally lower (0.7519 vs 0.7546) and its held-out goodput marginally higher (0.63× vs 0.61×) — within noise, not swept; the loss-law difference is which genome each run converged to, not a repair effect. Tests assert "discards nothing + stays safe + ≥ seed", never "beats the filter" |
 | M25 | **Misbehaving-receiver defence** (`bmc::check_ack_split_invariance`; `tcb::misbehaving_receiver_*`) — point the adversary at the protocol *peer*: exhaustively prove the **ACK-division byte bound** (window growth never exceeds the bytes acked, across every split into ≤k ACKs, sub-MSS granularity), and pin the honest scope + the two other receiver attacks | every byte-counting controller (Reno/DCTCP/Learned/Synth) is **proven to bound window growth by bytes acked** — anti-amplification, the receiver can't inflate past delivered data — and a `PerAckMss` strawman (`cwnd += MSS`/ACK) is caught violating it unboundedly (teeth). But it is a **ceiling, not split-invariance** (honestly pinned): slow start's per-ACK `min(MSS)` cap leaves a *real, byte-bounded residual* (a split stretch ACK recovers per-segment growth; per-RTT ABC / RFC 3465 would close it), while CA's byte accumulator is genuinely split-invariant. Two residuals characterised not built: an ACK **above `SND.NXT`** is dropped (RFC 793 §3.9); an **optimistic ACK** of in-flight data is accepted (indistinguishable from genuine) → needs a receipt nonce. The novelty is the *exhaustive proof of exactly what byte counting bounds*, not the mechanism |
-| M26 | **Exhaustive verified synthesis** (`sim::exhaust_ecn_response` / `ControlProgram::EXHAUSTED_ECN_OPTIMUM`) — turn the search into a *proof*: shrink the ECN-response grammar to all single-operation programs `cut = op(r[a], r[b])` (384), enumerate them, `bmc`-filter for safety (352 pass), score the safe ones on the frontier, take the max — a **proven** in-class optimum, not a sampled one | the optimum is **not** `α/2`: it is a **delay-based** `cut = srtt/rtt_min − 1` (ignores `α`, backs off proportional to the queuing delay), strictly above `α/2` on the train frontier (0.783 vs 0.740) and out-goodputting DCTCP/`Learned` on held-out (0.92× line vs 0.56×/0.81×, at ~1.4 ms queue). So **exhaustion beat the heuristic** — M23's `α/2` was a local optimum the GP got stuck at, *not* the grammar's true optimum; a bounded theorem (single-op grammar, this train set), a different (higher-goodput, higher-queue) frontier point, not shipped (higher queue) but proven |
+| M26 | **Exhaustive verified synthesis** (`sim::exhaust_ecn_response` / `ControlProgram::EXHAUSTED_ECN_OPTIMUM`) — turn the search into a *proof*: with increase/loss **fixed at AIMD's**, shrink the ECN-response grammar to all single-operation programs `cut = op(r[a], r[b])` (384), enumerate them, `bmc`-filter for safety (352 pass), score the safe ones on the frontier, take the max — a **proven** optimum over that class, not a sampled one | the optimum is **not** `α/2`: it is a **delay-based** `cut = srtt/rtt_min − 1` (ignores `α`, backs off proportional to the queuing delay), strictly above `α/2` *with AIMD's increase* (0.783 vs 0.740) and out-goodputting DCTCP/`Learned` on held-out (0.92× line vs 0.56×/0.81×, at ~1.4 ms queue). So M26 **confirms** M23's flag that `α/2` is an unproven fixed point — and proves it suboptimal *for the AIMD family*. Honest scope: the responses **interact** (`srtt−1` is *worse* than `α/2` for the GP's own evolved increase, 0.70 vs 0.75), so this is exhaustion settling a different corner, **not** out-searching the GP; a bounded theorem (single-op, this train set), a different (higher-goodput, higher-queue) frontier point, not shipped |
 
 ## 9. Environment
 

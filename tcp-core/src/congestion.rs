@@ -1206,14 +1206,16 @@ impl ControlProgram {
         ],
     };
 
-    /// The frontier-optimal **single-operation** ECN response found by **exhausting** the class (not the
-    /// heuristic GP): `cut = srtt/rtt_min − 1` — a **delay-based** response that backs off proportional to
-    /// the measured queuing delay, paired with AIMD's increase/loss. [`crate::sim::exhaust_ecn_response`]
-    /// enumerates all 384 single-op ECN responses, proves the 352 safe ones, and finds this one maximal on
-    /// the training frontier — strictly above DCTCP's `α/2` (the fixed point the GP got *stuck* at in M23).
-    /// So it is a **proven in-class optimum**, and the lesson is that M23's `α/2` was a *search* artefact,
-    /// not the grammar's true optimum. `#[cfg(test)]`: a research artifact (and a higher-queue operating
-    /// point than the shipped sub-ms controllers), exercised by the exhaustion tests, not shipped.
+    /// The frontier-optimal **single-operation** ECN response found by **exhausting** the class with the
+    /// increase/loss responses **fixed at AIMD's**: `cut = srtt/rtt_min − 1` — a **delay-based** response
+    /// that backs off proportional to the measured queuing delay (ignoring `α`).
+    /// [`crate::sim::exhaust_ecn_response`] enumerates all 384 single-op ECN responses, proves the 352 safe
+    /// ones, and finds this one maximal — strictly above DCTCP's `α/2` *with AIMD's increase*. So it is a
+    /// **proven optimum over that class**, confirming M23's flag that `α/2` was only an unproven search fixed
+    /// point. NOTE the responses interact: `srtt − 1` is *worse* than `α/2` for the increase the GP actually
+    /// evolved, so this proves `α/2` suboptimal for the AIMD family, NOT that the GP "missed" a better ECN.
+    /// `#[cfg(test)]`: a research artifact (and a higher-queue operating point than the shipped sub-ms
+    /// controllers), exercised by the exhaustion tests, not shipped.
     #[cfg(test)]
     pub(crate) const EXHAUSTED_ECN_OPTIMUM: ControlProgram = ControlProgram {
         inc: ControlProgram::AIMD.inc,

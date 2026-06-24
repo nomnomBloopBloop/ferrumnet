@@ -108,15 +108,18 @@ against a misbehaving peer — all zero-dependency, all CI-enforced, each claim 
   returning to. The gap to `Learned` is a characterised constant-resolution limit (the discrete grammar
   `{0.5, 1, 2}` cannot build `Learned`'s finer `≈ α·0.185` gain), which precisely motivates a GP-structure
   + CEM-constant hybrid. (`sim` + `bmc`)
-- **It turns the search into a *proof* — and exhaustion beats the heuristic.** The GP above *observed*
-  that it kept returning to DCTCP's `α/2`, but never proved nothing safe beats it. So for one response —
-  the ECN cut — shrink the grammar to all **single-operation** programs (`cut = op(r[a], r[b])`, 384 of
-  them), **exhaust** it: BMC-filter every member for safety (352 pass), score the survivors on the
-  frontier, take the max. The winner is a *proven* in-class optimum — and it is **not** `α/2`. It is a
-  **delay-based** response, `cut = srtt/rtt_min − 1` (back off in proportion to the measured queuing
-  delay), which scores strictly above `α/2` and recovers far more goodput than DCTCP (0.92× vs 0.56× line
-  on held-out, at a ~1.4 ms queue). So the GP was *stuck* at `α/2`; exhaustion found the better response it
-  missed — the verifier-as-prover, applied to synthesis itself. (`sim` + `bmc`)
+- **It turns the search into a *proof*.** The GP above *observed* that it kept returning to DCTCP's `α/2`
+  but never proved nothing safe beats it. So for one response — the ECN cut, with the increase/loss held at
+  AIMD's — shrink the grammar to all **single-operation** programs (`cut = op(r[a], r[b])`, 384 of them) and
+  **exhaust** it: BMC-filter every member for safety (352 pass), score the survivors on the frontier, take
+  the max. The winner is a *proven* optimum over that class — and it is **not** `α/2`. It is a **delay-based**
+  response, `cut = srtt/rtt_min − 1` (back off in proportion to the measured queuing delay), which scores
+  strictly above `α/2` *for AIMD's increase* (0.78 vs 0.74) and recovers far more goodput than DCTCP (0.92×
+  vs 0.56× line on held-out, at a ~1.4 ms queue). The honest scope: this is the optimum *for the AIMD-increase
+  family*, and the responses interact — `srtt − 1` actually *lowers* the GP's own evolved-increase controller
+  (0.70 vs its 0.75), so this is exhaustion settling a *different* corner of the space, not out-searching the
+  GP. It confirms what M23 already flagged: `α/2` was an unproven fixed point, and now it's proven not optimal
+  here. (`sim` + `bmc`)
 - **The verifier doesn't just reject — it *repairs* (CEGIS-with-repair).** The next turn of the same loop:
   instead of discarding an unsafe candidate, feed the `bmc`'s **counterexample** back as a repair signal —
   it names the violated clause, so a **sound, targeted** repair fixes just the offending response (the
