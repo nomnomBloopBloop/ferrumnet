@@ -460,20 +460,25 @@ pub fn check_learned_genome_space(mss: u32, depth: u32) -> BmcReport {
     report
 }
 
-// ── misbehaving-receiver defence: ACK-division invariance ────────────────────────────────────────
+// ── misbehaving-receiver defence: the ACK-division byte bound ──────────────────────────────────────
 //
 // The adversary so far has been the *network* (the capacity trace) and the *synthesiser* (the program).
 // This points it at the **protocol peer**. A misbehaving *receiver* can subvert a *sender*'s congestion
 // control — most classically by **ACK division** (Savage et al., "TCP Congestion Control with a Misbehaving
-// Receiver", 1999): on receiving one segment it returns many ACKs, each advancing the cumulative ACK by a
-// sub-MSS fraction, so a sender that grows its window *per ACK* inflates it far past what the delivered data
-// warrants. The defence is **byte counting** — grow as a function of bytes acknowledged, not ACK count —
-// and every controller in this stack does exactly that. We turn the bmc into the prover again: exhaust
-// every way to split a window of new data across ACKs and prove the window never grows past the bytes
-// acked, so ACK division buys the attacker nothing. (Two further receiver attacks are addressed elsewhere:
-// an ACK *above* `SND.NXT` — acking data never sent — is dropped by the TCB's RFC 793 §3.9 acceptability
-// test; and an **optimistic ACK** of in-flight-but-undelivered data is the residual threat, demonstrated
-// and characterised in `tcb`'s `misbehaving_receiver_*` tests — it needs a receipt nonce, not byte counting.)
+// Receiver", 1999): it returns many ACKs, each advancing the cumulative ACK by a sub-MSS fraction, so a
+// sender that grows its window *per ACK* (regardless of bytes) inflates it far past the delivered data. The
+// defence is **byte counting** — grow as a function of bytes acknowledged, not ACK count — which every
+// controller here does. We turn the bmc into the prover again to pin **what that does and does not buy**:
+// exhaust every way to split a window of new data across ACKs and prove the window never grows past the
+// **bytes acked** — an *anti-amplification* bound (a per-ACK `cwnd += MSS` controller violates it
+// unboundedly). This is NOT split-invariance, and the docs are careful about it: in slow start the per-ACK
+// `acked.min(MSS)` cap means a receiver that splits a *multi-segment* stretch ACK at MSS boundaries still
+// recovers the full per-segment growth a single stretch/delayed ACK is denied — a real but *bounded* gain
+// (closing it needs true per-RTT ABC, RFC 3465); in congestion avoidance the byte accumulator makes growth
+// genuinely split-insensitive. The residual is characterised in `ack_division_residual_is_slow_start_only`.
+// (Two further receiver attacks: an ACK *above* `SND.NXT` is dropped by the TCB's RFC 793 §3.9 acceptability
+// test; and an **optimistic ACK** of in-flight data is the residual the `tcb::misbehaving_receiver_*` test
+// characterises — it needs a receipt nonce, not byte counting.)
 
 /// `f` over every ordered composition of `n` into parts each `≥ 1`, with at most `max_parts` parts.
 fn for_each_composition(n: u32, max_parts: u32, prefix: &mut Vec<u32>, f: &mut impl FnMut(&[u32])) {
@@ -491,16 +496,17 @@ fn for_each_composition(n: u32, max_parts: u32, prefix: &mut Vec<u32>, f: &mut i
     }
 }
 
-/// **Exhaustively prove byte counting neutralises the ACK-division misbehaving receiver.** Drive a fresh
-/// `controller` (in slow start) through **every** way of splitting `total_units · unit` bytes of new data
-/// into `1..=max_acks` ACKs (each a positive multiple of `unit`), and confirm the window never grows by
-/// more than the **total bytes acknowledged** — so window growth is a function of bytes, not ACK count, and
-/// no split speeds it up. Use a sub-MSS `unit` (e.g. `MSS/4`) so the sub-MSS division the attack relies on
-/// is covered. A naive `cwnd += MSS`-per-ACK controller grows by `n_acks · MSS` and so violates this for
-/// any split finer than one ACK (the negative-control test drives exactly such a controller and shows it
-/// caught). Drives whatever regime `controller` is already in — pass a fresh one for slow start, or one
-/// already cut into congestion avoidance, to cover both. Returns the case count and the first violation (a
-/// byte-counting controller yields zero).
+/// **Exhaustively prove the ACK-division *byte bound*: window growth never exceeds the bytes acked.** Drive
+/// `controller` through **every** way of splitting `total_units · unit` bytes of new data into `1..=max_acks`
+/// ACKs (each a positive multiple of `unit`), and confirm the window never grows by more than the **total
+/// bytes acknowledged**. This is the *anti-amplification* property — a misbehaving receiver cannot inflate
+/// the window past the data it actually delivered, no matter how it splits its ACKs — and it is exactly what
+/// a naive `cwnd += MSS`-per-ACK controller fails (it grows by `n_acks · MSS`, unbounded in the number of
+/// ACKs; the negative-control test drives such a controller and shows it caught). It is **not**
+/// split-invariance: a finer split can still grow the window *faster*, up to this byte ceiling — see
+/// `ack_division_residual_is_slow_start_only` for the slow-start residual that recovers. Use a sub-MSS
+/// `unit` (e.g. `MSS/4`) to cover sub-MSS division. Drives whatever regime `controller` is already in.
+/// Returns the case count and the first violation (a byte-counting controller yields zero).
 pub fn check_ack_split_invariance<C: CongestionControl + Clone>(controller: &C, total_units: u32, unit: u32, max_acks: u32) -> BmcReport {
     let mut report = BmcReport::default();
     let total_bytes = total_units * unit;
@@ -749,38 +755,28 @@ mod tests {
         }
     }
 
-    /// PROOF (bounded), the **ACK-division defence**: every byte-counting controller in the stack — Reno,
-    /// DCTCP, the evolved `Learned`, and the synthesised `Synth` — has window growth bounded by the BYTES
-    /// acknowledged, across *every* way of splitting a window of new data into ACKs (down to sub-MSS
-    /// granularity). So a misbehaving receiver that floods the sender with many tiny ACKs gains nothing —
-    /// the window grows with delivered data, not ACK count. The negative control proves the property has
-    /// teeth: a per-ACK `cwnd += MSS` controller (the vulnerable design) is caught inflating its window past
-    /// the bytes acked on exactly the finely-split traces the attack uses.
+    /// PROOF (bounded), the **ACK-division byte bound** (anti-amplification): every byte-counting controller
+    /// in the stack — Reno, DCTCP, the evolved `Learned`, the synthesised `Synth` — has window growth bounded
+    /// by the BYTES acknowledged, across *every* way of splitting a window of new data into ACKs (down to
+    /// sub-MSS granularity). So a misbehaving receiver cannot inflate the window *past the data it delivered*,
+    /// however it splits its ACKs. The negative control gives it teeth: a per-ACK `cwnd += MSS` controller
+    /// (the vulnerable design) IS caught inflating its window past the bytes acked. (This is the byte ceiling,
+    /// not split-invariance — a finer split can still grow faster up to that ceiling; see
+    /// `ack_division_residual_is_slow_start_only`.)
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn byte_counting_neutralises_ack_division() {
+    fn ack_division_cannot_inflate_the_window_past_the_bytes_acked() {
         let mss = 1000u32;
         let unit = mss / 4; // sub-MSS granularity — the lever ACK division pulls
-
-        // Put a controller into congestion avoidance: a triple dup-ACK loss sets cwnd = ssthresh, so the
-        // next ACK is no longer in slow start. Covers the second regime, where growth is byte-counted too.
-        let ca_reno = {
-            let mut c = Reno::new(mss as u16);
-            c.on_dup_ack(CC_NOW, 10 * mss);
-            c.on_dup_ack(CC_NOW, 10 * mss);
-            c.on_dup_ack(CC_NOW, 10 * mss); // 3rd dup-ACK → fast recovery, cwnd = ssthresh → CA
-            c
-        };
         let runs = [
-            ("reno/slowstart", check_ack_split_invariance(&Reno::new(mss as u16), 6, unit, 6)),
-            ("reno/ca", check_ack_split_invariance(&ca_reno, 6, unit, 6)),
+            ("reno", check_ack_split_invariance(&Reno::new(mss as u16), 6, unit, 6)),
             ("dctcp", check_ack_split_invariance(&Dctcp::new(mss as u16), 6, unit, 6)),
             ("learned", check_ack_split_invariance(&Learned::with_params(mss as u16, LearnedParams::BAKED), 6, unit, 6)),
             ("synth", check_ack_split_invariance(&Synth::with_program(mss as u16, ControlProgram::BAKED_SYNTH), 6, unit, 6)),
         ];
         for (name, report) in runs {
             assert!(report.cases > 10, "{name}: the split enumeration must be substantial: {} cases", report.cases);
-            assert_eq!(report.violations, 0, "{name}: ACK division inflated the window; repro: {:?}", report.first_violation);
+            assert_eq!(report.violations, 0, "{name}: ACK division inflated the window past the bytes acked; repro: {:?}", report.first_violation);
         }
         // Negative control: the per-ACK strawman IS caught — splitting one window into many sub-MSS ACKs
         // grows its window past the bytes acked.
@@ -791,5 +787,51 @@ mod tests {
             "the violation is the ACK-split inflation one: {:?}",
             naive.first_violation
         );
+    }
+
+    /// **The honest scope of the ACK-division defence: byte counting is an anti-amplification *ceiling*, not
+    /// split-invariance.** The byte bound (above) holds, but the two regimes differ, and we pin both exactly:
+    /// - **Slow start has a real residual.** The per-ACK `cwnd += acked.min(MSS)` cap (RFC 5681 ABC with the
+    ///   one-MSS limit applied *per ACK*, not per RTT) means a single coalesced stretch ACK of `K` segments
+    ///   grows the window by only **one** MSS, but a receiver that splits the same window into `K` per-MSS
+    ///   ACKs grows it by `K` MSS — recovering the per-segment growth a stretch/delayed ACK is denied. That
+    ///   is a real gain to the attacker, *bounded* by the bytes acked. Closing it needs true per-RTT ABC
+    ///   (RFC 3465) — characterised here, not built.
+    /// - **Congestion avoidance has none.** The `ca_acc` byte accumulator credits the same total however the
+    ///   ACKs are split, so growth is split-insensitive — genuine immunity to division.
+    #[test]
+    fn ack_division_residual_is_slow_start_only() {
+        let mss = 1000u32;
+        let growth = |setup: &dyn Fn(&mut Reno), acks: &[u32]| -> u32 {
+            let mut c = Reno::new(mss as u16);
+            setup(&mut c);
+            let before = c.cwnd();
+            for &a in acks {
+                c.on_ack(CC_NOW, a);
+            }
+            c.cwnd().saturating_sub(before)
+        };
+
+        // Slow start: a 6-segment stretch ACK grows by ONE MSS; splitting it into 6 per-MSS ACKs grows by 6 —
+        // the residual. Both are bounded by the 6·MSS bytes acked (the anti-amplification ceiling holds).
+        let noop = |_: &mut Reno| {};
+        let coarse_ss = growth(&noop, &[6 * mss]);
+        let fine_ss = growth(&noop, &[mss; 6]);
+        assert_eq!(coarse_ss, mss, "a coalesced stretch ACK grows by one MSS (the per-ACK cap)");
+        assert_eq!(fine_ss, 6 * mss, "splitting it recovers full per-segment growth — the residual");
+        assert!(fine_ss > coarse_ss, "slow-start ACK division DOES speed the window up (not split-invariant)");
+        assert!(fine_ss <= 6 * mss, "...but only up to the bytes acked (the anti-amplification ceiling)");
+
+        // Congestion avoidance: enter CA with a small cwnd, then the byte accumulator makes growth identical
+        // whether the same bytes arrive coalesced or split — genuine split-invariance.
+        let into_ca = |c: &mut Reno| {
+            c.on_dup_ack(CC_NOW, 4 * mss);
+            c.on_dup_ack(CC_NOW, 4 * mss);
+            c.on_dup_ack(CC_NOW, 4 * mss); // ssthresh = cwnd = 2·MSS → congestion avoidance
+        };
+        let coarse_ca = growth(&into_ca, &[6 * mss]);
+        let fine_ca = growth(&into_ca, &[mss; 6]);
+        assert!(coarse_ca > 0, "the CA case must actually grow (non-vacuous)");
+        assert_eq!(coarse_ca, fine_ca, "in CA the byte accumulator makes growth split-invariant");
     }
 }

@@ -1837,11 +1837,13 @@ mod tests {
     ///    buffer for that (undelivered) data is freed. This is the **residual** threat: byte counting (which
     ///    defeats ACK division, see `bmc::byte_counting_neutralises_ack_division`) and the SND.NXT check do
     ///    not catch a premature-but-in-window ACK. Detecting it needs a *receipt nonce* (RFC 3540-style) the
-    ///    receiver cannot forge for data it never got — characterised here, not yet built.
+    ///    receiver cannot forge for data it never got — characterised here, not yet built. (There is no
+    ///    exploit to *run* in a unit test beyond that indistinguishability: the test confirms the in-window
+    ///    ACK is accepted exactly because it looks genuine — that acceptance *is* the gap.)
     #[test]
     fn misbehaving_receiver_optimistic_ack_defended_above_nxt_residual_in_flight() {
         let now = Instant::from_millis(0);
-        let (mut tcb, iss, cnxt) = established(now, 1000, 64000);
+        let (mut tcb, _iss, cnxt) = established(now, 1000, 64000);
         let full = tcb.tx_free();
         // Send three segments' worth; they go "on the wire" but no receiver has confirmed delivery yet.
         assert_eq!(tcb.send(&vec![0x5a; 3000]), 3000);
@@ -1862,7 +1864,6 @@ mod tests {
         assert_eq!(tcb.snd_una_dbg(), snd_nxt, "an in-window optimistic ACK advances SND.UNA (the residual threat)");
         assert_eq!(tcb.tx_free(), full, "...and frees the (undelivered) data from the retransmit buffer");
         assert!(tcb.cwnd_dbg() >= cwnd_before, "...and grows the window on the premature ACK");
-        let _ = iss;
     }
 
     #[test]

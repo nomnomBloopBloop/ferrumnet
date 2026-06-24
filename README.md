@@ -112,13 +112,17 @@ $ curl -v http://10.0.0.2:8080/
   hair higher — within noise; the constant-resolution ceiling from the GP synthesis still binds). (`sim` + `bmc`)
 - **It points the adversary at the *protocol peer*, not just the network.** A misbehaving *receiver* can
   try to subvert a sender's congestion control. Classic **ACK division** (Savage et al.) floods the sender
-  with many tiny sub-MSS ACKs so a per-ACK-growing sender over-inflates its window — and the `bmc` *proves*
-  this stack is immune: exhaust **every** way of splitting a window of new data across ACKs and the window
-  never grows past the **bytes** acked (a per-ACK `cwnd += MSS` strawman is caught on the same traces), so
-  byte counting neutralises the attack. An ACK *above* `SND.NXT` is dropped by the RFC 793 acceptability
-  check. The honest residual: an **optimistic ACK** of in-flight-but-undelivered data is indistinguishable
-  from a genuine one, so it's accepted — defeating it needs a receipt nonce the receiver can't forge, which
-  is characterised (a tcb test demonstrates the gap), not yet built. (`bmc` + `tcb`)
+  with many tiny sub-MSS ACKs so a *per-ACK*-growing sender over-inflates its window — and the `bmc` *proves
+  the byte bound*: exhaust **every** way of splitting a window of new data across ACKs and the window never
+  grows past the **bytes** acked (a per-ACK `cwnd += MSS` strawman is caught violating it, unboundedly). So
+  byte counting stops *amplification* — the receiver can't inflate the window past the data it delivered.
+  Stated honestly, that's a ceiling, not split-invariance: in slow start the per-ACK `min(MSS)` cap lets a
+  receiver splitting a multi-segment stretch ACK still recover full per-segment growth (a real but
+  byte-bounded gain; true per-RTT ABC / RFC 3465 would close it), while congestion avoidance's byte
+  accumulator is genuinely split-invariant — both pinned in tests. An ACK *above* `SND.NXT` is dropped by
+  the RFC 793 acceptability check; the other residual, an **optimistic ACK** of in-flight data, is accepted
+  because it's indistinguishable from a genuine one — defeating it needs a receipt nonce, characterised not
+  built. (`bmc` + `tcb`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -457,7 +461,7 @@ cargo test -p tcp-core      # 236 tests: unit + in-memory integration + loss/SAC
                             #            bloats BBR's queue ~6x / collapses its goodput)
                             #            + GP control-law synthesis (bmc as a hard reject filter)
                             #            + CEGIS-with-repair (bmc counterexample heals the law)
-                            #            + misbehaving-receiver defence (ACK-division invariance proof)
+                            #            + misbehaving-receiver defence (ACK-division byte-bound proof)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
