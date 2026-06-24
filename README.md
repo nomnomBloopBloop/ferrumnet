@@ -38,7 +38,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **seven pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one / a **GP-synthesised** one), and a **two-stack userspace loopback** (two
-  instances connecting to each other entirely in memory). **232 tests**, green on Rust 1.92 and the 1.75
+  instances connecting to each other entirely in memory). **234 tests**, green on Rust 1.92 and the 1.75
   MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -101,6 +101,14 @@ $ curl -v http://10.0.0.2:8080/
   returning to. The gap to `Learned` is a characterised constant-resolution limit (the discrete grammar
   `{0.5, 1, 2}` cannot build `Learned`'s finer `≈ α·0.185` gain), which precisely motivates a GP-structure
   + CEM-constant hybrid. (`sim` + `bmc`)
+- **The verifier doesn't just reject — it *repairs* (CEGIS-with-repair).** The next turn of the same loop:
+  instead of discarding an unsafe candidate, feed the `bmc`'s **counterexample** back as a repair signal —
+  it names the violated clause, so a targeted, structure-preserving projection heals just the offending
+  response (clamp the loss target to the pipe, floor the increase, restore the safe ECN baseline) and the
+  result is re-verified. So a near-safe-but-good law is *healed*, not thrown away. Honest measure: on the
+  held-out set the repaired search lands a safe law of comparable fitness (a hair better — 0.63× vs 0.61×
+  goodput at a slightly lower queue) while **discarding nothing**, and its loss response is the sensible
+  `½·FlightSize` rather than the filter's degenerate collapse-to-floor. (`sim` + `bmc`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -424,7 +432,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 232 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 234 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -438,6 +446,7 @@ cargo test -p tcp-core      # 232 tests: unit + in-memory integration + loss/SAC
                             #            + an adversarial worst-case search (the capacity trace that
                             #            bloats BBR's queue ~6x / collapses its goodput)
                             #            + GP control-law synthesis (bmc as a hard reject filter)
+                            #            + CEGIS-with-repair (bmc counterexample heals the law)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):

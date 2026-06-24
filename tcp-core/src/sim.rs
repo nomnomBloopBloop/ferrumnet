@@ -2318,6 +2318,40 @@ fn synth_crossover(rng: &mut Rng, a: ControlProgram, b: ControlProgram) -> Contr
     child
 }
 
+/// **CEGIS repair** — project `prog` into the safety envelope, using the bmc's *counterexample* as the
+/// guide (not just its yes/no verdict): check; if unsafe, map the violated clause to a targeted repair
+/// (clamp the loss target to the pipe, floor the increase, or restore the safe ECN baseline — see
+/// [`ControlProgram::repair_loss`] etc.) and re-check; iterate. The three gain clauses are independent and
+/// each repair is idempotent for its clause, so this converges in ≤ 3 steps; a defensive cap then falls
+/// back to the bmc-proven-safe [`ControlProgram::AIMD`]. Returns the safe program (re-verified by the
+/// loop's own exit condition) and how many repairs were applied (0 if it was already safe). This is the
+/// "verifier in the loop as a repair operator, not just a filter": a near-safe-but-good program is
+/// *healed* — its safe responses preserved — instead of discarded.
+fn repair_to_safe(mut prog: ControlProgram, mss: u16, depth: u32) -> (ControlProgram, u32) {
+    let mut repairs = 0u32;
+    for _ in 0..4 {
+        let report = crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, depth);
+        if report.violations == 0 {
+            return (prog, repairs);
+        }
+        let why = report.first_violation.as_deref().unwrap_or("");
+        // The bmc's violation messages (stable, defined in `crate::bmc`) name the offending clause; map
+        // each to the response that owns it. The two structural clauses (cwnd ≥ MSS, ssthresh ≥ 2·MSS)
+        // never fire for `Synth` (its floors are structural), so the `else` is a defensive baseline reset.
+        prog = if why.contains("loss inflated cwnd") {
+            prog.repair_loss()
+        } else if why.contains("ECN mark grew cwnd") {
+            prog.repair_ecn()
+        } else if why.contains("clean ACK shrank cwnd") {
+            prog.repair_increase()
+        } else {
+            ControlProgram::AIMD
+        };
+        repairs += 1;
+    }
+    (ControlProgram::AIMD, repairs)
+}
+
 /// What a control-law search found.
 #[derive(Clone, Copy, Debug)]
 pub struct SynthReport {
@@ -2328,19 +2362,29 @@ pub struct SynthReport {
     /// The fitness of the [`ControlProgram::AIMD`] seed on the same training set — the "did it beat the
     /// hand-written law?" reference.
     pub seed_fit: f64,
-    /// How many candidate programs the bmc safety filter rejected over the whole run (the filter's work).
+    /// In **filter** mode, how many candidate programs the bmc rejected (discarded). 0 in repair mode.
     pub rejected: u64,
+    /// In **repair** mode, how many candidates the bmc counterexample *healed* (≥ 1 repair applied). 0 in
+    /// filter mode. The point of CEGIS-with-repair: these would have been thrown away by a pure filter.
+    pub repaired: u64,
     /// How many distinct candidates were evaluated (mutated/crossed children, excluding carried elites).
     pub evaluated: u64,
 }
 
-/// **Synthesise a congestion-control law** by genetic search under the bmc safety filter. Starting from
-/// the safe [`ControlProgram::AIMD`] seed, each generation keeps the top `elite` by fitness and breeds the
-/// rest by crossover + mutation; **every** candidate is first run through
-/// [`crate::bmc::check_controller_safety`] at depth `bmc_depth`, and one with any violation is rejected
-/// (fitness [`SYNTH_REJECT`]) before it is ever scored on the network — so the returned `best` is, by a
-/// bounded machine-checked proof, inside the safety envelope. Scoring is [`synth_frontier_fitness`] on
-/// `train`. Deterministic in `seed`. This is the heavy search; the fast machinery test uses a small budget.
+/// **Synthesise a congestion-control law** by genetic search with the bmc safety checker in the loop.
+/// Starting from the safe [`ControlProgram::AIMD`] seed, each generation keeps the top `elite` by fitness
+/// and breeds the rest by crossover + mutation. The verifier gates every candidate one of two ways,
+/// selected by `repair`:
+///
+/// - `repair = false` — **filter** mode: a candidate with any safety violation is *rejected* (fitness
+///   [`SYNTH_REJECT`]) before it is ever scored, and discarded.
+/// - `repair = true` — **CEGIS-with-repair** mode: a candidate with a violation is instead *healed* by
+///   [`repair_to_safe`] (the bmc counterexample drives a targeted, structure-preserving repair) and the
+///   *repaired, safe* program is what is scored and propagated. Nothing is discarded.
+///
+/// Either way the returned `best` is, by a bounded machine-checked proof, inside the safety envelope.
+/// Scoring is [`synth_frontier_fitness`] on `train`. Deterministic in `seed`.
+#[allow(clippy::too_many_arguments)]
 pub fn evolve_control_law(
     train: &[TrainScenario],
     generations: u32,
@@ -2349,28 +2393,41 @@ pub fn evolve_control_law(
     mss: u16,
     bmc_depth: u32,
     seed: u64,
+    repair: bool,
 ) -> SynthReport {
     let mut rng = Rng::new(seed ^ 0x5717_C0DE_5717_C0DE);
     let mut rejected = 0u64;
+    let mut repaired = 0u64;
     let mut evaluated = 0u64;
-    // The verified filter, then the network score — cheap rejects never pay for an expensive sim.
-    let eval = |prog: ControlProgram, rejected: &mut u64, evaluated: &mut u64| -> f64 {
+    // The verifier in the loop. Returns the (possibly repaired) program actually scored and its fitness —
+    // in repair mode the *healed* program replaces the candidate, so the population is shaped toward safety
+    // while keeping each candidate's already-safe responses. The cheap verifier runs before the expensive
+    // sim, so a reject never pays for a scoring run.
+    let eval = |prog: ControlProgram, rejected: &mut u64, repaired: &mut u64, evaluated: &mut u64| -> (ControlProgram, f64) {
         *evaluated += 1;
-        let report = crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, bmc_depth);
-        if report.violations > 0 {
-            *rejected += 1;
-            return SYNTH_REJECT;
+        if repair {
+            let (safe, n) = repair_to_safe(prog, mss, bmc_depth);
+            if n > 0 {
+                *repaired += 1;
+            }
+            (safe, synth_frontier_fitness(safe, train))
+        } else {
+            let report = crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, bmc_depth);
+            if report.violations > 0 {
+                *rejected += 1;
+                (prog, SYNTH_REJECT)
+            } else {
+                (prog, synth_frontier_fitness(prog, train))
+            }
         }
-        synth_frontier_fitness(prog, train)
     };
 
-    let seed_fit = eval(ControlProgram::AIMD, &mut rejected, &mut evaluated);
+    let seed_fit = eval(ControlProgram::AIMD, &mut rejected, &mut repaired, &mut evaluated).1;
     let mut population: Vec<(ControlProgram, f64)> = vec![(ControlProgram::AIMD, seed_fit)];
     while population.len() < pop.max(1) {
         let muts = 1 + rng.below(3) as usize;
         let child = synth_mutate(&mut rng, ControlProgram::AIMD, muts);
-        let fit = eval(child, &mut rejected, &mut evaluated);
-        population.push((child, fit));
+        population.push(eval(child, &mut rejected, &mut repaired, &mut evaluated));
     }
     let mut best = population[0];
     for &cand in &population {
@@ -2389,17 +2446,16 @@ pub fn evolve_control_law(
             let pb = elites[rng.below(elites.len() as u64) as usize];
             let crossed = synth_crossover(&mut rng, pa, pb);
             let muts = 1 + rng.below(3) as usize;
-            let child = synth_mutate(&mut rng, crossed, muts);
-            let fit = eval(child, &mut rejected, &mut evaluated);
-            if fit > best.1 {
-                best = (child, fit);
+            let scored = eval(synth_mutate(&mut rng, crossed, muts), &mut rejected, &mut repaired, &mut evaluated);
+            if scored.1 > best.1 {
+                best = scored;
             }
-            next.push((child, fit));
+            next.push(scored);
         }
         population = next;
     }
 
-    SynthReport { best: best.0, best_fit: best.1, seed_fit, rejected, evaluated }
+    SynthReport { best: best.0, best_fit: best.1, seed_fit, rejected, repaired, evaluated }
 }
 
 #[cfg(test)]
@@ -2538,7 +2594,7 @@ mod tests {
             TrainScenario { bn: cemark_bn(2_500_000, 2_000, 1_000), bytes: 1024 * 1024, seed: 7 },
             TrainScenario { bn: cemark_bn(1_800_000, 3_000, 1_200), bytes: 1024 * 1024, seed: 7 },
         ];
-        let r = evolve_control_law(&train, 5, 8, 3, 1460, 4, 0x5A5A_1234);
+        let r = evolve_control_law(&train, 5, 8, 3, 1460, 4, 0x5A5A_1234, false);
         assert!(r.rejected > 0, "the bmc filter rejected nothing — it is not engaged: {r:?}");
         assert!(r.evaluated > 8, "the generation loop must actually run (more than one population): {r:?}");
         assert!(
@@ -2557,6 +2613,107 @@ mod tests {
         );
     }
 
+    /// Build a `Synth` sub-program that computes `first` then carries it to the output register (so the
+    /// whole sub-program evaluates to `first`) — used to assemble single-clause-unsafe laws.
+    fn synth_sub_from(first: crate::congestion::Instr) -> [crate::congestion::Instr; ControlProgram::PROG_LEN] {
+        let mut p = [crate::congestion::Instr::new(SynthOp::Max, 0, 0); ControlProgram::PROG_LEN];
+        p[0] = first;
+        for (i, slot) in p.iter_mut().enumerate().skip(1) {
+            let prev = (ControlProgram::REGS_IN + i - 1) as u8;
+            *slot = crate::congestion::Instr::new(SynthOp::Max, prev, prev);
+        }
+        p
+    }
+
+    /// **CEGIS-with-repair: the verifier *heals* an unsafe law instead of discarding it.** Each of the
+    /// three single-clause-unsafe programs (loss inflates / ECN grows / increase shrinks) is bmc-unsafe
+    /// before repair; `repair_to_safe` reads the counterexample and applies **exactly one targeted repair**,
+    /// leaving the other two responses byte-identical, and the result is machine-checked safe. AIMD needs
+    /// zero repairs. This is the verifier-in-the-loop *as a repair operator* — strictly more than a filter,
+    /// which would throw all three programs away wholesale.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cegis_repair_heals_unsafe_laws_targeting_only_the_offending_response() {
+        use crate::congestion::{Instr, SynthOp};
+        let mss = 1000u16;
+        let with = |which: usize, first: Instr| {
+            let mut p = ControlProgram::AIMD;
+            *p.sub_mut(which) = synth_sub_from(first);
+            p
+        };
+        // (response index, program): loss=1 inflates (flight×2), ecn=2 grows (cut=−0.5), inc=0 shrinks (step=−0.5).
+        let cases = [
+            ("loss", 1usize, with(1, Instr::new(SynthOp::Mul, 1, 7))),
+            ("ecn", 2, with(2, Instr::new(SynthOp::Sub, 5, 6))),
+            ("inc", 0, with(0, Instr::new(SynthOp::Sub, 5, 6))),
+        ];
+        for (name, offending, prog) in cases {
+            let before = crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, 4);
+            assert!(before.violations > 0, "{name}: must be unsafe before repair");
+            let (safe, n) = repair_to_safe(prog, mss, 4);
+            assert_eq!(n, 1, "{name}: one counterexample-guided repair suffices");
+            let after = crate::bmc::check_controller_safety(Synth::with_program(mss, safe), mss as u32, 4);
+            assert_eq!(after.violations, 0, "{name}: the repaired law is machine-checked safe: {:?}", after.first_violation);
+            for which in 0..ControlProgram::SUBS {
+                if which != offending {
+                    assert_eq!(safe.sub(which), prog.sub(which), "{name}: repair left response {which} untouched");
+                }
+            }
+        }
+        let (s, n) = repair_to_safe(ControlProgram::AIMD, mss, 4);
+        assert_eq!(n, 0, "already-safe AIMD repairs in zero steps");
+        assert_eq!(s, ControlProgram::AIMD, "...and is returned unchanged");
+    }
+
+    /// **CEGIS-with-repair vs the pure filter, same budget and seed.** The filter *discards* every unsafe
+    /// candidate (rejected > 0, nothing healed); repair *heals* them (rejected == 0, repaired > 0) and the
+    /// survivor — like everything it scored — is bmc-safe (re-checked one bound deeper) and no worse than
+    /// the AIMD seed. The point is sample efficiency without weakening the guarantee: repair throws nothing
+    /// away. Whether repair finds a *better* law than the filter is the open de-risk question (the M23
+    /// constant-resolution ceiling still binds), so this test deliberately does NOT assert that.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cegis_repair_discards_nothing_and_stays_safe() {
+        let train = vec![
+            TrainScenario { bn: cemark_bn(2_500_000, 2_000, 1_000), bytes: 512 * 1024, seed: 7 },
+            TrainScenario { bn: cemark_bn(1_800_000, 3_000, 1_200), bytes: 512 * 1024, seed: 7 },
+        ];
+        let filt = evolve_control_law(&train, 4, 8, 3, 1460, 4, 0x9E27_1234, false);
+        let rep = evolve_control_law(&train, 4, 8, 3, 1460, 4, 0x9E27_1234, true);
+
+        assert!(filt.rejected > 0 && filt.repaired == 0, "the pure filter discards unsafe candidates: {filt:?}");
+        assert!(rep.rejected == 0, "repair mode discards nothing: {rep:?}");
+        assert!(rep.repaired > 0, "repair mode must actually heal some candidates: {rep:?}");
+        assert!(
+            rep.best_fit.is_finite() && rep.best_fit >= rep.seed_fit - 1e-9,
+            "repair's winner is a real, scored law ≥ the seed: {rep:?}"
+        );
+        let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, rep.best), 1460, 5);
+        assert_eq!(safety.violations, 0, "repair's winner stays safe one bound deeper: {:?}", safety.first_violation);
+    }
+
+    /// De-risk for CEGIS-with-repair (ignored — runs the full search twice): does *healing* unsafe
+    /// candidates instead of discarding them change what the search finds? Prints both winners' fitness +
+    /// held-out frontier and the filter/repair bookkeeping. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cegis_repair_vs_filter_derisk() {
+        let train = train_set();
+        let filt = evolve_control_law(&train, 24, 28, 7, 1460, 4, 0x00C0_FFEE_5717, false);
+        let rep = evolve_control_law(&train, 24, 28, 7, 1460, 4, 0x00C0_FFEE_5717, true);
+        eprintln!("FILTER : best_fit {:.4}  evaluated {}  rejected {}", filt.best_fit, filt.evaluated, filt.rejected);
+        eprintln!("REPAIR : best_fit {:.4}  evaluated {}  repaired {}", rep.best_fit, rep.evaluated, rep.repaired);
+        let test = heldout_set();
+        for (name, prog) in [("filter", filt.best), ("repair", rep.best)] {
+            set_program_override(Some(prog));
+            let (g, q) = synth_frontier_of(&test);
+            set_program_override(None);
+            let (di, dl, de) = crate::congestion::synth_describe(&prog);
+            eprintln!("  {name}: heldout goodput {g:.2}x | queue {q:.0} us", );
+            eprintln!("    inc={di}\n    md ={dl}\n    ecn={de}");
+        }
+    }
+
     /// The control-law search is a **pure function of its seed**: two runs with the same arguments return
     /// the identical genome and fitness, bit-for-bit. This is the determinism the de-risk's reproducibility
     /// rests on (it is what let the Windows-discovered `BAKED_SYNTH` reappear unchanged on the Linux VPS);
@@ -2565,8 +2722,8 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn synth_search_is_deterministic_in_its_seed() {
         let train = vec![TrainScenario { bn: cemark_bn(2_500_000, 2_000, 1_000), bytes: 256 * 1024, seed: 7 }];
-        let a = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717);
-        let b = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717);
+        let a = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717, false);
+        let b = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717, false);
         assert_eq!(a.best, b.best, "same seed must yield the identical genome");
         assert_eq!(a.best_fit.to_bits(), b.best_fit.to_bits(), "...and the identical fitness, bit-for-bit");
         assert_eq!(a.rejected, b.rejected, "...and the identical filter-rejection count");
@@ -2632,7 +2789,7 @@ mod tests {
     #[ignore]
     fn synth_control_law_derisk() {
         let train = train_set();
-        let r = evolve_control_law(&train, 24, 28, 7, 1460, 4, 0x00C0_FFEE_5717);
+        let r = evolve_control_law(&train, 24, 28, 7, 1460, 4, 0x00C0_FFEE_5717, false);
         let (inc, md, ecn) = crate::congestion::synth_describe(&r.best);
         eprintln!("SYNTHESISED control law  (train-fitness {:.3}, AIMD-seed {:.3})", r.best_fit, r.seed_fit);
         eprintln!("  evaluated {} candidates; bmc rejected {} as unsafe", r.evaluated, r.rejected);

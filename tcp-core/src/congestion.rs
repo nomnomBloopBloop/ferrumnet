@@ -1226,6 +1226,41 @@ impl ControlProgram {
             _ => &mut self.ecn,
         }
     }
+
+    /// The register the output instruction reads when it is an identity carry — the second-to-last
+    /// register, where a safety clamp projects the discovered output. (Output = the last register.)
+    const OUT_PREV: u8 = (SYNTH_REGS_IN + SYNTH_PROG_LEN - 2) as u8;
+
+    // ── CEGIS repair primitives ─────────────────────────────────────────────────────────────────────
+    //
+    // Each minimally projects ONE response back into the safety envelope in answer to a specific bmc
+    // counterexample, leaving the other two responses untouched. They are *sound* — the projected program
+    // provably satisfies the named clause — and structure-preserving where the grammar allows: the loss
+    // and increase repairs keep the discovered law and only clamp its output (so a program whose output
+    // already lies in the safe range is unchanged), by overwriting the output instruction with a clamp of
+    // the prior register. A clean `max(cut, 0)` for the ECN clause is not expressible without a zero
+    // constant in the signal vector, so there the projection restores the gentle DCTCP baseline `α/2`.
+
+    /// Clause 2 (a loss must not inflate `cwnd` past the pipe): cap the loss target at the FlightSize, by
+    /// making the output `min(prior, flight_seg)` — provably `≤ flight_seg`, so `cwnd ≤ flight` on loss.
+    pub(crate) fn repair_loss(mut self) -> ControlProgram {
+        self.md[SYNTH_PROG_LEN - 1] = Instr { op: SynthOp::Min, a: ControlProgram::OUT_PREV, b: R_FLIGHT };
+        self
+    }
+
+    /// Clause 4 (a clean ACK must not shrink `cwnd`): floor the per-RTT increase at half a segment, by
+    /// making the output `max(prior, ½)` — provably `> 0`, so the additive increase never shrinks `cwnd`.
+    pub(crate) fn repair_increase(mut self) -> ControlProgram {
+        self.inc[SYNTH_PROG_LEN - 1] = Instr { op: SynthOp::Max, a: ControlProgram::OUT_PREV, b: R_HALF };
+        self
+    }
+
+    /// Clause 3 (an ECN mark must not grow `cwnd`): restore the safe DCTCP baseline `cut = α/2` (a clean
+    /// non-negativity clamp is not expressible without a zero constant, so the baseline is the projection).
+    pub(crate) fn repair_ecn(mut self) -> ControlProgram {
+        self.ecn = ControlProgram::AIMD.ecn;
+        self
+    }
 }
 
 /// NaN → 0, ±inf → ±cap, otherwise clamp to ±cap. `is_nan` is a bit test (not a transcendental
