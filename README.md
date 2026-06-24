@@ -27,6 +27,13 @@ $ curl -v http://10.0.0.2:8080/
 
 ## Why it's interesting
 
+Because the core does **no I/O and reads no clock**, the same engine that serves `curl` over a real TUN also
+runs deterministically in-process — which turns a *real* TCP into something you can put a **verifier in the
+loop** with: fuzz it, prove it, evolve a controller against it, attack it, co-evolve a robust one, certify a
+worst-case bound, synthesise the control law modulo a safety proof, repair the unsafe ones, and defend it
+against a misbehaving peer — all zero-dependency, all CI-enforced, each claim scoped to exactly what's proven.
+(The methodology, in one place: `docs/DESIGN.md` §5.12.)
+
 - **Zero dependencies.** Only the Rust standard library. The TCP/IP logic (no `smoltcp`), the
   async runtime — executor, reactor, `Waker` plumbing (no `tokio`) — and even the syscall
   bindings (including a hand-rolled `io_uring`) are all hand-written. The protocol core is

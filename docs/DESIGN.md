@@ -892,6 +892,41 @@ receiver cannot forge for data it never received — characterised, not built (t
 continuum-lift obstruction). The byte bound and the per-RTT-ABC residual are the genuinely novel pieces here
 — byte counting itself predates this work; what is new is the **exhaustive proof of exactly what it bounds**.
 
+### 5.12 The methodology in one place — a *verifier in the loop* for a real TCP
+
+The single idea under §5.10–§5.11: **because the core does no I/O and reads no clock, the same engine that
+serves `curl` over a real TUN also runs deterministically in-process — so a *real* TCP becomes something you
+can put a verifier in the loop with.** One sans-IO engine, one deterministic sim, used nine ways on the same
+real congestion-control and protocol code, each piece zero-dependency and CI-enforced:
+
+- **Fuzz it** (M17) — a coverage-guided greybox fuzzer whose signal is read *off the wire*, no engine
+  instrumentation, finds behaviour a fixed grid never reaches.
+- **Prove it** (M15/M19) — a hand-rolled bounded model checker *exhausts* the SACK scoreboard, the option
+  walker, and the controller **safety envelope** over a complete small neighbourhood — a finite proof, not a
+  sample, with negative controls that keep it honest.
+- **Evolve it** (M15) — a from-scratch CEM trainer searches a controller genome and lands a better
+  latency-throughput frontier point than the hand-tuned controllers, zero ML deps.
+- **Attack it** (M20) — the sim is inverted into an *adversary* that hunts the capacity trace that maximally
+  hurts a controller, and finds a BBR-specific collapse, replayable bit-for-bit.
+- **Co-evolve it** (M21) — synthesis ↔ attack close into a CEGIS loop that hardens a controller against its
+  own worst case, the survivor separately model-checked safe.
+- **Certify it** (M22) — the adversary becomes a *prover*: exhaust a discretised trace envelope for a sound
+  bounded worst-case latency, with the continuum lift characterised as an honest open obstruction.
+- **Synthesise it** (M23) — GP discovers the control *law itself* (not its gains) with the safety checker as
+  a hard filter — "synthesis modulo verification"; the honest verdict is that it rediscovers DCTCP's `α/2`
+  and loses fine constants to the gene-tuner, a sharp characterised negative.
+- **Repair it** (M24) — the verifier stops being a gate and becomes a *repair operator*: its counterexample
+  heals an unsafe law instead of discarding it (sample efficiency at equal safety).
+- **Defend it** (M25) — the adversary moves from the network to the *protocol peer*: an exhaustive proof of
+  exactly what byte counting bounds against a misbehaving receiver, with the residuals characterised.
+
+The thread is **the verifier-in-the-loop discipline applied to a live network stack**: synthesise *and*
+prove, attack *and* certify, and — the house rule that makes the rest trustworthy — **claim exactly what is
+proven and characterise the rest** (every milestone above carries its honest negative: the BBR loss residual,
+the continuum obstruction, AIMD as a local optimum, repair's no-fitness-breakthrough, the per-RTT-ABC and
+receipt-nonce residuals). Each was specified by an adversarial design pass and re-checked by a multi-agent
+adversarial review of the finished diff before commit — which caught an over-claim *every single time*.
+
 ## 6. End-to-end data flow (one `curl` request)
 
 1. `curl` → kernel routes `10.0.0.2` to `tun0` → the IP datagram appears on our fd.
