@@ -395,7 +395,7 @@ impl Tcb {
     /// stays byte-identical.
     #[inline]
     fn ecn_enabled(&self) -> bool {
-        matches!(self.cc_kind, CcKind::Dctcp | CcKind::Learned | CcKind::Prague)
+        matches!(self.cc_kind, CcKind::Dctcp | CcKind::Learned | CcKind::Prague | CcKind::Synth)
     }
 
     // ── application interface ─────────────────────────────────────────────────────────────

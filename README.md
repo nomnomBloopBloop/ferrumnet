@@ -36,10 +36,10 @@ $ curl -v http://10.0.0.2:8080/
   received bytes and emits bytes to send, with time injected as a parameter. So the whole
   engine, *including the async runtime* (via an in-memory mock device), is deterministically
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
-  selective recovery, **six pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
-  **Prague** / an **evolved** one), and a **two-stack userspace loopback** (two instances connecting to
-  each other entirely in memory). **223 tests**, green on Rust 1.92 and the 1.75 MSRV; Miri-clean (no UB,
-  no leaks, no suppression).
+  selective recovery, **seven pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
+  **Prague** / an **evolved** one / a **GP-synthesised** one), and a **two-stack userspace loopback** (two
+  instances connecting to each other entirely in memory). **231 tests**, green on Rust 1.92 and the 1.75
+  MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
   reordering, bit-corruption — driven by an event scheduler over the injected clock. The same seed
@@ -85,6 +85,18 @@ $ curl -v http://10.0.0.2:8080/
   *and* the sampling adversary, exactly where a performance proof is needed. It is *bounded* over the
   periodic envelope (not the continuum); lifting it to a continuum guarantee — a monotonicity/Lipschitz
   argument — is the open ceiling. (`sim`)
+- **It synthesizes the control *law*, not just its gains — modulo a safety proof.** Every controller
+  above (even the evolved `Learned`) operates on a hand-written AIMD skeleton. `Synth` removes it: its
+  three responses (increase / loss / ECN) are each a tiny **program** — an SSA register machine over the
+  live signals (`cwnd`, `flight`, `acked`, `α`, RTT) — and a genetic search discovers the program. The
+  novelty is the filter: **every candidate is run through the bounded safety checker (`bmc`) before it is
+  ever scored, and one that can break the safety envelope is rejected outright** — "synthesis modulo
+  verification", so every survivor is machine-checked safe (unlike a learned/RL controller). The honest
+  de-risk verdict: the discovered law is verified-safe and beats *every hand-tuned* controller on the
+  held-out frontier, but **not** the gene-tuned `Learned` — and its ECN response **rediscovers DCTCP's
+  exact `α/2`**, evidence that `α/2` is a *verified local optimum*. The gap is a characterised
+  constant-resolution limit (the discrete grammar `{0.5, 1, 2}` cannot build `Learned`'s finer `≈ α·0.185`
+  gain), which precisely motivates a GP-structure + CEM-constant hybrid. (`sim` + `bmc`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -313,7 +325,7 @@ neither beats in-kernel loopback, which has neither a per-packet syscall nor a u
   │    runtime:  executor + reactor + Wakers  →  TcpListener / TcpStream / TcpConnector│
   │    Stack  →  TCB per connection (active + passive open)                            │
   │      wire (parse + RFC 1071 checksum) · seq (RFC 1982) · isn (RFC 6528)            │
-  │      rtt (RFC 6298) · congestion: Reno/CUBIC/BBR/DCTCP/Prague/Learned · sack+reasm │
+  │      rtt · congestion: Reno/CUBIC/BBR/DCTCP/Prague/Learned/Synth · sack+reasm      │
   │      timestamps (RFC 7323) · delayed ACKs (RFC 1122) · buffers · timers            │
   └────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -441,9 +453,9 @@ IP forwarding, so it is safe to run alongside other services.
 ## Roadmap
 
 The big milestones are done — active open, SACK loss recovery, MTU-adaptive MSS, window scaling,
-RFC 7323 timestamps, delayed ACKs, an io_uring backend, **five pluggable congestion controllers**
-(Reno/CUBIC/BBR/DCTCP plus an evolved one) measured head-to-head over the two-instance hardware bench,
-and a **coverage-guided fuzzer** over the deterministic sim. What's left:
+RFC 7323 timestamps, delayed ACKs, an io_uring backend, **seven pluggable congestion controllers**
+(Reno/CUBIC/BBR/DCTCP/Prague plus an evolved and a GP-synthesised one) measured head-to-head over the
+two-instance hardware bench, and a **coverage-guided fuzzer** over the deterministic sim. What's left:
 
 - **BBR under random loss — done, with a known residual.** BBRv2 `inflight_hi`/`inflight_lo` bounds
   + ACK-aggregation, plus an ACK-clocked go-back-N drain that un-sticks the post-RTO wedge, took BBR

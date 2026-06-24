@@ -1320,7 +1320,7 @@ pub fn fuzz_random_baseline(fuzz_seed: u64, iterations: u32) -> FuzzReport {
 // `cos`), and the one square root the covariance update needs is hand-rolled Newton — so the optimiser
 // is zero-dependency and free of transcendental intrinsics, exactly like the controllers it tunes.
 
-use crate::congestion::{set_learned_override, LearnedParams};
+use crate::congestion::{set_learned_override, set_program_override, ControlProgram, Instr, LearnedParams, SynthOp, Synth};
 
 const GENOME: usize = 5;
 
@@ -2242,6 +2242,165 @@ pub fn certify_worst(cc: CcKind, env: AdvEnv, bytes: usize, n_slices: usize, n_l
     PerfCertificate { bound_us, worst_trace, traces_checked: checked, n_slices, n_levels }
 }
 
+// ── verified GP synthesis of the control law (synthesis modulo verification) ───────────────────────
+//
+// Everything above tunes KNOWN structure. The CEM trainer (`evolve`) moves five gains of a hand-written
+// AIMD skeleton; co-evolution makes those gains robust; the adversary/certificate measure a *fixed*
+// controller. This last search changes the kind of thing being searched: the control **law** itself, as
+// a program. The genome is a `ControlProgram` — three tiny SSA register machines (increase / loss / ecn,
+// see `crate::congestion`) — and a genetic search (point mutation + sub-program crossover) explores the
+// space of laws. The novelty is the **filter**: before a candidate is ever scored on the network, it is
+// driven through the bounded safety checker (`crate::bmc::check_controller_safety`); a program that can
+// break the safety envelope on *any* event sequence in the bounded neighbourhood is rejected outright,
+// never scored. So the search is confined, by a machine-checked proof, to provably-safe laws — "synthesis
+// modulo verification". The fitness of a survivor is the same latency-throughput frontier the CEM trainer
+// optimises (`synth_frontier_fitness`), so a discovered law is directly comparable to the hand-tuned and
+// gene-tuned controllers on the held-out bottlenecks. The seed is `ControlProgram::AIMD` (≡ DCTCP), which
+// is safe and decent, so the search always has a feasible warm start and the central question is sharp:
+// does it *move away* from AIMD to a better safe law, or does it stay — "AIMD is a verified local optimum"?
+
+/// Fitness sentinel for a program the safety filter rejected: below any real frontier fitness (which is a
+/// goodput-minus-queue score in roughly `[-5, 1]`), so a rejected law can never be selected.
+const SYNTH_REJECT: f64 = -1.0e18;
+
+/// The latency-throughput fitness of a synthesised `prog` over `scenarios` — the same hinge fitness as
+/// [`frontier_fitness`] (reward goodput as a fraction of line rate, penalise only the standing queue
+/// beyond a 1 ms L4S budget, heavily penalise a non-completing transfer), but run through the [`Synth`]
+/// controller (installed via [`set_program_override`]) so it is directly comparable to the gene-tuned
+/// [`crate::congestion::Learned`] frontier. Higher is better.
+pub fn synth_frontier_fitness(prog: ControlProgram, scenarios: &[TrainScenario]) -> f64 {
+    set_program_override(Some(prog));
+    let mut total = 0.0;
+    for s in scenarios {
+        let r = run_bottleneck(s.seed, s.bn, s.bytes, CcKind::Synth);
+        let line = s.bn.rate_bytes_per_sec.max(1) as f64;
+        let goodput = r.throughput_bytes_per_sec() as f64 / line;
+        let q_ms = r.data_queue.mean_queue_us as f64 / 1_000.0;
+        let queue_excess = (q_ms - 1.0).max(0.0);
+        let complete = if r.completed { 0.0 } else { -5.0 };
+        total += goodput - 0.4 * queue_excess + complete;
+    }
+    set_program_override(None);
+    total / scenarios.len().max(1) as f64
+}
+
+/// One point mutation repeated `n` times: pick a sub-program, an instruction slot, and one field (op /
+/// operand a / operand b) and reroll it. A rerolled operand is drawn in the valid SSA range for its slot
+/// (`[0, REGS_IN + slot)`), so a mutation never creates a forward reference. Returns the mutated program.
+fn synth_mutate(rng: &mut Rng, mut prog: ControlProgram, n: usize) -> ControlProgram {
+    for _ in 0..n.max(1) {
+        let which = rng.below(ControlProgram::SUBS as u64) as usize;
+        let slot = rng.below(ControlProgram::PROG_LEN as u64) as usize;
+        let field = rng.below(3);
+        let max_operand = (ControlProgram::REGS_IN + slot) as u64; // valid earlier registers
+        let sub = prog.sub_mut(which);
+        let cur = sub[slot];
+        sub[slot] = match field {
+            0 => Instr::new(SynthOp::ALL[rng.below(SynthOp::ALL.len() as u64) as usize], cur.a, cur.b),
+            1 => Instr::new(cur.op, rng.below(max_operand) as u8, cur.b),
+            _ => Instr::new(cur.op, cur.a, rng.below(max_operand) as u8),
+        };
+    }
+    prog
+}
+
+/// Sub-program-level crossover: the child takes each of the three response laws (increase / loss / ecn)
+/// from one parent or the other, uniformly — so the search can recombine, e.g., one parent's loss
+/// response with another's ECN response.
+fn synth_crossover(rng: &mut Rng, a: ControlProgram, b: ControlProgram) -> ControlProgram {
+    let mut child = a;
+    for which in 0..ControlProgram::SUBS {
+        if rng.below(2) == 1 {
+            *child.sub_mut(which) = *b.sub(which);
+        }
+    }
+    child
+}
+
+/// What a control-law search found.
+#[derive(Clone, Copy, Debug)]
+pub struct SynthReport {
+    /// The best **safe** program found (its safety is re-confirmable with `check_controller_safety`).
+    pub best: ControlProgram,
+    /// Its frontier fitness (the same scale as [`synth_frontier_fitness`]).
+    pub best_fit: f64,
+    /// The fitness of the [`ControlProgram::AIMD`] seed on the same training set — the "did it beat the
+    /// hand-written law?" reference.
+    pub seed_fit: f64,
+    /// How many candidate programs the bmc safety filter rejected over the whole run (the filter's work).
+    pub rejected: u64,
+    /// How many distinct candidates were evaluated (mutated/crossed children, excluding carried elites).
+    pub evaluated: u64,
+}
+
+/// **Synthesise a congestion-control law** by genetic search under the bmc safety filter. Starting from
+/// the safe [`ControlProgram::AIMD`] seed, each generation keeps the top `elite` by fitness and breeds the
+/// rest by crossover + mutation; **every** candidate is first run through
+/// [`crate::bmc::check_controller_safety`] at depth `bmc_depth`, and one with any violation is rejected
+/// (fitness [`SYNTH_REJECT`]) before it is ever scored on the network — so the returned `best` is, by a
+/// bounded machine-checked proof, inside the safety envelope. Scoring is [`synth_frontier_fitness`] on
+/// `train`. Deterministic in `seed`. This is the heavy search; the fast machinery test uses a small budget.
+pub fn evolve_control_law(
+    train: &[TrainScenario],
+    generations: u32,
+    pop: usize,
+    elite: usize,
+    mss: u16,
+    bmc_depth: u32,
+    seed: u64,
+) -> SynthReport {
+    let mut rng = Rng::new(seed ^ 0x5717_C0DE_5717_C0DE);
+    let mut rejected = 0u64;
+    let mut evaluated = 0u64;
+    // The verified filter, then the network score — cheap rejects never pay for an expensive sim.
+    let eval = |prog: ControlProgram, rejected: &mut u64, evaluated: &mut u64| -> f64 {
+        *evaluated += 1;
+        let report = crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, bmc_depth);
+        if report.violations > 0 {
+            *rejected += 1;
+            return SYNTH_REJECT;
+        }
+        synth_frontier_fitness(prog, train)
+    };
+
+    let seed_fit = eval(ControlProgram::AIMD, &mut rejected, &mut evaluated);
+    let mut population: Vec<(ControlProgram, f64)> = vec![(ControlProgram::AIMD, seed_fit)];
+    while population.len() < pop.max(1) {
+        let muts = 1 + rng.below(3) as usize;
+        let child = synth_mutate(&mut rng, ControlProgram::AIMD, muts);
+        let fit = eval(child, &mut rejected, &mut evaluated);
+        population.push((child, fit));
+    }
+    let mut best = population[0];
+    for &cand in &population {
+        if cand.1 > best.1 {
+            best = cand;
+        }
+    }
+
+    let n_elite = elite.clamp(1, pop.max(1));
+    for _ in 0..generations {
+        population.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let elites: Vec<ControlProgram> = population[..n_elite.min(population.len())].iter().map(|&(p, _)| p).collect();
+        let mut next: Vec<(ControlProgram, f64)> = population[..n_elite.min(population.len())].to_vec();
+        while next.len() < pop.max(1) {
+            let pa = elites[rng.below(elites.len() as u64) as usize];
+            let pb = elites[rng.below(elites.len() as u64) as usize];
+            let crossed = synth_crossover(&mut rng, pa, pb);
+            let muts = 1 + rng.below(3) as usize;
+            let child = synth_mutate(&mut rng, crossed, muts);
+            let fit = eval(child, &mut rejected, &mut evaluated);
+            if fit > best.1 {
+                best = (child, fit);
+            }
+            next.push((child, fit));
+        }
+        population = next;
+    }
+
+    SynthReport { best: best.0, best_fit: best.1, seed_fit, rejected, evaluated }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2286,6 +2445,18 @@ mod tests {
             q += r.data_queue.mean_queue_us as f64;
         }
         set_learned_override(None);
+        (g / set.len() as f64, q / set.len() as f64)
+    }
+
+    /// The (goodput, mean-queue) frontier of a synthesised law over `set` — the caller installs the
+    /// program with [`set_program_override`] first (mirroring how `frontier_of` takes a `LearnedParams`).
+    fn synth_frontier_of(set: &[TrainScenario]) -> (f64, f64) {
+        let (mut g, mut q) = (0.0, 0.0);
+        for s in set {
+            let r = run_bottleneck(s.seed, s.bn, s.bytes, CcKind::Synth);
+            g += r.throughput_bytes_per_sec() as f64 / s.bn.rate_bytes_per_sec as f64;
+            q += r.data_queue.mean_queue_us as f64;
+        }
         (g / set.len() as f64, q / set.len() as f64)
     }
 
@@ -2348,6 +2519,112 @@ mod tests {
         assert!(best_fit > default_fit, "evolution must improve on the default: {best_fit:.3} vs {default_fit:.3}");
         // the returned genome is within the controller's valid envelope (sanitized).
         assert_eq!(best, best.sanitized(), "the best genome is sanitized");
+    }
+
+    /// **The GP-synthesis machinery, end to end (fast).** A short control-law search must: (1) actually
+    /// engage the verifier — a free GP over the program space proposes unsafe laws, so the bmc filter
+    /// rejects a positive number of them; (2) return a real, scored law (not a reject sentinel) that is
+    /// **no worse than the AIMD seed** — the elitist search never regresses below its warm start; and
+    /// (3) yield a winner that is *independently* re-certified safe at the deeper depth-4 bound. This is
+    /// the deterministic CI proof that "synthesis modulo verification" works; the full search that asks
+    /// whether it finds a *new* law lives in the ignored `synth_control_law_derisk`.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn synth_search_finds_a_safe_law_no_worse_than_aimd() {
+        let train = vec![
+            TrainScenario { bn: cemark_bn(2_500_000, 2_000, 1_000), bytes: 1024 * 1024, seed: 7 },
+            TrainScenario { bn: cemark_bn(1_800_000, 3_000, 1_200), bytes: 1024 * 1024, seed: 7 },
+        ];
+        let r = evolve_control_law(&train, 5, 8, 3, 1460, 4, 0x5A5A_1234);
+        assert!(r.rejected > 0, "the bmc filter rejected nothing — it is not engaged: {r:?}");
+        assert!(
+            r.best_fit.is_finite() && r.best_fit > SYNTH_REJECT / 2.0,
+            "best must be a real, scored law (not a reject sentinel): {r:?}"
+        );
+        assert!(r.best_fit >= r.seed_fit - 1e-9, "the search must never return worse than the seed: {r:?}");
+        let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, r.best), 1460, 4);
+        assert_eq!(
+            safety.violations, 0,
+            "the synthesised winner must be machine-checked safe: {:?}",
+            safety.first_violation
+        );
+    }
+
+    /// **The synthesised law, headline result (fast — uses the baked discovery, no search).** The law
+    /// the GP found under the bmc filter ([`ControlProgram::BAKED_SYNTH`]) is, on the **held-out**
+    /// bottlenecks: (1) machine-checked safe at depth 4; (2) a better latency-throughput frontier point
+    /// than every *hand-tuned* controller — materially more goodput than DCTCP at a still-sub-millisecond
+    /// queue, and a queue orders of magnitude below Reno/BBR; but (3) **not** better than the *gene-tuned*
+    /// `Learned` controller. That last inequality is the de-risk's honest verdict made machine-checked:
+    /// the discrete program grammar rediscovers DCTCP's `α/2` ECN response (a verified local optimum) and
+    /// cannot reach `Learned`'s finer `≈ α·0.185` gain — so program-GP wins on *structure* and *safety*
+    /// but loses to continuous gene-tuning on fine constants. Deterministic (a baked genome, fixed scenarios).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn synthesised_law_beats_hand_tuned_but_not_gene_tuned() {
+        use crate::congestion::ControlProgram;
+        let test = heldout_set();
+
+        // (1) verified safe — the synthesis guarantee, on the shipped depth-4 bound.
+        let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, ControlProgram::BAKED_SYNTH), 1460, 4);
+        assert_eq!(safety.violations, 0, "the synthesised law must be machine-checked safe: {:?}", safety.first_violation);
+
+        set_program_override(Some(ControlProgram::BAKED_SYNTH));
+        let (synth_g, synth_q) = synth_frontier_of(&test);
+        set_program_override(None);
+        let (dctcp_g, _) = frontier_of(CcKind::Dctcp, None, &test);
+        let (_, reno_q) = frontier_of(CcKind::Reno, None, &test);
+        let (learned_g, _) = frontier_of(CcKind::Learned, None, &test);
+
+        // (2) beats every hand-tuned controller: more goodput than DCTCP, a queue ≪ Reno's, sub-ms-class.
+        assert!(synth_g > dctcp_g * 1.05, "synth recovers throughput over hand-tuned DCTCP: {synth_g:.2}x vs {dctcp_g:.2}x");
+        assert!(synth_q < 2_000.0, "synth holds a low (sub-ms-class) queue: {synth_q:.0} us");
+        assert!(synth_q * 10.0 < reno_q, "synth ≪ Reno queue: {synth_q:.0} us vs {reno_q:.0} us");
+
+        // (3) but NOT the gene-tuned Learned — the honest, characterised constant-resolution gap.
+        assert!(
+            synth_g < learned_g,
+            "the discrete-grammar law does not beat the continuous gene-tuner (expected): synth {synth_g:.2}x vs learned {learned_g:.2}x"
+        );
+    }
+
+    /// **The de-risk (ignored — runs the full search over hundreds of sims).** Synthesise a control law
+    /// from scratch under the bmc filter, decompile it to readable expressions, re-certify it safe at
+    /// depth 4, and print its held-out frontier against every hand-tuned and gene-tuned controller. The
+    /// headline question this answers: does GP discover a stable *new* safe law that beats the others, or
+    /// rediscover AIMD (a sharp result either way)? Run with `cargo test -p tcp-core synth_control_law_derisk -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn synth_control_law_derisk() {
+        let train = train_set();
+        let r = evolve_control_law(&train, 24, 28, 7, 1460, 4, 0x00C0_FFEE_5717);
+        let (inc, md, ecn) = crate::congestion::synth_describe(&r.best);
+        eprintln!("SYNTHESISED control law  (train-fitness {:.3}, AIMD-seed {:.3})", r.best_fit, r.seed_fit);
+        eprintln!("  evaluated {} candidates; bmc rejected {} as unsafe", r.evaluated, r.rejected);
+        eprintln!("  increase: step (seg/RTT) = {inc}");
+        eprintln!("  loss:     cwnd (seg)     = {md}");
+        eprintln!("  ecn:      cut            = {ecn}");
+        eprintln!("  genome = {:?}", r.best);
+        let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, r.best), 1460, 4);
+        eprintln!("  bmc(depth 4): {} cases, {} violations", safety.cases, safety.violations);
+
+        let test = heldout_set();
+        set_program_override(Some(r.best));
+        let (sg, sq) = synth_frontier_of(&test);
+        set_program_override(None);
+        eprintln!("HELD-OUT frontier (unseen bottlenecks):");
+        eprintln!("  {:>14}: goodput {sg:.2}x line | mean queue {sq:.0} us", "synth");
+        for &(name, cc) in &[
+            ("reno", CcKind::Reno),
+            ("cubic", CcKind::Cubic),
+            ("bbr", CcKind::Bbr),
+            ("dctcp", CcKind::Dctcp),
+            ("prague", CcKind::Prague),
+            ("learned-baked", CcKind::Learned),
+        ] {
+            let (g, q) = frontier_of(cc, None, &test);
+            eprintln!("  {name:>14}: goodput {g:.2}x line | mean queue {q:.0} us");
+        }
     }
 
     /// Coverage-guided greybox fuzzing as a **correctness oracle**. Across a campaign of coverage-

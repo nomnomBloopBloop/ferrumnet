@@ -1038,6 +1038,495 @@ impl CongestionControl for Learned {
     }
 }
 
+// ── synthesised control law: a verified GP-searched register machine ───────────────────────────────
+//
+// Every controller above operates on KNOWN structure: Reno's `+1 MSS`, DCTCP's `α/2`; even [`Learned`]
+// is a five-gene tuning of a hand-written AIMD skeleton. [`Synth`] removes the skeleton. Its three
+// congestion responses — the congestion-avoidance increase, the loss multiplicative decrease, and the
+// ECN cut — are each a tiny **program** ([`ControlProgram`]) over the live signals, discovered by the
+// genetic search in [`crate::sim`] with the bounded safety checker ([`crate::bmc`]) as a HARD FILTER:
+// a program that breaks the safety envelope is rejected before it is ever scored ("synthesis modulo
+// verification"). So the *algorithm* is searched, not the gains — and unlike a learned/RL controller,
+// every survivor is machine-checked safe. The machine is a fixed-length SSA register file evaluated
+// with `+ − × ÷ min max` only (protected division, NaN/inf guarded), so it is deterministic,
+// zero-transcendental and Miri-clean, exactly like the controllers it generalises.
+//
+// CRUCIAL: the program output is wired in **unsanitised**. A pathological program genuinely *can*
+// shrink the window on a clean ACK, grow it on a mark, or inflate it past the pipe on loss. Only the
+// liveness floors every shipped controller already has are applied (one MSS on the window; the RFC 5681
+// `2·MSS` floor on the loss/ssthresh response); the gain-dependent safety clauses are left exposed, so
+// the bmc filter has real teeth (it must actually reject the unsafe majority for the guarantee to mean
+// anything). The floors are raises-only, so they never *mask* a violation — only the floor's own clause
+// (`cwnd ≥ MSS`, `ssthresh ≥ 2·MSS`) is made structural; inflation-on-loss, growth-on-mark and
+// shrink-on-ack stay checkable.
+
+/// Input registers of the control-law machine: the live signals plus three constants. Indices are
+/// referenced by name (below) when assembling the AIMD seed, and by [`synth_expr`] when decompiling.
+const SYNTH_REGS_IN: usize = 8;
+/// Instructions per sub-program (= computed registers appended after the inputs).
+const SYNTH_PROG_LEN: usize = 8;
+/// Magnitude cap applied to every register value (in *segment* units, far above any real window), so a
+/// downstream `u32` cast can never overflow or trap.
+const SYNTH_CAP: f64 = 1.0e9;
+/// Upper bound on a synthesised `cwnd` in bytes (≈ 1 GiB) — caps the `f64 → u32` conversion safely.
+const SYNTH_CWND_CAP: u32 = 1 << 30;
+
+// Named input-register indices the AIMD seed references (must match the order in [`Synth::signals`]).
+const R_FLIGHT: u8 = 1;
+const R_ALPHA: u8 = 3;
+const R_HALF: u8 = 5;
+const R_ONE: u8 = 6;
+
+/// One operation in the control-law register machine. Total over the reals — division is protected
+/// (`y == 0 → 0`) and the result is NaN/inf-guarded — so evaluation never traps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SynthOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+}
+
+impl SynthOp {
+    /// All six ops, so the genetic search can pick one by index.
+    pub(crate) const ALL: [SynthOp; 6] =
+        [SynthOp::Add, SynthOp::Sub, SynthOp::Mul, SynthOp::Div, SynthOp::Min, SynthOp::Max];
+}
+
+/// One SSA instruction `r[N + t] = op(r[a], r[b])`. `a`/`b` index any earlier register; the interpreter
+/// clamps a forward/out-of-range index to the last valid register, so *every* genome is well-defined —
+/// there is no parse or validation step and mutation can never produce an illegal program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Instr {
+    pub(crate) op: SynthOp,
+    pub(crate) a: u8,
+    pub(crate) b: u8,
+}
+
+impl Instr {
+    pub(crate) fn new(op: SynthOp, a: u8, b: u8) -> Self {
+        Instr { op, a, b }
+    }
+}
+
+/// A synthesised congestion-control **law**: three SSA sub-programs over the shared signal vector, one
+/// per response. The default ([`ControlProgram::AIMD`]) reproduces Reno's additive increase, Reno's
+/// loss decrease and DCTCP's ECN response exactly, so a [`Synth`] controller with no override installed
+/// is a faithful, deterministic re-expression of DCTCP; the genetic search departs from there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ControlProgram {
+    pub(crate) inc: [Instr; SYNTH_PROG_LEN],
+    pub(crate) md: [Instr; SYNTH_PROG_LEN],
+    pub(crate) ecn: [Instr; SYNTH_PROG_LEN],
+}
+
+/// Build a sub-program that computes `op(r[a], r[b])` in its first slot and carries the result through
+/// to the output register with identity `max(x, x)` steps — used to assemble the AIMD/DCTCP seed.
+const fn seed_prog(op: SynthOp, a: u8, b: u8) -> [Instr; SYNTH_PROG_LEN] {
+    let mut prog = [Instr { op: SynthOp::Max, a: 0, b: 0 }; SYNTH_PROG_LEN];
+    prog[0] = Instr { op, a, b };
+    let mut i = 1;
+    while i < SYNTH_PROG_LEN {
+        let prev = (SYNTH_REGS_IN + i - 1) as u8;
+        prog[i] = Instr { op: SynthOp::Max, a: prev, b: prev };
+        i += 1;
+    }
+    prog
+}
+
+impl ControlProgram {
+    /// The seed law: Reno additive increase (`+1 MSS / RTT`), Reno multiplicative decrease
+    /// (`cwnd ← ½ · FlightSize`), DCTCP ECN response (`cut = α/2`). A [`Synth`] running this *is* DCTCP
+    /// (up to one ULP of float rounding in the loss step), so it is both the search's safe warm start
+    /// and the "did it just rediscover the hand-written law?" reference point.
+    pub(crate) const AIMD: ControlProgram = ControlProgram {
+        inc: seed_prog(SynthOp::Max, R_ONE, R_ONE),    // = 1.0 segment / RTT
+        md: seed_prog(SynthOp::Mul, R_FLIGHT, R_HALF), // = 0.5 · flight_seg
+        ecn: seed_prog(SynthOp::Mul, R_ALPHA, R_HALF), // = 0.5 · α
+    };
+
+    /// The law the GP synthesis actually discovered (`evolve_control_law(&train_set(), 24, 28, 7, 1460,
+    /// 4, 0xC0FFEE_5717)` in `sim`, reproduced by the ignored `synth_control_law_derisk`). A **research
+    /// artifact, not the shipped default** — `CcKind::Synth` keeps the safe AIMD/DCTCP law (above),
+    /// because this one's loss response is degenerate (see below) and would tank throughput on a plain
+    /// lossy path. Stripped of its introns (the redundant `max(x, x)` carries the genetic search leaves
+    /// behind), the three responses are:
+    ///
+    /// - **increase**: `step = max(0.5, α, acked_seg)` segments/RTT — a genuinely *new structure* the
+    ///   fixed AIMD/Learned skeleton cannot express: a signal-dependent increase, not a constant.
+    /// - **loss**: `cwnd ← 1 segment` (→ the `2·MSS` floor) — degenerate, because on the ECN-marking
+    ///   training bottlenecks the drop-based loss path almost never fires, so the search left it at the
+    ///   floor. (This is why it is not shipped.)
+    /// - **ecn**: `cut = α / 2` — DCTCP's response, **rediscovered exactly**. Free to pick *any* program,
+    ///   the search came back to `α/2`: evidence that DCTCP's ECN law is a **verified local optimum** of
+    ///   the control-law space (the sharp negative). It does *not* reach `Learned`'s gentler `≈ α·0.185`
+    ///   — a constant the discrete grammar `{0.5, 1, 2}` cannot build — which is exactly why this law
+    ///   beats every *hand-tuned* controller on the held-out frontier but loses to the *gene-tuned*
+    ///   one. The characterised gap motivates a GP-structure + CEM-constant hybrid.
+    ///
+    /// `#[cfg(test)]` because it is a research artifact, exercised only by the safety / frontier tests
+    /// and the de-risk — the shipped `CcKind::Synth` deliberately runs the safe AIMD default, not this.
+    #[cfg(test)]
+    pub(crate) const BAKED_SYNTH: ControlProgram = ControlProgram {
+        inc: [
+            Instr { op: SynthOp::Max, a: 6, b: 6 },
+            Instr { op: SynthOp::Max, a: 3, b: 5 },
+            Instr { op: SynthOp::Max, a: 9, b: 9 },
+            Instr { op: SynthOp::Max, a: 10, b: 10 },
+            Instr { op: SynthOp::Max, a: 11, b: 2 },
+            Instr { op: SynthOp::Max, a: 12, b: 12 },
+            Instr { op: SynthOp::Max, a: 13, b: 13 },
+            Instr { op: SynthOp::Max, a: 14, b: 14 },
+        ],
+        md: [
+            Instr { op: SynthOp::Mul, a: 1, b: 5 },
+            Instr { op: SynthOp::Max, a: 5, b: 8 },
+            Instr { op: SynthOp::Div, a: 9, b: 9 },
+            Instr { op: SynthOp::Max, a: 10, b: 10 },
+            Instr { op: SynthOp::Max, a: 11, b: 11 },
+            Instr { op: SynthOp::Max, a: 12, b: 11 },
+            Instr { op: SynthOp::Div, a: 13, b: 13 },
+            Instr { op: SynthOp::Max, a: 14, b: 14 },
+        ],
+        ecn: [
+            Instr { op: SynthOp::Mul, a: 3, b: 5 },
+            Instr { op: SynthOp::Max, a: 8, b: 8 },
+            Instr { op: SynthOp::Max, a: 9, b: 9 },
+            Instr { op: SynthOp::Max, a: 10, b: 10 },
+            Instr { op: SynthOp::Max, a: 11, b: 11 },
+            Instr { op: SynthOp::Max, a: 12, b: 12 },
+            Instr { op: SynthOp::Max, a: 13, b: 13 },
+            Instr { op: SynthOp::Max, a: 14, b: 14 },
+        ],
+    };
+
+    /// Number of sub-programs and instructions each, so the genetic search can size its mutations
+    /// without importing the machine's private constants.
+    pub(crate) const SUBS: usize = 3;
+    pub(crate) const PROG_LEN: usize = SYNTH_PROG_LEN;
+    pub(crate) const REGS_IN: usize = SYNTH_REGS_IN;
+
+    /// Immutable / mutable access to the `which`-th sub-program (0 = increase, 1 = loss, 2 = ecn) for
+    /// the genetic search's crossover and mutation.
+    pub(crate) fn sub(&self, which: usize) -> &[Instr; SYNTH_PROG_LEN] {
+        match which {
+            0 => &self.inc,
+            1 => &self.md,
+            _ => &self.ecn,
+        }
+    }
+    pub(crate) fn sub_mut(&mut self, which: usize) -> &mut [Instr; SYNTH_PROG_LEN] {
+        match which {
+            0 => &mut self.inc,
+            1 => &mut self.md,
+            _ => &mut self.ecn,
+        }
+    }
+}
+
+/// NaN → 0, ±inf → ±cap, otherwise clamp to ±cap. `is_nan` is a bit test (not a transcendental
+/// intrinsic), so this stays deterministic with no cross-platform drift.
+#[inline]
+fn synth_guard(v: f64) -> f64 {
+    if v.is_nan() {
+        0.0
+    } else {
+        clamp_f64(v, -SYNTH_CAP, SYNTH_CAP)
+    }
+}
+
+/// Evaluate one SSA sub-program over the input vector, returning the last register (the output). Each
+/// instruction reads two earlier registers (operands clamped into range, so the program is always
+/// well-defined), applies its op with protected division, and stores a guarded result.
+fn synth_eval(prog: &[Instr; SYNTH_PROG_LEN], inputs: &[f64; SYNTH_REGS_IN]) -> f64 {
+    let mut reg = [0.0_f64; SYNTH_REGS_IN + SYNTH_PROG_LEN];
+    reg[..SYNTH_REGS_IN].copy_from_slice(inputs);
+    for (t, ins) in prog.iter().enumerate() {
+        let n = SYNTH_REGS_IN + t;
+        let a = reg[(ins.a as usize).min(n - 1)];
+        let b = reg[(ins.b as usize).min(n - 1)];
+        let v = match ins.op {
+            SynthOp::Add => a + b,
+            SynthOp::Sub => a - b,
+            SynthOp::Mul => a * b,
+            SynthOp::Div => {
+                if b == 0.0 {
+                    0.0 // protected division
+                } else {
+                    a / b
+                }
+            }
+            SynthOp::Min => {
+                if a < b {
+                    a
+                } else {
+                    b
+                }
+            }
+            SynthOp::Max => {
+                if a > b {
+                    a
+                } else {
+                    b
+                }
+            }
+        };
+        reg[n] = synth_guard(v);
+    }
+    reg[SYNTH_REGS_IN + SYNTH_PROG_LEN - 1]
+}
+
+/// Convert a synthesised window (bytes, as an `f64`) to a `u32`, applying only the liveness `floor`
+/// (one MSS for the increase / ECN responses, `2·MSS` for the loss response — the floors every shipped
+/// controller already uses) and the overflow cap. It deliberately does **not** clamp the gain-dependent
+/// safety properties, so an unsafe synthesised law stays visible to the bmc. A floor is a raise-only
+/// operation, so it can never hide a violation — only its own clause becomes structural.
+#[inline]
+fn synth_to_cwnd(v: f64, floor: u32) -> u32 {
+    if v < floor as f64 {
+        floor
+    } else if v > SYNTH_CWND_CAP as f64 {
+        SYNTH_CWND_CAP
+    } else {
+        v as u32
+    }
+}
+
+/// Decompile each sub-program's output register to an infix expression over the named signals — purely
+/// for the synthesis de-risk readout, so a discovered law can be eyeballed (AIMD, or genuinely new?).
+/// Returns `(increase, loss, ecn)`. `#[cfg(test)]`: a readout helper, not part of the shipped controller.
+#[cfg(test)]
+pub(crate) fn synth_describe(prog: &ControlProgram) -> (String, String, String) {
+    let out = SYNTH_REGS_IN + SYNTH_PROG_LEN - 1;
+    (synth_expr(&prog.inc, out), synth_expr(&prog.md, out), synth_expr(&prog.ecn, out))
+}
+
+#[cfg(test)]
+fn synth_expr(prog: &[Instr; SYNTH_PROG_LEN], reg: usize) -> String {
+    const NAMES: [&str; SYNTH_REGS_IN] = ["cwnd", "flight", "acked", "alpha", "srtt", "0.5", "1", "2"];
+    if reg < SYNTH_REGS_IN {
+        return NAMES[reg].to_string();
+    }
+    let ins = prog[reg - SYNTH_REGS_IN];
+    let amax = reg - 1; // operands clamp to < reg, matching synth_eval — and strictly decreasing, so this terminates
+    let a = synth_expr(prog, (ins.a as usize).min(amax));
+    let b = synth_expr(prog, (ins.b as usize).min(amax));
+    match ins.op {
+        SynthOp::Add => format!("({a} + {b})"),
+        SynthOp::Sub => format!("({a} - {b})"),
+        SynthOp::Mul => format!("({a} * {b})"),
+        SynthOp::Div => format!("({a} / {b})"),
+        SynthOp::Min => format!("min({a}, {b})"),
+        SynthOp::Max => format!("max({a}, {b})"),
+    }
+}
+
+thread_local! {
+    /// Training-time injection of a candidate [`ControlProgram`] for subsequently-built [`Synth`]
+    /// controllers — the genetic search in [`crate::sim`] installs a candidate here before scoring it
+    /// through the real bottleneck sim, exactly as the CEM trainer does with [`set_learned_override`].
+    /// Single-threaded sim ⇒ deterministic; std-only ⇒ zero-dependency. The shipped `CcKind::Synth`
+    /// (override `None`) resolves to [`ControlProgram::AIMD`].
+    static SYNTH_OVERRIDE: std::cell::Cell<Option<ControlProgram>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install a candidate program for subsequently-constructed [`Synth`] controllers (training only).
+pub(crate) fn set_program_override(prog: Option<ControlProgram>) {
+    SYNTH_OVERRIDE.with(|c| c.set(prog));
+}
+
+/// The program a new [`Synth`] uses right now: the installed override, else [`ControlProgram::AIMD`].
+fn current_program() -> ControlProgram {
+    SYNTH_OVERRIDE.with(|c| c.get()).unwrap_or(ControlProgram::AIMD)
+}
+
+/// A congestion controller whose three responses are a synthesised [`ControlProgram`] rather than
+/// hand-written code — the unit the genetic search in [`crate::sim`] evolves under the bmc safety
+/// filter. With no override installed it runs [`ControlProgram::AIMD`] (≡ DCTCP); the search installs a
+/// candidate via [`set_program_override`]. Slow start is fixed-safe; only the three congestion responses
+/// are program-driven, and they are wired **unsanitised** (see the module note) so the safety checker can
+/// reject an unsafe law. Everything is `+ − × ÷`/comparisons, so it stays deterministic and Miri-clean.
+#[derive(Clone)]
+pub struct Synth {
+    cwnd: u32,
+    ssthresh: u32,
+    mss: u32,
+    ca_acc: u32,
+    dup_acks: u8,
+    prog: ControlProgram,
+    // ECN round accounting (as in `Dctcp`).
+    alpha: f64,
+    acked_in_window: u32,
+    marked_in_window: u32,
+    window_bytes: u32,
+    // RTT signals: the latest smoothed RTT and the running minimum, so the law can read the inflation
+    // ratio `srtt / rtt_min` (a delay signal that needs no extra plumbing — the TCB already feeds RTT).
+    srtt_us: u32,
+    rtt_min_us: u32,
+}
+
+impl Synth {
+    pub fn new(mss: u16) -> Self {
+        Synth::with_program(mss, current_program())
+    }
+
+    /// Build a `Synth` running `prog` verbatim — no sanitisation, which is exactly what lets the bmc
+    /// drive a deliberately-unsafe law and prove the synthesis filter has teeth.
+    pub(crate) fn with_program(mss: u16, prog: ControlProgram) -> Self {
+        let mss = mss as u32;
+        Synth {
+            cwnd: initial_window(mss),
+            ssthresh: u32::MAX, // slow start until the first loss (identical to Reno/DCTCP)
+            mss,
+            ca_acc: 0,
+            dup_acks: 0,
+            prog,
+            alpha: 1.0,
+            acked_in_window: 0,
+            marked_in_window: 0,
+            window_bytes: initial_window(mss),
+            srtt_us: 0,
+            rtt_min_us: 0,
+        }
+    }
+
+    #[inline]
+    fn in_slow_start(&self) -> bool {
+        self.cwnd < self.ssthresh
+    }
+
+    /// The live signal vector the program reads: window / flight / acked in **segments** (so magnitudes
+    /// are O(1–1000) and the ops compose meaningfully across signals), the smoothed ECN fraction `α`,
+    /// the RTT inflation ratio `srtt / rtt_min` (≥ 1; 1 before the first sample), and the constants ½,
+    /// 1, 2 (so the machine can build halving, identity and doubling).
+    fn signals(&self, flight: u32, acked: u32) -> [f64; SYNTH_REGS_IN] {
+        let mss = self.mss.max(1) as f64;
+        let srtt_ratio = if self.rtt_min_us > 0 && self.srtt_us > 0 {
+            self.srtt_us as f64 / self.rtt_min_us as f64
+        } else {
+            1.0
+        };
+        [
+            self.cwnd as f64 / mss, // r0 cwnd_seg
+            flight as f64 / mss,    // r1 flight_seg
+            acked as f64 / mss,     // r2 acked_seg
+            self.alpha,             // r3 α
+            srtt_ratio,             // r4 srtt / rtt_min
+            0.5,                    // r5
+            1.0,                    // r6
+            2.0,                    // r7
+        ]
+    }
+
+    /// The synthesised loss response: `cwnd ← md(signals)` segments, floored at `2·MSS` (the RFC 5681
+    /// loss floor every controller shares). UNSANITISED above the floor, so a law that returns more than
+    /// the FlightSize inflates the window past the pipe and the bmc flags it.
+    #[inline]
+    fn loss_target(&self, flight_size: u32) -> u32 {
+        let target_seg = synth_eval(&self.prog.md, &self.signals(flight_size, 0));
+        synth_to_cwnd(target_seg * self.mss as f64, 2 * self.mss)
+    }
+}
+
+impl CongestionControl for Synth {
+    #[inline]
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+
+    #[inline]
+    fn ssthresh(&self) -> u32 {
+        self.ssthresh
+    }
+
+    fn on_ack(&mut self, _now: Instant, acked: u32) {
+        self.dup_acks = 0;
+        if acked == 0 {
+            return;
+        }
+        if self.in_slow_start() {
+            // Slow start is fixed-safe (not synthesised): +1 MSS per ACK, like every controller.
+            self.cwnd = self.cwnd.saturating_add(acked.min(self.mss));
+        } else {
+            self.ca_acc = self.ca_acc.saturating_add(acked);
+            // Synthesised additive increase: step (segments / RTT) = inc(signals), in bytes per
+            // cwnd-worth of acked data. Unsanitised — a negative step shrinks cwnd on a clean ACK, which
+            // the bmc's clean-ACK clause catches. The `2·MSS`-floored loop (cwnd ≥ MSS) always advances
+            // ca_acc, so it terminates even for a zero/negative step.
+            let step = synth_eval(&self.prog.inc, &self.signals(self.cwnd, acked)) * self.mss as f64;
+            while self.ca_acc >= self.cwnd {
+                self.ca_acc -= self.cwnd;
+                self.cwnd = synth_to_cwnd(self.cwnd as f64 + step, self.mss);
+            }
+        }
+    }
+
+    fn on_dup_ack(&mut self, _now: Instant, flight_size: u32) -> bool {
+        self.dup_acks = self.dup_acks.saturating_add(1);
+        if self.dup_acks == 3 {
+            self.ssthresh = self.loss_target(flight_size);
+            self.cwnd = self.ssthresh;
+            self.ca_acc = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn enter_recovery(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = self.loss_target(flight_size);
+        self.cwnd = self.ssthresh;
+        self.ca_acc = 0;
+        self.dup_acks = 0;
+    }
+
+    fn on_rto(&mut self, _now: Instant, flight_size: u32) {
+        self.ssthresh = self.loss_target(flight_size);
+        self.cwnd = self.mss; // collapse to one segment (fixed-safe, like every controller)
+        self.ca_acc = 0;
+    }
+
+    fn set_mss(&mut self, mss: u16) {
+        self.mss = mss as u32;
+        self.cwnd = self.cwnd.max(self.mss);
+        self.ca_acc = 0;
+    }
+
+    fn on_ecn(&mut self, _now: Instant, acked: u32, marked: u32) {
+        if acked == 0 {
+            return;
+        }
+        self.acked_in_window = self.acked_in_window.saturating_add(acked);
+        self.marked_in_window = self.marked_in_window.saturating_add(marked.min(acked));
+        if self.acked_in_window < self.window_bytes {
+            return;
+        }
+        let fraction = self.marked_in_window as f64 / self.acked_in_window as f64;
+        self.alpha = (1.0 - DCTCP_G) * self.alpha + DCTCP_G * fraction;
+        let cwnd_before = self.cwnd;
+        if self.marked_in_window > 0 {
+            // Synthesised ECN response: cut fraction = ecn(signals); cwnd ← cwnd · (1 − cut). Unsanitised
+            // — a negative cut would *grow* cwnd on a mark, which the bmc's ECN-monotonicity clause flags.
+            let cut = synth_eval(&self.prog.ecn, &self.signals(self.cwnd, 0));
+            self.cwnd = synth_to_cwnd(self.cwnd as f64 * (1.0 - cut), self.mss);
+            self.ssthresh = self.cwnd;
+            self.ca_acc = 0;
+        }
+        self.acked_in_window = 0;
+        self.marked_in_window = 0;
+        self.window_bytes = cwnd_before.max(self.mss);
+    }
+
+    fn on_rtt_sample(&mut self, srtt_us: u32) {
+        self.srtt_us = srtt_us;
+        if srtt_us > 0 {
+            self.rtt_min_us = if self.rtt_min_us == 0 { srtt_us } else { self.rtt_min_us.min(srtt_us) };
+        }
+    }
+}
+
 /// Which controller a connection runs. The TCB defaults to [`CcKind::Reno`]; a backend can select
 /// another (e.g. from `FERRUM_CC`) before connections form. Drives [`Cc::new`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1052,6 +1541,9 @@ pub enum CcKind {
     Learned,
     /// TCP Prague — the L4S scalable, RTT-independent controller; see [`Prague`].
     Prague,
+    /// A controller whose control *law* (not just its gains) is a synthesised [`ControlProgram`]
+    /// discovered by GP under the bmc safety filter; see [`Synth`].
+    Synth,
 }
 
 /// The congestion controller the TCB holds. An **enum, not `Box<dyn CongestionControl>`**: dispatch
@@ -1072,6 +1564,7 @@ pub enum Cc {
     Dctcp(Dctcp),
     Learned(Learned),
     Prague(Prague),
+    Synth(Synth),
 }
 
 impl Cc {
@@ -1084,6 +1577,7 @@ impl Cc {
             CcKind::Dctcp => Cc::Dctcp(Dctcp::new(mss)),
             CcKind::Learned => Cc::Learned(Learned::new(mss)),
             CcKind::Prague => Cc::Prague(Prague::new(mss)),
+            CcKind::Synth => Cc::Synth(Synth::new(mss)),
         }
     }
 
@@ -1108,6 +1602,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.cwnd(),
             Cc::Learned(c) => c.cwnd(),
             Cc::Prague(c) => c.cwnd(),
+            Cc::Synth(c) => c.cwnd(),
         }
     }
 
@@ -1120,6 +1615,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.ssthresh(),
             Cc::Learned(c) => c.ssthresh(),
             Cc::Prague(c) => c.ssthresh(),
+            Cc::Synth(c) => c.ssthresh(),
         }
     }
 
@@ -1131,6 +1627,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.on_ack(now, acked),
             Cc::Learned(c) => c.on_ack(now, acked),
             Cc::Prague(c) => c.on_ack(now, acked),
+            Cc::Synth(c) => c.on_ack(now, acked),
         }
     }
 
@@ -1142,6 +1639,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.on_dup_ack(now, flight_size),
             Cc::Learned(c) => c.on_dup_ack(now, flight_size),
             Cc::Prague(c) => c.on_dup_ack(now, flight_size),
+            Cc::Synth(c) => c.on_dup_ack(now, flight_size),
         }
     }
 
@@ -1153,6 +1651,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.enter_recovery(now, flight_size),
             Cc::Learned(c) => c.enter_recovery(now, flight_size),
             Cc::Prague(c) => c.enter_recovery(now, flight_size),
+            Cc::Synth(c) => c.enter_recovery(now, flight_size),
         }
     }
 
@@ -1164,6 +1663,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.on_rto(now, flight_size),
             Cc::Learned(c) => c.on_rto(now, flight_size),
             Cc::Prague(c) => c.on_rto(now, flight_size),
+            Cc::Synth(c) => c.on_rto(now, flight_size),
         }
     }
 
@@ -1175,6 +1675,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.set_mss(mss),
             Cc::Learned(c) => c.set_mss(mss),
             Cc::Prague(c) => c.set_mss(mss),
+            Cc::Synth(c) => c.set_mss(mss),
         }
     }
 
@@ -1186,6 +1687,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.pacing_rate(),
             Cc::Learned(c) => c.pacing_rate(),
             Cc::Prague(c) => c.pacing_rate(),
+            Cc::Synth(c) => c.pacing_rate(),
         }
     }
 
@@ -1197,6 +1699,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Learned(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
             Cc::Prague(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
+            Cc::Synth(c) => c.on_transmit(now, seq_end, bytes, inflight, app_limited),
         }
     }
 
@@ -1208,6 +1711,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Learned(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
             Cc::Prague(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
+            Cc::Synth(c) => c.on_ack_sample(now, snd_una, inflight, acked, pipe, in_recovery),
         }
     }
 
@@ -1219,6 +1723,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.on_ecn(now, acked, marked),
             Cc::Learned(c) => c.on_ecn(now, acked, marked),
             Cc::Prague(c) => c.on_ecn(now, acked, marked),
+            Cc::Synth(c) => c.on_ecn(now, acked, marked),
         }
     }
 
@@ -1230,6 +1735,7 @@ impl CongestionControl for Cc {
             Cc::Dctcp(c) => c.on_rtt_sample(srtt_us),
             Cc::Learned(c) => c.on_rtt_sample(srtt_us),
             Cc::Prague(c) => c.on_rtt_sample(srtt_us),
+            Cc::Synth(c) => c.on_rtt_sample(srtt_us),
         }
     }
 }
@@ -1759,5 +2265,122 @@ mod tests {
         if let Cc::Prague(p) = &cc {
             assert_eq!(p.ai_step(), 2920, "2·mss at twice the reference RTT");
         }
+    }
+
+    // ── synthesised control-law machine ────────────────────────────────────────────────────────────
+
+    /// The SSA interpreter computes a hand-built program exactly, including protected division and the
+    /// shared-register SSA discipline (a later instruction reading an earlier computed register).
+    #[test]
+    fn synth_interpreter_evaluates_a_hand_built_program() {
+        // inputs: r0..r7 = [cwnd, flight, acked, alpha, srtt, 0.5, 1, 2]
+        let inputs = [10.0, 8.0, 2.0, 0.25, 1.5, 0.5, 1.0, 2.0];
+        // A program: r8 = r0 + r1 (=18); r9 = r8 * r5 (=9); then carry r9 to the output (r15).
+        let mut prog = [Instr { op: SynthOp::Max, a: 0, b: 0 }; SYNTH_PROG_LEN];
+        prog[0] = Instr { op: SynthOp::Add, a: 0, b: 1 }; // r8 = 18
+        prog[1] = Instr { op: SynthOp::Mul, a: 8, b: 5 }; // r9 = 18 * 0.5 = 9
+        for (i, slot) in prog.iter_mut().enumerate().skip(2) {
+            let prev = (SYNTH_REGS_IN + i - 1) as u8;
+            *slot = Instr { op: SynthOp::Max, a: prev, b: prev }; // identity carry
+        }
+        assert_eq!(synth_eval(&prog, &inputs), 9.0);
+
+        // Protected division: r8 = r0 / (r5 - r5) = 10 / 0 -> 0 (not inf/NaN).
+        let mut dz = [Instr { op: SynthOp::Max, a: 0, b: 0 }; SYNTH_PROG_LEN];
+        dz[0] = Instr { op: SynthOp::Sub, a: 5, b: 5 }; // r8 = 0
+        dz[1] = Instr { op: SynthOp::Div, a: 0, b: 8 }; // r9 = 10 / 0 -> protected 0
+        for (i, slot) in dz.iter_mut().enumerate().skip(2) {
+            let prev = (SYNTH_REGS_IN + i - 1) as u8;
+            *slot = Instr { op: SynthOp::Max, a: prev, b: prev };
+        }
+        assert_eq!(synth_eval(&dz, &inputs), 0.0);
+
+        // An out-of-range / forward operand index is clamped to the last valid register, so it never
+        // reads uninitialised state — the program stays total.
+        let oob = [Instr { op: SynthOp::Add, a: 200, b: 0 }; SYNTH_PROG_LEN];
+        assert!(synth_eval(&oob, &inputs).is_finite());
+    }
+
+    /// The NaN/inf guard keeps every register finite and bounded — so a downstream `u32` cast is always
+    /// safe — without using any transcendental intrinsic.
+    #[test]
+    fn synth_guard_bounds_every_register() {
+        assert_eq!(synth_guard(0.0 / 1.0), 0.0);
+        assert_eq!(synth_guard(f64::INFINITY), SYNTH_CAP);
+        assert_eq!(synth_guard(f64::NEG_INFINITY), -SYNTH_CAP);
+        assert_eq!(synth_guard(f64::NAN), 0.0); // v != v branch
+        assert_eq!(synth_guard(1e30), SYNTH_CAP);
+        assert_eq!(synth_guard(42.0), 42.0);
+    }
+
+    /// The AIMD seed program (`ControlProgram::AIMD`) reproduces DCTCP **exactly** — driven through an
+    /// identical event sequence with FlightSizes that are whole multiples of the MSS (so the loss step's
+    /// segment normalisation round-trips with no rounding), `Synth` and `Dctcp` track the same cwnd and
+    /// ssthresh at every step. So the synthesised default is a faithful re-expression of the hand-written
+    /// controller, and the GP's warm start is genuinely DCTCP — the reference for "did it find something
+    /// new?".
+    #[test]
+    fn synth_aimd_program_reproduces_dctcp() {
+        let mss = 1000u16;
+        let mut s = Synth::with_program(mss, ControlProgram::AIMD);
+        let mut d = Dctcp::new(mss);
+        let w = 10 * mss as u32;
+        // A mix of clean ACKs, ECN-marked rounds, and the three loss signals — flights are k·MSS.
+        let acks = [w, mss as u32, w, w];
+        let marks = [(w, 0u32), (w, mss as u32), (w, w)];
+        let flights = [2 * mss as u32, 10 * mss as u32, 40 * mss as u32];
+        for round in 0..6 {
+            for &a in &acks {
+                s.on_ack(NOW, a);
+                d.on_ack(NOW, a);
+                assert_eq!(s.cwnd(), d.cwnd(), "ack cwnd diverged at round {round}");
+            }
+            for &(a, m) in &marks {
+                s.on_ecn(NOW, a, m);
+                d.on_ecn(NOW, a, m);
+                assert_eq!(s.cwnd(), d.cwnd(), "ecn cwnd diverged at round {round}");
+                assert_eq!(s.ssthresh(), d.ssthresh(), "ecn ssthresh diverged at round {round}");
+            }
+            let f = flights[round % flights.len()];
+            // A clean third dup-ACK loss, then an RTO, exercising both loss paths.
+            let _ = s.on_dup_ack(NOW, f);
+            let _ = s.on_dup_ack(NOW, f);
+            let st = s.on_dup_ack(NOW, f);
+            let dt = d.on_dup_ack(NOW, f) || d.on_dup_ack(NOW, f) || d.on_dup_ack(NOW, f);
+            assert_eq!(st, dt);
+            assert_eq!(s.cwnd(), d.cwnd(), "loss cwnd diverged at round {round}");
+            assert_eq!(s.ssthresh(), d.ssthresh(), "loss ssthresh diverged at round {round}");
+            s.on_rto(NOW, f);
+            d.on_rto(NOW, f);
+            assert_eq!(s.cwnd(), d.cwnd(), "rto cwnd diverged at round {round}");
+            assert_eq!(s.ssthresh(), d.ssthresh(), "rto ssthresh diverged at round {round}");
+        }
+    }
+
+    #[test]
+    fn cc_enum_dispatches_to_synth() {
+        let mut cc = Cc::new(CcKind::Synth, 1460);
+        assert!(matches!(cc, Cc::Synth(_)));
+        assert_eq!(cc.cwnd(), initial_window(1460));
+        cc.on_ack(NOW, 1460);
+        assert!(cc.cwnd() > initial_window(1460), "slow start grows through the enum");
+    }
+
+    /// The synthesised law's ECN sub-program (`BAKED_SYNTH.ecn`) **rediscovered DCTCP's exact `α/2`
+    /// response**: free to pick any program over the signals, the GP returned `0.5 · α` for every `α`.
+    /// This is the de-risk's sharp negative made machine-checkable — DCTCP's ECN law is a verified local
+    /// optimum of the program space; the search did not find a different ECN response.
+    #[test]
+    fn synth_baked_ecn_response_rediscovered_dctcp() {
+        for &alpha in &[0.0, 0.1, 0.3, 0.5, 0.9, 1.0] {
+            // signals = [cwnd_seg, flight_seg, acked_seg, α, srtt_ratio, 0.5, 1, 2]
+            let inputs = [12.0, 12.0, 0.0, alpha, 1.0, 0.5, 1.0, 2.0];
+            let cut = synth_eval(&ControlProgram::BAKED_SYNTH.ecn, &inputs);
+            assert!((cut - alpha * 0.5).abs() < 1e-12, "ecn cut at α={alpha} is {cut}, not α/2");
+        }
+        // The increase, by contrast, is genuinely new structure — max(0.5, α, acked_seg), not a constant.
+        let inputs = [12.0, 12.0, 3.0, 0.2, 1.0, 0.5, 1.0, 2.0]; // acked_seg = 3
+        let step = synth_eval(&ControlProgram::BAKED_SYNTH.inc, &inputs);
+        assert_eq!(step, 3.0, "increase rises with acked_seg (= max(0.5, 0.2, 3.0))");
     }
 }

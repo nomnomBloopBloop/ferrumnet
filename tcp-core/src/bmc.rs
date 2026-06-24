@@ -452,7 +452,7 @@ pub fn check_learned_genome_space(mss: u32, depth: u32) -> BmcReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::congestion::{initial_window, Dctcp, Prague, Reno};
+    use crate::congestion::{initial_window, ControlProgram, Dctcp, Instr, Prague, Reno, Synth, SynthOp};
 
     /// PROOF (bounded): across *every* sequence of up to three scoreboard operations over a small
     /// window — at sequence-number base 0 and straddling the 2³² wrap — the scoreboard stays
@@ -521,6 +521,7 @@ mod tests {
             ("dctcp", check_controller_safety(Dctcp::new(mss as u16), mss, 4)),
             ("prague", check_controller_safety(Prague::new(mss as u16), mss, 4)),
             ("learned(baked)", check_controller_safety(Learned::with_params(mss as u16, LearnedParams::BAKED), mss, 4)),
+            ("synth(baked)", check_controller_safety(Synth::with_program(mss as u16, ControlProgram::BAKED_SYNTH), mss, 4)),
         ];
         for (name, report) in runs {
             assert!(report.cases > 10_000, "{name}: the sweep must be substantial: {} cases", report.cases);
@@ -580,5 +581,69 @@ mod tests {
         assert!(false_inv.violations > 0, "the enumeration must surface the false invariant's violations");
         let real = run_cc_sweep(Reno::new(mss as u16), mss, 3, cc_safety_invariants);
         assert_eq!(real.violations, 0, "the real envelope holds over the same states");
+    }
+
+    /// Build a `Synth` sub-program that computes `first` in its first slot and carries the result to the
+    /// output register (so the whole sub-program evaluates to `first`) — the rest of the law stays AIMD.
+    fn sub_from(first: Instr) -> [Instr; ControlProgram::PROG_LEN] {
+        let mut p = [Instr::new(SynthOp::Max, 0, 0); ControlProgram::PROG_LEN];
+        p[0] = first;
+        for (i, slot) in p.iter_mut().enumerate().skip(1) {
+            let prev = (ControlProgram::REGS_IN + i - 1) as u8;
+            *slot = Instr::new(SynthOp::Max, prev, prev);
+        }
+        p
+    }
+
+    /// **The synthesis-modulo-verification filter, proven to have teeth.** This is the heart of the GP
+    /// synthesis: the bmc is used as a *hard reject* on a candidate control LAW, and it must (a) pass the
+    /// AIMD seed unscathed, and (b) reject each of the three single-clause-unsafe laws — an increase that
+    /// shrinks the window on a clean ACK, an ECN response that *grows* the window on a mark, and a loss
+    /// response that inflates the window past the pipe — with exactly the matching envelope clause, even
+    /// though every one of those laws is wired through the *unsanitised* `Synth` path. So the GP filter
+    /// is not vacuous: it actually catches the unsafe majority a free search would produce, which is what
+    /// makes "every survivor is machine-checked safe" a real guarantee and not a tautology.
+    #[test]
+    #[cfg_attr(miri, ignore)] // tens of thousands of states per law — beyond Miri's budget
+    fn synth_safety_filter_accepts_aimd_and_rejects_unsafe_laws() {
+        let mss = 1000u32;
+
+        // (a) The AIMD seed is inside the envelope — the search's warm start is feasible.
+        let safe = check_controller_safety(Synth::with_program(mss as u16, ControlProgram::AIMD), mss, 4);
+        assert!(safe.cases > 10_000, "the sweep must be substantial: {} cases", safe.cases);
+        assert_eq!(safe.violations, 0, "AIMD broke the envelope: {:?}", safe.first_violation);
+
+        // (b1) An increase law `step = 0.5 − 1 = −0.5 seg/RTT` shrinks cwnd on a clean ACK (clause 4).
+        let mut p = ControlProgram::AIMD;
+        *p.sub_mut(0) = sub_from(Instr::new(SynthOp::Sub, 5, 6)); // r5(0.5) − r6(1) = −0.5
+        let r = check_controller_safety(Synth::with_program(mss as u16, p), mss, 4);
+        assert!(r.violations > 0, "a negative-increase law must violate the envelope");
+        assert!(
+            r.first_violation.as_deref().unwrap_or("").contains("clean ACK shrank cwnd"),
+            "the violation is the clean-ACK-shrink one: {:?}",
+            r.first_violation
+        );
+
+        // (b2) An ECN law `cut = 0.5 − 1 = −0.5` *grows* cwnd on a CE mark (clause 3, ECN-monotonicity).
+        let mut p = ControlProgram::AIMD;
+        *p.sub_mut(2) = sub_from(Instr::new(SynthOp::Sub, 5, 6)); // negative cut
+        let r = check_controller_safety(Synth::with_program(mss as u16, p), mss, 4);
+        assert!(r.violations > 0, "a negative-cut ECN law must violate the envelope");
+        assert!(
+            r.first_violation.as_deref().unwrap_or("").contains("ECN mark grew cwnd"),
+            "the violation is the ECN-growth one: {:?}",
+            r.first_violation
+        );
+
+        // (b3) A loss law `cwnd = 2 · flight_seg` inflates the window past the pipe (clause 2).
+        let mut p = ControlProgram::AIMD;
+        *p.sub_mut(1) = sub_from(Instr::new(SynthOp::Mul, 1, 7)); // r1(flight) × r7(2)
+        let r = check_controller_safety(Synth::with_program(mss as u16, p), mss, 4);
+        assert!(r.violations > 0, "an inflating loss law must violate the envelope");
+        assert!(
+            r.first_violation.as_deref().unwrap_or("").contains("loss inflated cwnd"),
+            "the violation is the loss-inflation one: {:?}",
+            r.first_violation
+        );
     }
 }

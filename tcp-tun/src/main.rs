@@ -47,16 +47,18 @@ fn main() -> std::io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(Ipv4Addr::new(10, 0, 0, 2));
     // Congestion controller: `FERRUM_CC=cubic` runs CUBIC (RFC 8312), `=bbr` runs BBR, `=dctcp`
-    // runs DCTCP (RFC 8257, L4S/ECN), `=prague` runs TCP Prague (L4S scalable + RTT-independent);
-    // anything else (default) is Reno. The swappable knob for the controller comparison. (DCTCP and
-    // Prague only react to congestion if the path marks CE — over a plain TUN with no ECN AQM they
-    // behave like Reno; the marking demos are the in-process bottleneck sim.)
+    // runs DCTCP (RFC 8257, L4S/ECN), `=prague` runs TCP Prague (L4S scalable + RTT-independent),
+    // `=learned` runs the CEM-evolved AIMD genome, `=synth` runs the GP-synthesised control law (its
+    // safe AIMD/DCTCP-equivalent default); anything else is Reno. The swappable knob for the controller
+    // comparison. (The ECN/L4S controllers only react to congestion if the path marks CE — over a plain
+    // TUN with no ECN AQM they behave like Reno; the marking demos are the in-process bottleneck sim.)
     let cc_kind = match std::env::var("FERRUM_CC").as_deref() {
         Ok("cubic") => CcKind::Cubic,
         Ok("bbr") => CcKind::Bbr,
         Ok("dctcp") => CcKind::Dctcp,
         Ok("learned") => CcKind::Learned,
         Ok("prague") => CcKind::Prague,
+        Ok("synth") => CcKind::Synth,
         _ => CcKind::Reno,
     };
     let cc_name = match cc_kind {
@@ -66,6 +68,7 @@ fn main() -> std::io::Result<()> {
         CcKind::Dctcp => "dctcp",
         CcKind::Learned => "learned",
         CcKind::Prague => "prague",
+        CcKind::Synth => "synth",
     };
 
     // `tcp-tun <dev> connect <server-ip> [path]` is the download client; otherwise serve.
