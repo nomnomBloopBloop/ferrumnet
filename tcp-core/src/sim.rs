@@ -2463,6 +2463,61 @@ pub fn evolve_control_law(
     SynthReport { best: best.0, best_fit: best.1, seed_fit, rejected, repaired, evaluated }
 }
 
+// ── exhaustive verified synthesis: a PROVEN in-class optimum ──────────────────────────────────────
+//
+// `evolve_control_law` *searches* the program space, so M23's "the GP keeps returning to `α/2`" is an
+// *observed* fixed point, not a proof that nothing safe beats it. This closes that gap for one response by
+// *exhausting* a small grammar instead of searching it — the same discipline the performance certificate
+// uses on the trace envelope. The class: every ECN response of the form `cut = op(r[a], r[b])` (a single
+// machine operation over the input registers — signals and the `½/1/2` constants), `6 · REGS_IN²` programs.
+// Each is paired with AIMD's increase/loss, driven through the `bmc` safety filter, and the safe ones scored
+// on the frontier; the max is a **proven** optimum over the class — no safe single-op ECN response scores
+// higher. It is a *bounded* theorem (this grammar, this train set), exactly as the bmc and the certificate
+// are bounded — but it is a proof, not an artefact, and it upgrades M23's observation accordingly.
+
+/// What the exhaustive single-op ECN-response synthesis found.
+#[derive(Clone, Copy, Debug)]
+pub struct ExhaustReport {
+    /// The frontier-optimal **safe** single-op ECN response (AIMD increase/loss + this ecn) — a proven
+    /// optimum over the enumerated class.
+    pub best: ControlProgram,
+    pub best_fit: f64,
+    /// Size of the class (`6 · REGS_IN²`) and how many members passed the `bmc` safety filter.
+    pub total: u32,
+    pub safe: u32,
+}
+
+/// **Exhaustively synthesise the frontier-optimal single-operation ECN response, modulo verification.**
+/// Enumerate every `cut = op(r[a], r[b])` over the six ops and the input registers, build each with AIMD's
+/// increase/loss, reject any the `bmc` finds unsafe at `bmc_depth`, score the rest on `train`, and return
+/// the max. The winner is a **proven** in-class optimum (the class was enumerated, not sampled).
+/// Deterministic; the cost is one frontier evaluation per safe candidate.
+pub fn exhaust_ecn_response(train: &[TrainScenario], mss: u16, bmc_depth: u32) -> ExhaustReport {
+    let regs = ControlProgram::REGS_IN as u8;
+    let mut best: Option<(ControlProgram, f64)> = None;
+    let mut total = 0u32;
+    let mut safe = 0u32;
+    for op in SynthOp::ALL {
+        for a in 0..regs {
+            for b in 0..regs {
+                total += 1;
+                let prog = ControlProgram::aimd_with_ecn_op(op, a, b);
+                if crate::bmc::check_controller_safety(Synth::with_program(mss, prog), mss as u32, bmc_depth).violations > 0 {
+                    continue;
+                }
+                safe += 1;
+                let fit = synth_frontier_fitness(prog, train);
+                if best.map_or(true, |(_, f)| fit > f) {
+                    best = Some((prog, fit));
+                }
+            }
+        }
+    }
+    // `α/2` (op = Mul, a = α, b = ½) is itself in the class and safe, so a maximum always exists.
+    let (best, best_fit) = best.expect("the class contains AIMD's own safe ECN response");
+    ExhaustReport { best, best_fit, total, safe }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2856,6 +2911,50 @@ mod tests {
             let (g, q) = frontier_of(cc, None, &test);
             eprintln!("  {name:>14}: goodput {g:.2}x line | mean queue {q:.0} us");
         }
+    }
+
+    /// **Exhaustive synthesis beats the heuristic GP (fast — uses the baked optimum).** The single-op ECN
+    /// optimum found by *exhausting* the class — the delay-based `cut = srtt/rtt_min − 1`
+    /// (`ControlProgram::EXHAUSTED_ECN_OPTIMUM`) — is (1) machine-checked safe at depth 4, and (2) scores
+    /// **strictly higher** on the training frontier than DCTCP's `α/2` (which the heuristic GP got *stuck*
+    /// at, M23). So exhaustion found a safe response the search missed — `α/2` was a search artefact, not the
+    /// in-class optimum. (The full proof that it is THE optimum over all 384 single-op responses is the
+    /// ignored `exhaust_ecn_response_derisk`.)
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn exhausted_ecn_optimum_beats_alpha_half_and_is_safe() {
+        use crate::congestion::ControlProgram;
+        let mss = 1460u16;
+        let opt = ControlProgram::EXHAUSTED_ECN_OPTIMUM;
+        let safety = crate::bmc::check_controller_safety(Synth::with_program(mss, opt), mss as u32, 4);
+        assert_eq!(safety.violations, 0, "the exhaustive optimum must be machine-checked safe: {:?}", safety.first_violation);
+        let train = train_set();
+        let fit_opt = synth_frontier_fitness(opt, &train);
+        let fit_alpha = synth_frontier_fitness(ControlProgram::AIMD, &train); // AIMD.ecn = α/2
+        assert!(fit_opt > fit_alpha, "the delay-based optimum beats DCTCP's α/2 on the frontier: {fit_opt:.4} vs {fit_alpha:.4}");
+    }
+
+    /// De-risk for **exhaustive verified synthesis** (ignored — scores every safe member of the class).
+    /// Enumerate every single-op ECN response, prove the frontier-optimal safe one, and report whether it
+    /// is DCTCP's `α/2` (upgrading M23's *observed* fixed point to a *proven* in-class optimum) or something
+    /// the heuristic GP missed. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn exhaust_ecn_response_derisk() {
+        let train = train_set();
+        let r = exhaust_ecn_response(&train, 1460, 4);
+        let (_, _, ecn) = crate::congestion::synth_describe(&r.best);
+        let aimd_fit = synth_frontier_fitness(crate::congestion::ControlProgram::AIMD, &train);
+        eprintln!("EXHAUSTIVE single-op ECN synthesis: {} in class, {} safe", r.total, r.safe);
+        eprintln!("  proven optimum:  cut = {ecn}   (train-fitness {:.4})", r.best_fit);
+        eprintln!("  AIMD/DCTCP α/2:  train-fitness {aimd_fit:.4}   (is the optimum α/2? {})", r.best == crate::congestion::ControlProgram::AIMD);
+        let test = heldout_set();
+        set_program_override(Some(r.best));
+        let (g, q) = synth_frontier_of(&test);
+        set_program_override(None);
+        let (dg, _) = frontier_of(CcKind::Dctcp, None, &test);
+        let (lg, _) = frontier_of(CcKind::Learned, None, &test);
+        eprintln!("  held-out: optimum {g:.2}x @ {q:.0}us | dctcp {dg:.2}x | learned {lg:.2}x");
     }
 
     /// Coverage-guided greybox fuzzing as a **correctness oracle**. Across a campaign of coverage-

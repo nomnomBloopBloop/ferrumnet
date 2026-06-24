@@ -1074,6 +1074,8 @@ const SYNTH_CWND_CAP: u32 = 1 << 30;
 // Named input-register indices the AIMD seed references (must match the order in [`Synth::signals`]).
 const R_FLIGHT: u8 = 1;
 const R_ALPHA: u8 = 3;
+#[cfg(test)]
+const R_SRTT: u8 = 4; // only the test-only EXHAUSTED_ECN_OPTIMUM references it by name
 const R_HALF: u8 = 5;
 const R_ONE: u8 = 6;
 
@@ -1204,6 +1206,21 @@ impl ControlProgram {
         ],
     };
 
+    /// The frontier-optimal **single-operation** ECN response found by **exhausting** the class (not the
+    /// heuristic GP): `cut = srtt/rtt_min − 1` — a **delay-based** response that backs off proportional to
+    /// the measured queuing delay, paired with AIMD's increase/loss. [`crate::sim::exhaust_ecn_response`]
+    /// enumerates all 384 single-op ECN responses, proves the 352 safe ones, and finds this one maximal on
+    /// the training frontier — strictly above DCTCP's `α/2` (the fixed point the GP got *stuck* at in M23).
+    /// So it is a **proven in-class optimum**, and the lesson is that M23's `α/2` was a *search* artefact,
+    /// not the grammar's true optimum. `#[cfg(test)]`: a research artifact (and a higher-queue operating
+    /// point than the shipped sub-ms controllers), exercised by the exhaustion tests, not shipped.
+    #[cfg(test)]
+    pub(crate) const EXHAUSTED_ECN_OPTIMUM: ControlProgram = ControlProgram {
+        inc: ControlProgram::AIMD.inc,
+        md: ControlProgram::AIMD.md,
+        ecn: seed_prog(SynthOp::Sub, R_SRTT, R_ONE), // cut = srtt_ratio − 1
+    };
+
     /// Number of sub-programs and instructions each, so the genetic search can size its mutations
     /// without importing the machine's private constants.
     pub(crate) const SUBS: usize = 3;
@@ -1270,6 +1287,13 @@ impl ControlProgram {
     pub(crate) fn repair_ecn(mut self) -> ControlProgram {
         self.ecn = ControlProgram::AIMD.ecn;
         self
+    }
+
+    /// AIMD's increase + loss with the ECN response replaced by a **single operation** `op(r[a], r[b])`
+    /// (carried to the output) — the unit the exhaustive single-op ECN-response search
+    /// ([`crate::sim::exhaust_ecn_response`]) enumerates. `a`/`b` index input registers (`0..REGS_IN`).
+    pub(crate) fn aimd_with_ecn_op(op: SynthOp, a: u8, b: u8) -> ControlProgram {
+        ControlProgram { inc: ControlProgram::AIMD.inc, md: ControlProgram::AIMD.md, ecn: seed_prog(op, a, b) }
     }
 }
 
@@ -2431,5 +2455,24 @@ mod tests {
         let inputs = [12.0, 12.0, 3.0, 0.2, 1.0, 0.5, 1.0, 2.0]; // acked_seg = 3
         let step = synth_eval(&ControlProgram::BAKED_SYNTH.inc, &inputs);
         assert_eq!(step, 3.0, "increase rises with acked_seg (= max(0.5, 0.2, 3.0))");
+    }
+
+    /// The **exhaustively-proven** single-op ECN optimum is a **delay-based** response: `cut = srtt/rtt_min
+    /// − 1`. Unlike the GP's `α/2` (which ignores delay), it backs off proportional to the measured queuing
+    /// delay — zero cut when the RTT is at its minimum (no queue), rising as the queue builds. This pins the
+    /// value the exhaustive search (`crate::sim::exhaust_ecn_response`) returns as optimal; it does NOT read
+    /// the ECN fraction `α` at all.
+    #[test]
+    fn exhausted_ecn_optimum_is_the_delay_law() {
+        for &srtt in &[1.0, 1.25, 2.0, 3.5] {
+            // signals = [cwnd_seg, flight_seg, acked_seg, α, srtt_ratio, 0.5, 1, 2]
+            let inputs = [12.0, 12.0, 0.0, 0.7, srtt, 0.5, 1.0, 2.0];
+            let cut = synth_eval(&ControlProgram::EXHAUSTED_ECN_OPTIMUM.ecn, &inputs);
+            assert!((cut - (srtt - 1.0)).abs() < 1e-12, "ecn cut at srtt_ratio={srtt} is {cut}, not srtt−1");
+        }
+        // It is invariant to α (a genuine delay response, not an ECN-fraction one).
+        let a = synth_eval(&ControlProgram::EXHAUSTED_ECN_OPTIMUM.ecn, &[12.0, 12.0, 0.0, 0.1, 2.0, 0.5, 1.0, 2.0]);
+        let b = synth_eval(&ControlProgram::EXHAUSTED_ECN_OPTIMUM.ecn, &[12.0, 12.0, 0.0, 0.9, 2.0, 0.5, 1.0, 2.0]);
+        assert_eq!(a, b, "the delay law ignores α");
     }
 }

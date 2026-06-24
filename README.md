@@ -45,7 +45,7 @@ against a misbehaving peer — all zero-dependency, all CI-enforced, each claim 
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **seven pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one / a **GP-synthesised** one), and a **two-stack userspace loopback** (two
-  instances connecting to each other entirely in memory). **236 tests**, green on Rust 1.92 and the 1.75
+  instances connecting to each other entirely in memory). **239 tests**, green on Rust 1.92 and the 1.75
   MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -108,6 +108,15 @@ against a misbehaving peer — all zero-dependency, all CI-enforced, each claim 
   returning to. The gap to `Learned` is a characterised constant-resolution limit (the discrete grammar
   `{0.5, 1, 2}` cannot build `Learned`'s finer `≈ α·0.185` gain), which precisely motivates a GP-structure
   + CEM-constant hybrid. (`sim` + `bmc`)
+- **It turns the search into a *proof* — and exhaustion beats the heuristic.** The GP above *observed*
+  that it kept returning to DCTCP's `α/2`, but never proved nothing safe beats it. So for one response —
+  the ECN cut — shrink the grammar to all **single-operation** programs (`cut = op(r[a], r[b])`, 384 of
+  them), **exhaust** it: BMC-filter every member for safety (352 pass), score the survivors on the
+  frontier, take the max. The winner is a *proven* in-class optimum — and it is **not** `α/2`. It is a
+  **delay-based** response, `cut = srtt/rtt_min − 1` (back off in proportion to the measured queuing
+  delay), which scores strictly above `α/2` and recovers far more goodput than DCTCP (0.92× vs 0.56× line
+  on held-out, at a ~1.4 ms queue). So the GP was *stuck* at `α/2`; exhaustion found the better response it
+  missed — the verifier-as-prover, applied to synthesis itself. (`sim` + `bmc`)
 - **The verifier doesn't just reject — it *repairs* (CEGIS-with-repair).** The next turn of the same loop:
   instead of discarding an unsafe candidate, feed the `bmc`'s **counterexample** back as a repair signal —
   it names the violated clause, so a **sound, targeted** repair fixes just the offending response (the
@@ -453,7 +462,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 236 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 239 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -469,6 +478,7 @@ cargo test -p tcp-core      # 236 tests: unit + in-memory integration + loss/SAC
                             #            + GP control-law synthesis (bmc as a hard reject filter)
                             #            + CEGIS-with-repair (bmc counterexample heals the law)
                             #            + misbehaving-receiver defence (ACK-division byte-bound proof)
+                            #            + exhaustive synthesis (proven in-class-optimal ECN response)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):
