@@ -712,7 +712,15 @@ budget** (certified 50.9 ms vs sampled 44.5 ms), and the bound is *still growing
 an exhaustive *lower* bound that beats sampling, not a converged one. (The `n_levels` axis does not nest in
 general, so the convergence argument varies only `n_slices`.) Both regimes are exact over the discretised
 periodic envelope; lifting either to a continuum guarantee — the monotonicity/Lipschitz step — is the open
-ceiling.
+ceiling, and we have **characterised that obstruction precisely** rather than hand-wave it (the ignored
+`continuum_lift_obstruction`): monotonicity is *near but not exact* (raising a slice's capacity occasionally
+raises the queue — 2/108 perturbations for Prague mean-queue, from the controller's own adaptation — so the
+all-floor trace cannot be *proven* the continuum worst by monotonicity); and a Lipschitz lift is sound but
+*too loose* (the measured sensitivity `L ≈ 27 µs/%` gives a slack `n·L·½-step` of the same order as the
+bound itself, worse for BBR). What *does* hold empirically is **grid-convergence on both axes** — refining
+the level grid 3→9 moves the bound by ≤ 1 % — so the discretised certificate is strong evidence for, but not
+a proof of, the continuum worst case. A *tight* continuum performance proof is therefore a real open
+problem, now bounded by measurement rather than assumed away.
 
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
