@@ -75,15 +75,16 @@ $ curl -v http://10.0.0.2:8080/
   test enforces a weaker bound and the warm-start/convergence/safety checks.) No ML libraries, no solver,
   zero dependencies. (`sim` + `bmc`)
 - **It certifies a worst-case latency — the adversary as a *prover*.** `certify_worst` exhausts a
-  discretized capacity-trace envelope and takes the worst — a sound performance bound, the model-checking
-  discipline applied to *performance*, not just safety. It discriminates controllers: **Prague's certified
-  worst-case standing queue is 4.1 ms vs Reno's 62 ms**, and the co-evolved controller's is 26% of the
-  average-optimal one's. For AIMD/ECN controllers the worst case is the structural minimum-rate trace and
-  the bound **converges** across nested granularities (a real guarantee); for **BBR** — whose rate
-  estimator has no structural worst case — exhaustion finds a **resonant timing pattern** (a spike that
-  primes the estimate before a crash) that beats both the floor *and* the sampling adversary, exactly where
-  a performance proof is needed. Bounded over the periodic envelope; lifting it to the continuum is the open
-  ceiling. (`sim`)
+  discretized capacity-trace envelope and takes the worst — a sound performance bound **over that envelope**,
+  the model-checking discipline applied to *performance*, not just safety. It discriminates controllers:
+  **Prague's certified worst-case standing queue is 4.1 ms vs Reno's 62 ms**, and the co-evolved
+  controller's is 26% of the average-optimal one's. For AIMD/ECN controllers the worst case is — *observed
+  exhaustively, not proven* — the minimum-rate trace, and the bound **converges** across nested period
+  granularities; for **BBR** — whose rate estimator has no such structural worst case — exhaustion finds a
+  **resonant timing pattern** (a spike that primes the estimate before a crash) that beats both the floor
+  *and* the sampling adversary, exactly where a performance proof is needed. It is *bounded* over the
+  periodic envelope (not the continuum); lifting it to a continuum guarantee — a monotonicity/Lipschitz
+  argument — is the open ceiling. (`sim`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.

@@ -2149,31 +2149,42 @@ pub fn worst_under_fresh_attack(genome: Option<LearnedParams>, env: AdvEnv, byte
 // to prove a safety invariant. This fuses the two: **exhaust a bounded slice of the capacity-trace space
 // and take the worst, turning the adversary into a prover.** The envelope is every `n_slices`-periodic
 // schedule over `n_levels` evenly-spaced capacity levels (tiled across the 16-slice trace); the returned
-// bound is the MAX mean standing queue over *all* of them — a sound worst-case **performance** bound for
-// that bounded envelope, the model-checking discipline applied to performance, not just safety. It is a
-// *bounded* certificate (over the discretised, periodic envelope), exactly as the safety bmc is bounded
-// (small depth/window) — but two things make it more than "we tried a lot of traces": the bound
-// **converges** as the envelope grows (a finer/longer discretisation finds nothing worse — the worst case
-// is a low-period pattern), and the sampling adversary only *approaches* it from below (so the exhaustive
-// max is a genuine upper bound). It discriminates controllers — a robust controller's certified worst-case
-// queue is far below a fragile one's — which is the point: a quantitative guarantee, machine-checked, on
-// the real stack engine, zero-dependency.
+// bound is the MAX of a chosen cost (mean or max standing queue) over *all* of them — a sound worst-case
+// **performance** bound *for that discretised, periodic envelope*, the model-checking discipline applied to
+// performance, not just safety. It is a *bounded* certificate (over the discretised, periodic envelope),
+// exactly as the safety bmc is bounded (small depth/window). Two things give it teeth beyond "we tried a
+// lot of traces". First, it **discriminates** controllers — a robust controller's certified worst-case
+// queue is far below a fragile one's. Second, along the **`n_slices` (period) axis** the envelopes are
+// *nested* — for `n_slices` a divisor of 16 a period-2 pattern *is* a period-4 pattern, so
+// envelope(2) ⊆ envelope(4) ⊆ envelope(8) and the bound is monotone non-decreasing — so when it stops
+// growing (as it does for controllers whose worst case is a low-period structural pattern, e.g. the
+// minimum-rate floor for AIMD/ECN controllers) that is a *real* convergence, not luck. (The `n_levels`
+// axis does NOT generally nest — `{30,90,150}` is not a subset of `{30,70,110,150}` — so we vary only
+// `n_slices` for the convergence argument.) For a controller whose worst case is a *timing* pattern (BBR),
+// the bound is still growing at the checked granularities, so there it is an exhaustive *lower* bound that
+// nonetheless beats the sampling adversary. Crucially the certificate is sound only **over its discretised
+// periodic envelope**: extending it to a continuum bound would need a monotonicity/Lipschitz argument that
+// is *not* proven here — that is the open ceiling.
 
 /// A certified worst-case standing-queue bound from exhausting a discretised capacity-trace envelope.
 #[derive(Clone, Copy, Debug)]
 pub struct PerfCertificate {
-    /// The max mean standing-queue (µs) over every trace in the envelope — a sound upper bound for it.
+    /// The max over the envelope of the chosen `objective` (mean or max standing queue, µs) — a sound
+    /// upper bound on that cost for every trace **in the discretised periodic envelope**.
     pub bound_us: u64,
-    /// The trace that attains the bound (replayable bit-for-bit through [`run_adversarial`]).
+    /// The envelope trace that attains the bound (always a member of the envelope; replayable bit-for-bit
+    /// through [`run_adversarial`]).
     pub worst_trace: AdvTrace,
-    /// How many traces were exhausted (`n_levels ^ n_slices`).
+    /// How many traces were actually exhausted (counted, not inferred — `n_levels ^ n_slices`).
     pub traces_checked: u64,
     pub n_slices: usize,
     pub n_levels: usize,
 }
 
 /// The `k`-th of `n_levels` capacity levels, evenly spaced across `[ADV_MIN_PCT, ADV_MAX_PCT]` (percent
-/// of the base rate). `n_levels == 1` collapses to the floor.
+/// of the base rate). `n_levels == 1` collapses to the floor. Note the level sets nest (a coarser grid ⊆ a
+/// finer one) only when `(coarse-1) | (fine-1)` — e.g. 3 → 5, not 3 → 4 — so the convergence argument
+/// varies `n_slices`, not `n_levels`.
 fn adv_level(k: usize, n_levels: usize) -> u16 {
     if n_levels <= 1 {
         return ADV_MIN_PCT;
@@ -2184,20 +2195,30 @@ fn adv_level(k: usize, n_levels: usize) -> u16 {
 
 /// **Certify a worst-case `objective` bound** for `cc` over the bounded capacity-trace envelope: every
 /// `n_slices`-periodic schedule over `n_levels` evenly-spaced capacity levels, tiled across the 16-slice
-/// trace. **Exhaustive** — `bound_us` is a sound upper bound on the cost for *any* trace in that envelope
-/// (the bounded-model-checking discipline applied to performance). Deterministic. For the [`Learned`]
+/// trace (the tiling is exactly `n_slices`-periodic when `n_slices` divides 16 — use 2/4/8, the values the
+/// nested-envelope convergence argument relies on). **Exhaustive** — `bound_us` is a sound upper bound on
+/// the cost for *any* trace **in that envelope** (not the continuum). Deterministic. For the [`Learned`]
 /// controller, install the genome with [`set_learned_override`] first. Cost is `n_levels ^ n_slices`
-/// transfers, so keep the envelope small (it is a *bounded* certificate). Note: for [`AdvObjective::
-/// MeanQueueUs`] the worst case is *structurally* the minimum-rate trace (mean sojourn is monotone in
-/// capacity), so exhaustion merely confirms it; the certificate earns its keep on objectives whose worst
-/// case is a genuine **timing** pattern — e.g. [`AdvObjective::MaxQueueUs`], where a capacity spike primes
-/// the window before a crash — which no structural shortcut finds.
+/// transfers (panics if that overflows `u64` — keep the envelope small; it is a *bounded* certificate).
+///
+/// Note on what the bound means per objective. For [`AdvObjective::MeanQueueUs`] the worst-case trace is —
+/// *empirically, over this envelope* — the minimum-rate one; we do **not** prove that mean queue is monotone
+/// in capacity for an adaptive controller, so this is an exhaustive observation, not a structural theorem.
+/// The certificate earns its keep on objectives whose worst case is a genuine **timing** pattern — e.g.
+/// [`AdvObjective::MaxQueueUs`], where a capacity spike primes the window before a crash — which the
+/// minimum-rate trace does not capture.
 pub fn certify_worst(cc: CcKind, env: AdvEnv, bytes: usize, n_slices: usize, n_levels: usize, objective: AdvObjective) -> PerfCertificate {
     let n_slices = n_slices.clamp(1, ADV_SLICES);
     let n_levels = n_levels.max(1);
-    let total = (n_levels as u64).saturating_pow(n_slices as u32);
+    // Reject an unrepresentable envelope loudly rather than silently truncating an "exhaustive" sweep.
+    let total = (n_levels as u64)
+        .checked_pow(n_slices as u32)
+        .expect("envelope too large to exhaust — keep n_levels^n_slices within u64");
+    // Seed the witness with the all-floor trace (idx 0) — always a member of the envelope, so a returned
+    // `worst_trace` is a genuine envelope member even if every cost is 0.
+    let mut worst_trace = AdvTrace { schedule: [ADV_MIN_PCT; ADV_SLICES] };
     let mut bound_us = 0u64;
-    let mut worst_trace = AdvTrace::FLAT;
+    let mut checked = 0u64;
     for idx in 0..total {
         // Decode idx into an n_slices-digit base-n_levels pattern, then tile it across the 16 slices.
         let mut schedule = [100u16; ADV_SLICES];
@@ -2216,8 +2237,9 @@ pub fn certify_worst(cc: CcKind, env: AdvEnv, bytes: usize, n_slices: usize, n_l
             bound_us = cost;
             worst_trace = trace;
         }
+        checked += 1;
     }
-    PerfCertificate { bound_us, worst_trace, traces_checked: total, n_slices, n_levels }
+    PerfCertificate { bound_us, worst_trace, traces_checked: checked, n_slices, n_levels }
 }
 
 #[cfg(test)]
@@ -2999,11 +3021,11 @@ mod tests {
     /// A BOUNDED PERFORMANCE CERTIFICATE that **discriminates controllers**: by exhausting the
     /// discretised capacity-trace envelope we certify each controller's worst-case standing queue, and
     /// the ECN-reactive scalable controller (Prague) has a worst-case latency *far* below the loss-based
-    /// one (Reno). For these controllers the worst case is **structural** — the minimum-rate trace (mean
-    /// sojourn is monotone in capacity) — so the bound has **converged**: a coarser (nested) envelope
-    /// already certifies the same number, and nothing the exhaustion tries beats the floor. This is the
-    /// model-checking discipline applied to *performance*: a machine-checked quantitative latency
-    /// guarantee, on real stack code, zero-dependency.
+    /// one (Reno). For these controllers the worst case is — *over this envelope* — the minimum-rate trace,
+    /// and the bound has **converged**: a coarser (nested) `n_slices` envelope already certifies the same
+    /// number, so the exhaustion found nothing worse at finer period granularity. (The bound is sound over
+    /// the discretised periodic envelope; we do not claim it is the continuum worst case — that would need
+    /// an unproven monotonicity argument.)
     #[test]
     #[cfg_attr(miri, ignore)] // exhausts dozens of full transfers — far too slow for Miri
     fn certified_worst_case_latency_discriminates_controllers() {
@@ -3021,14 +3043,19 @@ mod tests {
             prague.bound_us, reno.bound_us
         );
 
-        // The bound has CONVERGED — a coarser (nested) n=2 envelope certifies the *same* bound, so the
-        // exhaustion found nothing worse at finer granularity (the worst case is the structural floor).
+        // ANCHOR the bound to the structural floor: the certified-worst trace is the all-minimum-rate one
+        // (every slice at the 30% floor), NOT the flat-100% baseline — so a certifier that merely returned
+        // the flat-trace cost (no exhaustion) would fail here, and the bound is genuinely the floor's queue.
+        let floor = certify_worst(CcKind::Reno, env, bytes, 1, 1, AdvObjective::MeanQueueUs); // the all-floor trace alone
+        assert!(reno.worst_trace.schedule().iter().all(|&p| p == ADV_MIN_PCT), "Reno's worst trace is the all-floor one: {:?}", reno.worst_trace);
+        assert_eq!(reno.bound_us, floor.bound_us, "Reno's certified bound is the floor-rate queue, not the flat baseline");
+        assert!(!reno.worst_trace.time_varies(), "...the structural floor, not a timing pattern");
+
+        // The bound has CONVERGED across nested period granularities (n=2 ⊆ n=4): the same number.
         let prague2 = certify_worst(CcKind::Prague, env, bytes, 2, 3, AdvObjective::MeanQueueUs);
         let reno2 = certify_worst(CcKind::Reno, env, bytes, 2, 3, AdvObjective::MeanQueueUs);
-        assert_eq!(prague.bound_us, prague2.bound_us, "Prague bound converged across discretisation");
-        assert_eq!(reno.bound_us, reno2.bound_us, "Reno bound converged across discretisation");
-        // ...and the certified-worst trace is the floor-rate one (the structural worst), not a timing pattern.
-        assert!(!reno.worst_trace.time_varies(), "Reno's worst case is the structural minimum-rate trace: {:?}", reno.worst_trace);
+        assert_eq!(prague.bound_us, prague2.bound_us, "Prague bound converged across period granularity");
+        assert_eq!(reno.bound_us, reno2.bound_us, "Reno bound converged across period granularity");
 
         // Deterministic — same envelope → same certificate.
         assert_eq!(prague.bound_us, certify_worst(CcKind::Prague, env, bytes, 4, 3, AdvObjective::MeanQueueUs).bound_us);
@@ -3048,16 +3075,19 @@ mod tests {
         // BBR's worst-case max standing queue over the n=4, 3-level envelope.
         let cert = certify_worst(CcKind::Bbr, env, bytes, 4, 3, AdvObjective::MaxQueueUs);
 
-        // The worst case is a genuine TIME-VARYING trace (a spike/crash resonance), not the floor —
-        // so exhaustion (not a structural shortcut) is what finds it.
-        assert!(cert.worst_trace.time_varies(), "BBR's worst case is a timing pattern, not the floor: {:?}", cert.worst_trace);
+        // The worst case is a genuine resonant SPIKE/CRASH pattern: the worst trace contains both a
+        // raised level (a spike that primes BBR's rate estimate) and the floor (the crash) — not the
+        // flat minimum-rate trace a structural shortcut would assume.
+        let sched = cert.worst_trace.schedule();
+        assert!(sched.iter().any(|&p| p >= 90) && sched.contains(&ADV_MIN_PCT),
+            "BBR's worst case is a spike/crash resonance, not the floor: {:?}", cert.worst_trace);
 
-        // The exhaustive certificate EXCEEDS what the sampling adversary turns up at a comparable budget:
-        // the periodic resonance pattern the sampler misses.
+        // The exhaustive certificate EXCEEDS what the sampling adversary turns up at a comparable budget,
+        // with margin (a near-tie regression would be caught): the periodic resonance the sampler misses.
         let sampled = adversary_search(CcKind::Bbr, AdvObjective::MaxQueueUs, env, bytes, 80, 0xBEEF).best_cost;
         assert!(
-            cert.bound_us > sampled,
-            "the exhaustive certificate beats sampling on BBR: certified {} µs vs sampled {} µs",
+            cert.bound_us > sampled + sampled / 20,
+            "the exhaustive certificate beats sampling on BBR by >5%: certified {} µs vs sampled {} µs",
             cert.bound_us, sampled
         );
 

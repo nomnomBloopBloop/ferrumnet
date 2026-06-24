@@ -692,22 +692,27 @@ capacity-trace space and take the worst, turning the adversary into a prover**. 
 `n_slices`-periodic schedule over `n_levels` capacity levels (tiled across the 16-slice trace); the returned
 bound is the MAX of a chosen cost (mean or max standing queue) over *all* of them — a sound worst-case
 **performance** bound for that bounded envelope, the model-checking discipline applied to performance, not
-just safety. Two things make it more than "we tried a lot of traces". First it **discriminates** controllers
-and, for those whose worst case is **structural**, it is a tight, *converged* guarantee: for AIMD/ECN
-controllers the worst-case standing queue is attained at the minimum-rate trace (mean sojourn is monotone in
-capacity), so the bound is identical at `n ∈ {2,4,8}` (nested envelopes — period-2 ⊂ period-4 ⊂ period-8 —
-so "it stopped growing" is real) and yields a single certified number per controller: **Prague 4.1 ms vs
-Reno 62 ms** (≈15×), and the co-evolved controller's certified worst-case queue is **26 % of the
-average-optimal baked genome's**. Second, and where exhaustion **earns its keep**, is the controller whose
-worst case is *not* structural: **BBR**. Its windowed-max rate estimator has no monotone worst case, so the
-certificate finds a **resonant timing pattern** — `[30,30,90,30,…]`, a capacity spike that primes the
-estimate high before a crash — that drives the max queue **above the minimum-rate floor and above what the
-sampling adversary finds at a comparable budget** (certified 50.9 ms vs sampled 44.5 ms), and the bound is
-still *growing* at `n=8` (the timing worst-case has a longer period). So the certificate is honest about its
-two regimes: a **converged, sound upper bound** where the worst case is structural (a real performance
-guarantee), and an **exhaustive lower bound that beats sampling** where it is a timing pattern — exactly the
-non-trivial case a performance model checker exists for. It is *bounded* (over the discretised, periodic
-envelope), like every other proof here; lifting it to the continuum is the open ceiling.
+just safety. The bound is sound **over the discretised periodic envelope** by construction (it is the max
+over every trace in it) — *not* over the continuum; that distinction is load-bearing below. Two things give
+it teeth beyond "we tried a lot of traces". First it **discriminates** controllers: **Prague 4.1 ms vs Reno
+62 ms** certified worst-case standing queue (≈15×), and the co-evolved controller's is **26 % of the
+average-optimal baked genome's** (figures from the ignored `perfproof_reproduction`; CI enforces the
+qualitative inequalities and the floor anchor). Second, the **convergence** argument: along the `n_slices`
+(period) axis the envelopes *nest* — for divisors of 16, period-2 ⊂ period-4 ⊂ period-8 — so the bound is
+monotone non-decreasing, and when it stops growing that is real. For AIMD/ECN controllers it converges: the
+worst-case trace, *observed exhaustively over the envelope*, is the minimum-rate one — note this is an
+**observation, not a theorem**; we do *not* prove mean queue is monotone in capacity for an *adaptive*
+controller, so the certified number is a sound bound over the envelope and only a *lower* bound on the true
+continuum worst case (it would be a continuum upper bound only if that unproven monotonicity held). Where
+exhaustion **earns its keep** is the controller whose worst case is *not* the floor: **BBR**, whose
+windowed-max rate estimator has no monotone worst case. There the certificate finds a **resonant timing
+pattern** — `[30,30,90,30,…]`, a capacity spike that primes the estimate high before a crash — that drives
+the max queue **above the minimum-rate floor and above what the sampling adversary finds at a comparable
+budget** (certified 50.9 ms vs sampled 44.5 ms), and the bound is *still growing* at `n=8`, so there it is
+an exhaustive *lower* bound that beats sampling, not a converged one. (The `n_levels` axis does not nest in
+general, so the convergence argument varies only `n_slices`.) Both regimes are exact over the discretised
+periodic envelope; lifting either to a continuum guarantee — the monotonicity/Lipschitz step — is the open
+ceiling.
 
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
@@ -820,7 +825,7 @@ assurance learned controllers usually lack.
 | M19 | **Provably-safe synthesised congestion control** (`bmc::check_controller_safety` / `check_learned_genome_space`) — turn the bounded model checker on the controllers: a 5-clause safety envelope (starvation-freedom, loss never inflates `cwnd` past the FlightSize, ECN/clean-ACK monotonicity, `ssthresh` floor) over every event sequence, with FlightSize modelled independently of `cwnd` (`flight > cwnd` is reachable) | Reno/DCTCP/Prague + the evolved genome all satisfy it exhaustively, and the **whole sanitised genome family** (243-genome grid, ~1.3 M states, + a structural argument to the continuum) is bounded-proven safe — "evolve *and* prove"; an unsanitised `md_loss=2` genome is caught inflating `cwnd` past the pipe, proving the sanitiser is load-bearing; the adversarial review caught and fixed the original flight-model under-approximation |
 | M20 | **Adversarial worst-case discovery** (`adversary_search` / `run_adversarial`) — invert the trainer into a minimax adversary: search a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base rate schedule) for the trajectory that maximises a controller's mean/max standing queue or throughput shortfall; a steady-state evolutionary maximiser over an elite corpus, equal-budget-compared to blind random sampling, every trace replayable bit-for-bit | the headline (CI-verified, baked discovered trace): a **time-varying** trace **collapses BBR's goodput** to a sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — a BBR-specific pathology (bandwidth under its windowed-max estimate; the link is controller-agnostic, so the asymmetry is BBR's doing). The standing-queue objective separately drives a sustained throttle that bloats BBR's queue **15.5 ms → ~100 ms (6.4×)**, largely erasing pacing's latency edge; the verifier-in-the-loop step before co-evolving a robust controller |
 | M21 | **Co-evolution / CEGIS for CC** (`coevolve`) — close the loop: the CEM synthesises a controller, the adversary finds the counterexample trace, it joins an archive, and the CEM re-synthesises against the worst case; a true zero-sum frontier-penalty game (minimax), the survivor `bmc`-certified safe — all on real stack code, zero ML/solver deps | the adversary's best attack **shrinks round over round** and the loop **converges in 2–3 rounds**; on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break** than the average-optimal baked genome (worst-case penalty 41–66 % of baked) and is **bounded-proven safe (0 violations)** — **safe by construction, empirically robust** — at the honest cost of average-case throughput (the robustness/performance Pareto, found automatically) |
-| M22 | **Bounded performance certificate** (`certify_worst`) — the adversary as a *prover*: exhaust the discretised capacity-trace envelope (every `n_slices`-periodic schedule over `n_levels` levels) and take the worst-case queue — a sound performance bound for that envelope, the model-checking discipline applied to performance not just safety; deterministic, zero-dep | discriminates controllers (**Prague 4.1 ms vs Reno 62 ms** certified worst-case queue; the co-evolved controller's is **26 % of baked's**); for AIMD/ECN controllers the worst case is the structural minimum-rate trace and the bound **converges** across nested granularities (a real guarantee); for **BBR** it finds a **resonant timing pattern** (a spike priming the rate estimate) that beats both the floor and the sampling adversary (certified 50.9 ms vs sampled 44.5 ms) — exactly where exhaustion is needed; *bounded* over the periodic envelope, lifting to the continuum is the open ceiling |
+| M22 | **Bounded performance certificate** (`certify_worst`) — the adversary as a *prover*: exhaust the discretised capacity-trace envelope (every `n_slices`-periodic schedule over `n_levels` levels) and take the worst-case queue — a sound performance bound for that envelope, the model-checking discipline applied to performance not just safety; deterministic, zero-dep | discriminates controllers (**Prague 4.1 ms vs Reno 62 ms** certified worst-case queue; the co-evolved controller's is **26 % of baked's**); for AIMD/ECN controllers the worst case is — *observed exhaustively, not proven* — the minimum-rate trace and the bound **converges** across nested period granularities; for **BBR** it finds a **resonant timing pattern** (a spike priming the rate estimate) that beats both the floor and the sampling adversary (certified 50.9 ms vs sampled 44.5 ms) — exactly where exhaustion is needed; sound *over the discretised periodic envelope*, lifting to a continuum guarantee is the open ceiling |
 
 ## 9. Environment
 
