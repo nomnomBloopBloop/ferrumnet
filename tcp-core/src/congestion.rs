@@ -1159,12 +1159,14 @@ impl ControlProgram {
     /// - **loss**: `cwnd ← 1 segment` (→ the `2·MSS` floor) — degenerate, because on the ECN-marking
     ///   training bottlenecks the drop-based loss path almost never fires, so the search left it at the
     ///   floor. (This is why it is not shipped.)
-    /// - **ecn**: `cut = α / 2` — DCTCP's response, **rediscovered exactly**. Free to pick *any* program,
-    ///   the search came back to `α/2`: evidence that DCTCP's ECN law is a **verified local optimum** of
-    ///   the control-law space (the sharp negative). It does *not* reach `Learned`'s gentler `≈ α·0.185`
-    ///   — a constant the discrete grammar `{0.5, 1, 2}` cannot build — which is exactly why this law
-    ///   beats every *hand-tuned* controller on the held-out frontier but loses to the *gene-tuned*
-    ///   one. The characterised gap motivates a GP-structure + CEM-constant hybrid.
+    /// - **ecn**: `cut = α / 2` — DCTCP's response, **rediscovered exactly** (a unit test pins the value).
+    ///   Free to pick *any* program, the search kept coming back to `α/2` — a fixed point of the GP under
+    ///   this grammar/objective (the sharp negative; this is convergence, not a proof of optimality). It
+    ///   does *not* reach `Learned`'s gentler `≈ α·0.185` — a constant the discrete grammar `{0.5, 1, 2}`
+    ///   cannot build — which is exactly why this law, under the queue-penalised hinge fitness, tops every
+    ///   *hand-tuned* controller on the held-out set yet loses raw goodput to the loss-based ones and loses
+    ///   outright to the *gene-tuned* `Learned`. The characterised gap motivates a GP-structure +
+    ///   CEM-constant hybrid.
     ///
     /// `#[cfg(test)]` because it is a research artifact, exercised only by the safety / frontier tests
     /// and the de-risk — the shipped `CcKind::Synth` deliberately runs the safe AIMD default, not this.
@@ -2368,8 +2370,10 @@ mod tests {
 
     /// The synthesised law's ECN sub-program (`BAKED_SYNTH.ecn`) **rediscovered DCTCP's exact `α/2`
     /// response**: free to pick any program over the signals, the GP returned `0.5 · α` for every `α`.
-    /// This is the de-risk's sharp negative made machine-checkable — DCTCP's ECN law is a verified local
-    /// optimum of the program space; the search did not find a different ECN response.
+    /// This pins the *value* (the de-risk's sharp negative, machine-checked) — DCTCP's `α/2` is a fixed
+    /// point the search keeps returning to. It is NOT a proof of optimality (the GP is a heuristic search,
+    /// not an exhaustive neighbourhood check); proving `α/2` optimal in-class would need to exhaust a small
+    /// ECN-response grammar, which this test does not do.
     #[test]
     fn synth_baked_ecn_response_rediscovered_dctcp() {
         for &alpha in &[0.0, 0.1, 0.3, 0.5, 0.9, 1.0] {

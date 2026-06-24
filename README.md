@@ -38,7 +38,7 @@ $ curl -v http://10.0.0.2:8080/
   unit-testable off-device, including under simulated packet loss, reordering, SACK-based
   selective recovery, **seven pluggable congestion controllers** (Reno / CUBIC / BBR / DCTCP /
   **Prague** / an **evolved** one / a **GP-synthesised** one), and a **two-stack userspace loopback** (two
-  instances connecting to each other entirely in memory). **231 tests**, green on Rust 1.92 and the 1.75
+  instances connecting to each other entirely in memory). **232 tests**, green on Rust 1.92 and the 1.75
   MSRV; Miri-clean (no UB, no leaks, no suppression).
 - **It fuzzes itself, deterministically.** Because the core is sans-IO, a `sim` module wires two
   whole stacks through an in-process virtual link with a *seeded* fault model — loss, duplication,
@@ -92,11 +92,15 @@ $ curl -v http://10.0.0.2:8080/
   novelty is the filter: **every candidate is run through the bounded safety checker (`bmc`) before it is
   ever scored, and one that can break the safety envelope is rejected outright** — "synthesis modulo
   verification", so every survivor is machine-checked safe (unlike a learned/RL controller). The honest
-  de-risk verdict: the discovered law is verified-safe and beats *every hand-tuned* controller on the
-  held-out frontier, but **not** the gene-tuned `Learned` — and its ECN response **rediscovers DCTCP's
-  exact `α/2`**, evidence that `α/2` is a *verified local optimum*. The gap is a characterised
-  constant-resolution limit (the discrete grammar `{0.5, 1, 2}` cannot build `Learned`'s finer `≈ α·0.185`
-  gain), which precisely motivates a GP-structure + CEM-constant hybrid. (`sim` + `bmc`)
+  de-risk verdict: the discovered law is verified-safe and, under the **latency-throughput hinge fitness it
+  was bred for** (goodput penalised for standing queue past a 1 ms L4S budget), ranks above *every
+  hand-tuned* controller on the held-out set — but that is **not** a Pareto win: on raw goodput it *loses*
+  to Reno/CUBIC/BBR (which bury themselves in ~90 ms of queue) and only out-goodputs DCTCP/Prague, buying
+  that with a far lower queue; and it loses outright to the gene-tuned `Learned`. Its ECN response
+  **rediscovers DCTCP's exact `α/2`** (a unit test pins the value) — a fixed point the search keeps
+  returning to. The gap to `Learned` is a characterised constant-resolution limit (the discrete grammar
+  `{0.5, 1, 2}` cannot build `Learned`'s finer `≈ α·0.185` gain), which precisely motivates a GP-structure
+  + CEM-constant hybrid. (`sim` + `bmc`)
 - **It connects both ways.** Not just a server: it does **active open** (`connect`) as well as
   passive open — the full RFC 793 §3.9 client path, including simultaneous open — so two instances
   can talk to each other with no kernel TCP involved.
@@ -420,7 +424,7 @@ on *new data*, never on *the connection going away*.)
 The protocol core builds and tests on any platform:
 
 ```sh
-cargo test -p tcp-core      # 223 tests: unit + in-memory integration + loss/SACK/teardown
+cargo test -p tcp-core      # 232 tests: unit + in-memory integration + loss/SACK/teardown
                             #            + two-stack loopback + timestamps + delayed ACKs
                             #            + CUBIC + BBR (rate sampler, windowed filter, phases,
                             #            inflight bounds) + DCTCP/L4S (ECT marking, AccECN ACE counter,
@@ -433,6 +437,7 @@ cargo test -p tcp-core      # 223 tests: unit + in-memory integration + loss/SAC
                             #            the controller safety envelope over the whole genome family)
                             #            + an adversarial worst-case search (the capacity trace that
                             #            bloats BBR's queue ~6x / collapses its goodput)
+                            #            + GP control-law synthesis (bmc as a hard reject filter)
 ```
 
 The TUN backend + live demo run on **Linux** (needs root for the device + routing):

@@ -739,8 +739,10 @@ envelope (the guarantee a learned/RL controller cannot give). Crucially the prog
 floor, both raise-only so they cannot *mask* a violation) — so the gain-dependent clauses stay exposed and
 the filter has real teeth: a hand-built law that shrinks `cwnd` on a clean ACK, grows it on an ECN mark, or
 inflates it past the pipe on loss is each caught with exactly the matching clause (`synth_safety_filter_
-accepts_aimd_and_rejects_unsafe_laws`). The seed is `ControlProgram::AIMD`, which reproduces DCTCP exactly
-(a unit test drives it against `Dctcp` step-for-step), so the search has a safe, decent warm start and the
+accepts_aimd_and_rejects_unsafe_laws`). The seed is `ControlProgram::AIMD`, which reproduces DCTCP exactly on
+MSS-multiple FlightSizes (a unit test drives it against `Dctcp` step-for-step on `k·MSS` flights; off the
+grid the float loss step differs from DCTCP's integer halving by at most one ULP), so the search has a safe,
+decent warm start and the
 question is sharp: does it move *away* from AIMD to a better safe law, or stay?
 
 The honest de-risk verdict (`synth_control_law_derisk`; the discovery is baked as `BAKED_SYNTH` and its
@@ -749,16 +751,24 @@ Decompiled (stripped of the redundant `max(x,x)` introns the search leaves behin
 `increase = max(0.5, α, acked_seg)`, `loss → 1 segment` (the floor — the drop path barely fires on ECN
 bottlenecks, so the search left it degenerate, which is why `Synth` does **not** ship this law), and
 `ecn = α/2`. That ECN response is **DCTCP's, rediscovered exactly**: free to pick any program over the
-signals, the search returned `α/2` — evidence that DCTCP's `α/2` is a **verified local optimum** of the
-control-law space (a machine-checked unit test pins it). On the held-out bottlenecks the law is verified-safe
-(depth-4 `bmc`, 0 violations) and lands a better frontier point than **every hand-tuned controller** — more
-goodput than DCTCP at a still-sub-millisecond queue, orders of magnitude below Reno/BBR — but it does **not**
-beat the gene-tuned `Learned`. The gap is *characterised*, not hand-waved: `Learned` wins with a gentler
-`ecn_a ≈ 0.185`, a constant the discrete grammar `{½, 1, 2}` cannot build, so program-GP wins on *structure*
-(a signal-dependent increase the fixed AIMD skeleton cannot express) and *safety-by-construction* but loses
-to continuous gene-tuning on *fine constants*. The precise next step the de-risk motivates is therefore a
-**GP-for-structure + CEM-for-constants hybrid** (ephemeral evolvable constants). Everything is std-only,
-zero-transcendental and deterministic — the whole search reproduces bit-for-bit on x86-64 Linux and Windows.
+signals, the search returned `α/2` — a **fixed point the GP keeps returning to** (a unit test pins the
+*value* is exactly `α/2`; this is the search converging, not a proof of optimality — turning it into a proven
+in-class optimum by *exhausting* a small ECN-response grammar is the natural next result). On the held-out
+bottlenecks the law is verified-safe (depth-4 `bmc`, 0 violations). Its frontier standing is **metric-specific
+and not a Pareto win**, and the test (`synthesised_law_tops_the_queue_penalised_fitness_not_raw_goodput`)
+asserts the full honest picture: under the **latency-throughput hinge fitness it was bred for** (goodput minus
+a queue penalty past a 1 ms budget) it ranks above *every hand-tuned* controller — but only because the
+loss-based ones bury themselves in ~90 ms of standing queue; on **raw goodput** it *loses* to Reno/CUBIC/BBR
+and only out-goodputs DCTCP/Prague (it Pareto-dominates none — it trades goodput for a far lower queue). And
+it loses to the gene-tuned `Learned` on **both** axes. The gap is *characterised*, not hand-waved: `Learned`
+wins with a gentler `ecn_a ≈ 0.185`, a constant the discrete grammar `{½, 1, 2}` cannot build, so program-GP
+wins on *structure* (a signal-dependent increase the fixed AIMD skeleton cannot express) and
+*safety-by-construction* but loses to continuous gene-tuning on *fine constants*. The precise next step the
+de-risk motivates is therefore a **GP-for-structure + CEM-for-constants hybrid** (ephemeral evolvable
+constants). Everything is std-only, zero-transcendental and deterministic (a CI test pins the search is a pure
+function of its seed); the Windows-discovered `BAKED_SYNTH` reappeared bit-identically when the de-risk was
+re-run on the Linux VPS — an observation consistent with the transcendental-free IEEE-754 arithmetic, though
+not yet asserted by an automated cross-platform golden.
 
 [TigerBeetle]: https://tigerbeetle.com/blog/2023-07-11-we-put-a-distributed-database-in-the-browser
 [FoundationDB]: https://apple.github.io/foundationdb/testing.html
@@ -875,7 +885,7 @@ sweep alongside the stock controllers.
 | M20 | **Adversarial worst-case discovery** (`adversary_search` / `run_adversarial`) — invert the trainer into a minimax adversary: search a bounded **capacity-trace** envelope (a 16-slice, 30–150 %-of-base rate schedule) for the trajectory that maximises a controller's mean/max standing queue or throughput shortfall; a steady-state evolutionary maximiser over an elite corpus, equal-budget-compared to blind random sampling, every trace replayable bit-for-bit | the headline (CI-verified, baked discovered trace): a **time-varying** trace **collapses BBR's goodput** to a sub-2 KB/s crawl while Reno/CUBIC/DCTCP complete the *same* trace at ~1 MB/s — a BBR-specific pathology (bandwidth under its windowed-max estimate; the link is controller-agnostic, so the asymmetry is BBR's doing). The standing-queue objective separately drives a sustained throttle that bloats BBR's queue **15.5 ms → ~100 ms (6.4×)**, largely erasing pacing's latency edge; the verifier-in-the-loop step before co-evolving a robust controller |
 | M21 | **Co-evolution / CEGIS for CC** (`coevolve`) — close the loop: the CEM synthesises a controller, the adversary finds the counterexample trace, it joins an archive, and the CEM re-synthesises against the worst case; a true zero-sum frontier-penalty game (minimax), the survivor `bmc`-certified safe — all on real stack code, zero ML/solver deps | the adversary's best attack **shrinks round over round** and the loop **converges in 2–3 rounds**; on a **held-out fresh attack** the co-evolved controller is **1.5–2.4× harder to break** than the average-optimal baked genome (worst-case penalty 41–66 % of baked) and is **bounded-proven safe (0 violations)** — **safe by construction, empirically robust** — at the honest cost of average-case throughput (the robustness/performance Pareto, found automatically) |
 | M22 | **Bounded performance certificate** (`certify_worst`) — the adversary as a *prover*: exhaust the discretised capacity-trace envelope (every `n_slices`-periodic schedule over `n_levels` levels) and take the worst-case queue — a sound performance bound for that envelope, the model-checking discipline applied to performance not just safety; deterministic, zero-dep | discriminates controllers (**Prague 4.1 ms vs Reno 62 ms** certified worst-case queue; the co-evolved controller's is **26 % of baked's**); for AIMD/ECN controllers the worst case is — *observed exhaustively, not proven* — the minimum-rate trace and the bound **converges** across nested period granularities; for **BBR** it finds a **resonant timing pattern** (a spike priming the rate estimate) that beats both the floor and the sampling adversary (certified 50.9 ms vs sampled 44.5 ms) — exactly where exhaustion is needed; sound *over the discretised periodic envelope*, lifting to a continuum guarantee is the open ceiling |
-| M23 | **Verified GP synthesis of the control law** (`Synth` / `ControlProgram` / `evolve_control_law`) — synthesise the control *law*, not its gains: each response (increase/loss/ECN) is a small **SSA register-machine program** over the live signals, genetic-searched with the `bmc` safety checker as a **hard reject filter** ("synthesis modulo verification"), wired in **unsanitised** so the filter has real teeth; zero-transcendental, deterministic | every survivor is **machine-checked safe by a bounded proof** (the guarantee learned/RL controllers lack); the discovered law is verified-safe (depth-4 `bmc`, 0 violations) and beats **every hand-tuned** controller on the held-out frontier but **not** the gene-tuned `Learned`, and its ECN response **rediscovers DCTCP's exact `α/2`** — a **verified local optimum** of the program space (the sharp negative). The gap is a *characterised* constant-resolution limit (the grammar `{½,1,2}` can't build `Learned`'s finer `≈ α·0.185`), which motivates a GP-structure + CEM-constant hybrid; reproduces bit-for-bit on Linux + Windows |
+| M23 | **Verified GP synthesis of the control law** (`Synth` / `ControlProgram` / `evolve_control_law`) — synthesise the control *law*, not its gains: each response (increase/loss/ECN) is a small **SSA register-machine program** over the live signals, genetic-searched with the `bmc` safety checker as a **hard reject filter** ("synthesis modulo verification"), wired in **unsanitised** so the filter has real teeth; zero-transcendental, deterministic (CI-pinned pure function of its seed) | every survivor is **machine-checked safe by a bounded proof** (the guarantee learned/RL controllers lack); the discovered law is verified-safe (depth-4 `bmc`, 0 violations) and, **under the queue-penalised hinge fitness it was bred for**, ranks above **every hand-tuned** controller on the held-out set — but *not* a Pareto win (on raw goodput it loses to Reno/CUBIC/BBR, only out-goodputs DCTCP/Prague at a far lower queue) and it loses to the gene-tuned `Learned` on both axes. Its ECN response **rediscovers DCTCP's exact `α/2`** — a fixed point the search returns to (the sharp negative; a proven in-class optimum would need an exhaustive grammar sweep). The gap is a *characterised* constant-resolution limit (the grammar `{½,1,2}` can't build `Learned`'s finer `≈ α·0.185`), which motivates a GP-structure + CEM-constant hybrid |
 
 ## 9. Environment
 

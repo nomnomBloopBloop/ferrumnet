@@ -2257,7 +2257,8 @@ pub fn certify_worst(cc: CcKind, env: AdvEnv, bytes: usize, n_slices: usize, n_l
 // optimises (`synth_frontier_fitness`), so a discovered law is directly comparable to the hand-tuned and
 // gene-tuned controllers on the held-out bottlenecks. The seed is `ControlProgram::AIMD` (≡ DCTCP), which
 // is safe and decent, so the search always has a feasible warm start and the central question is sharp:
-// does it *move away* from AIMD to a better safe law, or does it stay — "AIMD is a verified local optimum"?
+// does it *move away* from AIMD to a better safe law, or does it stay — "AIMD is a fixed point the search
+// keeps returning to" (a heuristic-search observation, not a proof of optimality)?
 
 /// Fitness sentinel for a program the safety filter rejected: below any real frontier fitness (which is a
 /// goodput-minus-queue score in roughly `[-5, 1]`), so a rejected law can never be selected.
@@ -2523,11 +2524,13 @@ mod tests {
 
     /// **The GP-synthesis machinery, end to end (fast).** A short control-law search must: (1) actually
     /// engage the verifier — a free GP over the program space proposes unsafe laws, so the bmc filter
-    /// rejects a positive number of them; (2) return a real, scored law (not a reject sentinel) that is
-    /// **no worse than the AIMD seed** — the elitist search never regresses below its warm start; and
-    /// (3) yield a winner that is *independently* re-certified safe at the deeper depth-4 bound. This is
-    /// the deterministic CI proof that "synthesis modulo verification" works; the full search that asks
-    /// whether it finds a *new* law lives in the ignored `synth_control_law_derisk`.
+    /// rejects a positive number of them; (2) return a real, scored law (not a reject sentinel) whose
+    /// fitness is the run-wide maximum over every evaluated candidate including the AIMD seed, hence never
+    /// below it; and (3) yield a winner that **generalises past the filter's bound** — the search filters
+    /// at depth 4, and we re-certify the winner at a strictly *deeper* depth 5, so this is a genuine
+    /// (non-tautological) generalisation check, not a replay of the selecting check. This is the
+    /// deterministic CI proof that "synthesis modulo verification" works; the full search that asks whether
+    /// it finds a *new* law lives in the ignored `synth_control_law_derisk`.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn synth_search_finds_a_safe_law_no_worse_than_aimd() {
@@ -2537,33 +2540,58 @@ mod tests {
         ];
         let r = evolve_control_law(&train, 5, 8, 3, 1460, 4, 0x5A5A_1234);
         assert!(r.rejected > 0, "the bmc filter rejected nothing — it is not engaged: {r:?}");
+        assert!(r.evaluated > 8, "the generation loop must actually run (more than one population): {r:?}");
         assert!(
             r.best_fit.is_finite() && r.best_fit > SYNTH_REJECT / 2.0,
             "best must be a real, scored law (not a reject sentinel): {r:?}"
         );
-        assert!(r.best_fit >= r.seed_fit - 1e-9, "the search must never return worse than the seed: {r:?}");
-        let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, r.best), 1460, 4);
+        // best is the run-wide max over all evaluated candidates (the seed included), so it is never below it.
+        assert!(r.best_fit >= r.seed_fit - 1e-9, "the returned best is never below the AIMD seed it warm-starts from: {r:?}");
+        // Re-certify at depth 5 — strictly deeper than the depth-4 filter that selected it, so a winner that
+        // happened to be safe only up to depth 4 would be caught here. (NOT a replay of the selecting check.)
+        let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, r.best), 1460, 5);
         assert_eq!(
             safety.violations, 0,
-            "the synthesised winner must be machine-checked safe: {:?}",
+            "the synthesised winner stays safe one bound deeper than the filter: {:?}",
             safety.first_violation
         );
     }
 
-    /// **The synthesised law, headline result (fast — uses the baked discovery, no search).** The law
-    /// the GP found under the bmc filter ([`ControlProgram::BAKED_SYNTH`]) is, on the **held-out**
-    /// bottlenecks: (1) machine-checked safe at depth 4; (2) a better latency-throughput frontier point
-    /// than every *hand-tuned* controller — materially more goodput than DCTCP at a still-sub-millisecond
-    /// queue, and a queue orders of magnitude below Reno/BBR; but (3) **not** better than the *gene-tuned*
-    /// `Learned` controller. That last inequality is the de-risk's honest verdict made machine-checked:
-    /// the discrete program grammar rediscovers DCTCP's `α/2` ECN response (a verified local optimum) and
-    /// cannot reach `Learned`'s finer `≈ α·0.185` gain — so program-GP wins on *structure* and *safety*
-    /// but loses to continuous gene-tuning on fine constants. Deterministic (a baked genome, fixed scenarios).
+    /// The control-law search is a **pure function of its seed**: two runs with the same arguments return
+    /// the identical genome and fitness, bit-for-bit. This is the determinism the de-risk's reproducibility
+    /// rests on (it is what let the Windows-discovered `BAKED_SYNTH` reappear unchanged on the Linux VPS);
+    /// the cross-*platform* bit-identity is an observation, this in-process replay is the CI-enforced part.
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn synthesised_law_beats_hand_tuned_but_not_gene_tuned() {
+    fn synth_search_is_deterministic_in_its_seed() {
+        let train = vec![TrainScenario { bn: cemark_bn(2_500_000, 2_000, 1_000), bytes: 256 * 1024, seed: 7 }];
+        let a = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717);
+        let b = evolve_control_law(&train, 2, 4, 2, 1460, 3, 0xD37E_8717);
+        assert_eq!(a.best, b.best, "same seed must yield the identical genome");
+        assert_eq!(a.best_fit.to_bits(), b.best_fit.to_bits(), "...and the identical fitness, bit-for-bit");
+        assert_eq!(a.rejected, b.rejected, "...and the identical filter-rejection count");
+    }
+
+    /// **The synthesised law, headline result (fast — uses the baked discovery, no search).** Stated
+    /// precisely, because the win is metric-specific and NOT a Pareto win. The law the GP found under the
+    /// bmc filter ([`ControlProgram::BAKED_SYNTH`]) is, on the **held-out** bottlenecks: (1) machine-checked
+    /// safe at depth 4; (2) the top of the **latency-throughput hinge fitness it was bred for** (goodput
+    /// minus a queue penalty past a 1 ms L4S budget) over *every hand-tuned* controller — but this is
+    /// because the loss-based controllers bury themselves in ~90 ms of standing queue: on **raw goodput**
+    /// synth *loses* to Reno/CUBIC/BBR and only out-goodputs DCTCP/Prague (so it Pareto-dominates none — it
+    /// trades goodput for a far lower queue); and (3) it loses to the *gene-tuned* `Learned` on **both**
+    /// axes. That gap is the de-risk's honest verdict made machine-checked: the discrete grammar rediscovers
+    /// DCTCP's `α/2` ECN response and cannot reach `Learned`'s finer `≈ α·0.185` gain — program-GP wins on
+    /// *structure* + *safety-by-construction*, loses to continuous gene-tuning on fine constants.
+    /// Deterministic (a baked genome, fixed scenarios).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn synthesised_law_tops_the_queue_penalised_fitness_not_raw_goodput() {
         use crate::congestion::ControlProgram;
         let test = heldout_set();
+        // The exact hinge fitness the search optimises (see `synth_frontier_fitness`): goodput, minus
+        // 0.4 per ms of standing queue beyond a 1 ms L4S budget. This is the axis synth wins on.
+        let hinge = |g: f64, q_us: f64| g - 0.4 * (q_us / 1_000.0 - 1.0).max(0.0);
 
         // (1) verified safe — the synthesis guarantee, on the shipped depth-4 bound.
         let safety = crate::bmc::check_controller_safety(Synth::with_program(1460, ControlProgram::BAKED_SYNTH), 1460, 4);
@@ -2572,20 +2600,27 @@ mod tests {
         set_program_override(Some(ControlProgram::BAKED_SYNTH));
         let (synth_g, synth_q) = synth_frontier_of(&test);
         set_program_override(None);
+        let synth_h = hinge(synth_g, synth_q);
+
+        // (2) under the hinge fitness it was bred for, synth tops *every hand-tuned* controller — but only
+        // because the loss-based ones drown in standing queue; assert the ranking AND the mechanism.
+        let (reno_g, reno_q) = frontier_of(CcKind::Reno, None, &test);
+        for &(name, cc) in &[("reno", CcKind::Reno), ("cubic", CcKind::Cubic), ("bbr", CcKind::Bbr), ("dctcp", CcKind::Dctcp), ("prague", CcKind::Prague)] {
+            let (g, q) = frontier_of(cc, None, &test);
+            assert!(synth_h > hinge(g, q), "synth tops the hinge fitness vs {name}: {synth_h:.2} vs {:.2}", hinge(g, q));
+        }
+
+        // (2b) HONESTLY: on raw goodput synth is NOT the best — it loses to the loss-based controllers and
+        // only out-goodputs DCTCP/Prague, buying that with a far lower queue (it Pareto-dominates none).
+        assert!(synth_g < reno_g, "synth LOSES raw goodput to loss-based Reno (the honest caveat): {synth_g:.2}x vs {reno_g:.2}x");
         let (dctcp_g, _) = frontier_of(CcKind::Dctcp, None, &test);
-        let (_, reno_q) = frontier_of(CcKind::Reno, None, &test);
-        let (learned_g, _) = frontier_of(CcKind::Learned, None, &test);
+        assert!(synth_g > dctcp_g * 1.05, "...but out-goodputs DCTCP at a sub-ms queue: {synth_g:.2}x vs {dctcp_g:.2}x");
+        assert!(synth_q < 2_000.0 && synth_q * 10.0 < reno_q, "synth holds a sub-ms-class queue ≪ Reno's: {synth_q:.0} us vs {reno_q:.0} us");
 
-        // (2) beats every hand-tuned controller: more goodput than DCTCP, a queue ≪ Reno's, sub-ms-class.
-        assert!(synth_g > dctcp_g * 1.05, "synth recovers throughput over hand-tuned DCTCP: {synth_g:.2}x vs {dctcp_g:.2}x");
-        assert!(synth_q < 2_000.0, "synth holds a low (sub-ms-class) queue: {synth_q:.0} us");
-        assert!(synth_q * 10.0 < reno_q, "synth ≪ Reno queue: {synth_q:.0} us vs {reno_q:.0} us");
-
-        // (3) but NOT the gene-tuned Learned — the honest, characterised constant-resolution gap.
-        assert!(
-            synth_g < learned_g,
-            "the discrete-grammar law does not beat the continuous gene-tuner (expected): synth {synth_g:.2}x vs learned {learned_g:.2}x"
-        );
+        // (3) and it loses to the gene-tuned Learned on BOTH axes — the characterised constant-resolution gap.
+        let (learned_g, learned_q) = frontier_of(CcKind::Learned, None, &test);
+        assert!(synth_g < learned_g, "synth loses goodput to the gene-tuner Learned (expected): {synth_g:.2}x vs {learned_g:.2}x");
+        assert!(synth_h < hinge(learned_g, learned_q), "...and loses to Learned on the hinge too: {synth_h:.2} vs {:.2}", hinge(learned_g, learned_q));
     }
 
     /// **The de-risk (ignored — runs the full search over hundreds of sims).** Synthesise a control law
